@@ -35,6 +35,15 @@ def _detokenize(tokens: Iterable[str]) -> str:
     return " ".join(tokens).strip()
 
 
+def clean_ocr_artifacts(text: str) -> str:
+    if not text:
+        return text
+
+    # Merge hyphenated line breaks like "lin-\n guists" -> "linguists".
+    text = re.sub(r"([A-Za-z])-[\t\r\n ]+([A-Za-z])", r"\1\2", text)
+    return text
+
+
 def _split_tokens(tokens: list[str], chunk_size: int, overlap: int) -> list[list[str]]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
@@ -214,7 +223,7 @@ def ingest_pdf(
     children: list[ChildChunk] = []
 
     for index, page in enumerate(reader.pages, start=1):
-        page_text = (page.extract_text() or "").strip()
+        page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
         if not page_text:
             continue
         section = _Section(header_path="Document", text=page_text)
@@ -234,7 +243,7 @@ def ingest_pdf(
                 "pdfminer.six is required for fallback PDF extraction."
             ) from exc
 
-        fallback_text = (extract_text(str(path)) or "").strip()
+        fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
         if fallback_text:
             section = _Section(header_path="Document", text=fallback_text)
             for parent in _split_parent_chunks(
@@ -256,7 +265,7 @@ def ingest_pdf(
         doc = fitz.open(str(path))
         for index in range(doc.page_count):
             page = doc.load_page(index)
-            page_text = (page.get_text("text") or "").strip()
+            page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
             if not page_text:
                 continue
             section = _Section(header_path="Document", text=page_text)
@@ -279,7 +288,9 @@ def ingest_pdf(
 
         images = convert_from_path(str(path))
         for index, image in enumerate(images, start=1):
-            page_text = (pytesseract.image_to_string(image) or "").strip()
+            page_text = clean_ocr_artifacts(
+                (pytesseract.image_to_string(image) or "").strip()
+            )
             if not page_text:
                 continue
             section = _Section(header_path="Document", text=page_text)
