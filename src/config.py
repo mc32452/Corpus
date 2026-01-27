@@ -48,7 +48,7 @@ def select_model_config(*, manual_tier: str | None = None) -> ModelConfig:
     if tier in {"high", "high-performance", "tier1"}:
         return ModelConfig(
             tier="high",
-            llm_model="Qwen 2.5/3 32B Instruct",
+            llm_model="mlx-community/Llama-3.3-70B-Instruct-4bit",
             embedding_model="BAAI/bge-m3",
             reranker_model="BAAI/bge-reranker-v2-m3",
             embedding_device="cpu",
@@ -57,7 +57,7 @@ def select_model_config(*, manual_tier: str | None = None) -> ModelConfig:
     if tier in {"efficiency", "tier2"}:
         return ModelConfig(
             tier="efficiency",
-            llm_model="Mistral Small 3.1 24B",
+            llm_model="mlx-community/Llama-3.3-70B-Instruct-4bit",
             embedding_model="BAAI/bge-m3",
             reranker_model="BAAI/bge-reranker-v2-m3",
             embedding_device="cpu",

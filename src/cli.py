@@ -54,7 +54,11 @@ def run() -> None:
     query_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
     query_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
     query_parser.add_argument("--tier", default=None, help="Override hardware tier")
-    query_parser.add_argument("--model", default="models/llm", help="Path to mlx-lm model")
+    query_parser.add_argument(
+        "--model",
+        default=None,
+        help="Path or Hugging Face ID for mlx-lm model",
+    )
     query_parser.add_argument(
         "--no-generate",
         action="store_true",
@@ -127,7 +131,8 @@ def run() -> None:
 
     prompt = f"Context:\n{context}\n\nQuestion: {args.query}\nAnswer:"
 
-    generator = MlxGenerator(args.model)
+    model_id = args.model or config.llm_model
+    generator = MlxGenerator(model_id)
     answer = generator.generate(prompt)
     print(answer)
 
