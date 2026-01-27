@@ -13,6 +13,7 @@ warnings.filterwarnings(
 )
 
 from .config import select_model_config
+from .generation import build_prompt
 from .generator import MlxGenerator
 from .ingest import ingest_file_to_storage
 from .retrieval import RetrievalEngine
@@ -129,7 +130,7 @@ def run() -> None:
             print("-" * 80)
         return
 
-    prompt = f"Context:\n{context}\n\nQuestion: {args.query}\nAnswer:"
+    prompt = build_prompt(context, args.query)
 
     model_id = args.model or config.llm_model
     generator = MlxGenerator(model_id)
