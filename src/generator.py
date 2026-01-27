@@ -30,17 +30,18 @@ class MlxGenerator:
         cfg = config or GenerationConfig()
         try:
             from mlx_lm import generate
+            from mlx_lm.generate import make_sampler
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("mlx-lm generate is not available.") from exc
 
         try:
+            sampler = make_sampler(temp=cfg.temperature, top_p=cfg.top_p)
             return generate(
                 self._model,
                 self._tokenizer,
                 prompt,
                 max_tokens=cfg.max_tokens,
-                temperature=cfg.temperature,
-                top_p=cfg.top_p,
+                sampler=sampler,
             )
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("mlx-lm generation failed.") from exc
