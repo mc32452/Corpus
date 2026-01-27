@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .config import select_model_config
 from .generator import MlxGenerator
+from .ingest import ingest_markdown_to_storage
 from .retrieval import RetrievalEngine
 from .storage import StorageConfig, StorageEngine
 
@@ -24,13 +25,27 @@ def _dedupe_context(texts: Iterable[str]) -> str:
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="Offline RAG CLI")
-    parser.add_argument("query", help="User query")
-    parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
-    parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
-    parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
-    parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
-    parser.add_argument("--tier", default=None, help="Override hardware tier")
-    parser.add_argument("--model", default="models/llm", help="Path to mlx-lm model")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest a Markdown file")
+    ingest_parser.add_argument("file", help="Markdown file path")
+    ingest_parser.add_argument("--source-id", required=True, help="Source identifier")
+    ingest_parser.add_argument("--page-number", type=int, default=None, help="Page number")
+    ingest_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
+    ingest_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
+    ingest_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
+    ingest_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    ingest_parser.add_argument("--tier", default=None, help="Override hardware tier")
+
+    query_parser = subparsers.add_parser("query", help="Query the RAG system")
+    query_parser.add_argument("query", help="User query")
+    query_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
+    query_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
+    query_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
+    query_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    query_parser.add_argument("--tier", default=None, help="Override hardware tier")
+    query_parser.add_argument("--model", default="models/llm", help="Path to mlx-lm model")
+
     args = parser.parse_args()
 
     config = select_model_config(manual_tier=args.tier)
@@ -46,7 +61,6 @@ def run() -> None:
         raise RuntimeError("FlagEmbedding is required for reranking.") from exc
 
     embedding_model = SentenceTransformer(config.embedding_model, device=config.embedding_device)
-    reranker = FlagReranker(config.reranker_model, use_fp16=True)
 
     storage = StorageEngine(
         StorageConfig(
@@ -57,8 +71,26 @@ def run() -> None:
     )
 
     bm25_path = Path(args.bm25)
-    if bm25_path.exists():
-        storage.load_bm25(bm25_path)
+
+    if args.command == "ingest":
+        parents_count, children_count = ingest_markdown_to_storage(
+            args.file,
+            source_id=args.source_id,
+            page_number=args.page_number,
+            storage=storage,
+            embedding_model=embedding_model,
+            bm25_path=bm25_path,
+        )
+        print(f"Ingested {parents_count} parents and {children_count} children.")
+        return
+
+    if not bm25_path.exists():
+        raise FileNotFoundError(
+            "BM25 index missing. Run 'ingest' to build indexes before querying."
+        )
+
+    storage.load_bm25(bm25_path)
+    reranker = FlagReranker(config.reranker_model, use_fp16=True)
 
     retrieval = RetrievalEngine(storage=storage, embedding_model=embedding_model, reranker=reranker)
 

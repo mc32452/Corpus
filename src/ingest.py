@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .models import ChildChunk, Metadata, ParentChunk
+from .storage import StorageEngine
 
 HEADER_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
@@ -185,3 +186,41 @@ def ingest_markdown(
         raise ValueError("No child chunks produced from markdown content.")
 
     return parents, children
+
+
+def _coerce_embeddings(raw_embeddings: object) -> list[list[float]]:
+    if hasattr(raw_embeddings, "tolist"):
+        return raw_embeddings.tolist()
+    if isinstance(raw_embeddings, list):
+        return [list(map(float, emb)) for emb in raw_embeddings]
+    raise TypeError("Unsupported embeddings type.")
+
+
+def ingest_markdown_to_storage(
+    file_path: str | Path,
+    *,
+    source_id: str,
+    page_number: Optional[int],
+    storage: StorageEngine,
+    embedding_model: object,
+    bm25_path: Optional[Path] = None,
+) -> tuple[int, int]:
+    parents, children = ingest_markdown(
+        file_path,
+        source_id=source_id,
+        page_number=page_number,
+    )
+
+    texts = [child.text for child in children]
+    try:
+        embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+    except Exception as exc:  # pragma: no cover - dependency runtime
+        raise RuntimeError("Embedding model encode failed.") from exc
+
+    storage.add_parents(parents)
+    storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+
+    if bm25_path is not None:
+        storage.persist_bm25(bm25_path)
+
+    return len(parents), len(children)

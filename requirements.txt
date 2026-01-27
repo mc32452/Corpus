@@ -1,0 +1,6 @@
+chromadb
+rank-bm25
+pydantic
+sentence-transformers
+FlagEmbedding
+mlx-lm

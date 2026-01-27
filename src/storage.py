@@ -23,6 +23,9 @@ class StorageConfig:
 class StorageEngine:
     def __init__(self, config: StorageConfig) -> None:
         self._config = config
+        config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        config.chroma_dir.mkdir(parents=True, exist_ok=True)
+
         self._conn = sqlite3.connect(str(config.sqlite_path))
         self._conn.execute(
             """
@@ -71,7 +74,12 @@ class StorageEngine:
                 rows,
             )
 
-    def add_children(self, children: Iterable[ChildChunk]) -> None:
+    def add_children(
+        self,
+        children: Iterable[ChildChunk],
+        *,
+        embeddings: Optional[list[list[float]]] = None,
+    ) -> None:
         child_list = list(children)
         if not child_list:
             return
@@ -88,7 +96,15 @@ class StorageEngine:
             for child in child_list
         ]
 
-        self._collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        if embeddings is not None and len(embeddings) != len(child_list):
+            raise ValueError("Embeddings length must match children length.")
+
+        self._collection.add(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas,
+            embeddings=embeddings,
+        )
 
         tokenized = [doc.split() for doc in documents]
         self._bm25_corpus.extend(tokenized)
@@ -102,6 +118,13 @@ class StorageEngine:
         )
         row = cursor.fetchone()
         return row[0] if row else None
+
+    def query_children(self, *, embeddings: list[list[float]], top_k: int) -> dict[str, list]:
+        return self._collection.query(
+            query_embeddings=embeddings,
+            n_results=top_k,
+            include=["documents", "metadatas", "distances", "ids"],
+        )
 
     def persist_bm25(self, path: Path) -> None:
         payload = {

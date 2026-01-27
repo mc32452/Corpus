@@ -38,11 +38,7 @@ class RetrievalEngine:
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("Embedding model encode failed.") from exc
 
-        response = self._storage._collection.query(
-            query_embeddings=embeddings,
-            n_results=top_k,
-            include=["documents", "metadatas", "distances", "ids"],
-        )
+        response = self._storage.query_children(embeddings=embeddings, top_k=top_k)
 
         results: list[dict[str, Any]] = []
         ids = response.get("ids", [[]])[0]
