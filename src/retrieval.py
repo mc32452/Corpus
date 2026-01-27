@@ -47,7 +47,7 @@ class RetrievalEngine:
         distances = response.get("distances", [[]])[0]
 
         for rank, (cid, doc, meta, dist) in enumerate(
-            zip(ids, docs, metas, distances, strict=False),
+            zip(ids, docs, metas, distances),
             start=1,
         ):
             results.append(
@@ -134,7 +134,7 @@ class RetrievalEngine:
             raise RuntimeError("Reranker failed to score pairs.") from exc
 
         reranked = []
-        for item, score in zip(items, scores, strict=False):
+        for item, score in zip(items, scores):
             reranked.append({**item, "rerank_score": float(score)})
         reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return reranked
