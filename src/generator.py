@@ -8,8 +8,8 @@ from typing import Optional
 @dataclass(frozen=True)
 class GenerationConfig:
     max_tokens: Optional[int] = None
-    temperature: float = 0.2
-    top_p: float = 0.9
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
 
 
@@ -82,13 +82,27 @@ class MlxGenerator:
         model_size = self._infer_model_size_b(self._model_id)
         max_tokens = cfg.max_tokens
         repetition_penalty = cfg.repetition_penalty
+        temperature = cfg.temperature
+        top_p = cfg.top_p
 
         if model_size is not None:
             if model_size < 30:
-                max_tokens = max_tokens or 500
-                repetition_penalty = repetition_penalty or 1.15
+                max_tokens = max_tokens or 220
+                repetition_penalty = repetition_penalty or 1.2
+                temperature = temperature or 0.1
+                top_p = top_p or 0.8
             elif model_size >= 70:
                 repetition_penalty = repetition_penalty or 1.05
+                temperature = temperature or 0.2
+                top_p = top_p or 0.9
+            else:
+                max_tokens = max_tokens or 400
+                repetition_penalty = repetition_penalty or 1.1
+                temperature = temperature or 0.15
+                top_p = top_p or 0.9
+        else:
+            temperature = temperature or 0.2
+            top_p = top_p or 0.9
         try:
             from mlx_lm import generate
             from mlx_lm.generate import make_sampler
@@ -96,7 +110,7 @@ class MlxGenerator:
             raise RuntimeError("mlx-lm generate is not available.") from exc
 
         try:
-            sampler = make_sampler(temp=cfg.temperature, top_p=cfg.top_p)
+            sampler = make_sampler(temp=temperature, top_p=top_p)
             logits_processors = []
             if repetition_penalty is not None:
                 processor = self._build_repetition_penalty_processor(repetition_penalty)
