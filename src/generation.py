@@ -51,6 +51,18 @@ def postprocess_bullets(text: str) -> str:
         bullets.append(" ".join(current).strip())
 
     bullets = [b for b in bullets if b]
+    if len(bullets) < 3:
+        inline_matches = re.findall(
+            r"(?:^|\s)-\s+(.+?)(?=(?:\s-\s+|$))",
+            text,
+            flags=re.DOTALL,
+        )
+        bullets = [
+            re.sub(r"\s+", " ", b).strip()
+            for b in inline_matches
+            if b.strip()
+        ]
+
     if not bullets:
         return text.strip()
 
