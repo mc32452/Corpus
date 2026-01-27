@@ -15,3 +15,5 @@ chroma/
 # Local models (keep directory placeholders)
 /models/
 !models/.gitkeep
+
+*.md

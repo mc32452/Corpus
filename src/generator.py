@@ -11,6 +11,20 @@ class GenerationConfig:
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    stop_tokens: Optional[list[str]] = None
+
+
+# Default stop tokens to prevent runaway generation
+DEFAULT_STOP_TOKENS = [
+    "<|endoftext|>",
+    "<|im_end|>",
+    "<|eot_id|>",
+    "Human:",
+    "Assistant:",
+    "user@Mac",
+    "\n\nQuestion:",
+    "\n\nContext:",
+]
 
 
 class MlxGenerator:
@@ -109,6 +123,9 @@ class MlxGenerator:
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("mlx-lm generate is not available.") from exc
 
+        # Collect stop tokens
+        stop_tokens = cfg.stop_tokens if cfg.stop_tokens is not None else DEFAULT_STOP_TOKENS
+
         try:
             sampler = make_sampler(temp=temperature, top_p=top_p)
             logits_processors = []
@@ -118,7 +135,7 @@ class MlxGenerator:
                     logits_processors.append(processor)
 
             capped_max_tokens = min(max_tokens or 512, 300)
-            return generate(
+            output = generate(
                 self._model,
                 self._tokenizer,
                 prompt,
@@ -126,5 +143,23 @@ class MlxGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors or None,
             )
+            
+            # Apply stop token truncation (mlx-lm may not support all stop tokens natively)
+            output = self._apply_stop_tokens(output, stop_tokens)
+            return output
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("mlx-lm generation failed.") from exc
+
+    @staticmethod
+    def _apply_stop_tokens(text: str, stop_tokens: list[str]) -> str:
+        """Truncate output at the first occurrence of any stop token."""
+        if not stop_tokens:
+            return text
+        
+        earliest_pos = len(text)
+        for token in stop_tokens:
+            pos = text.find(token)
+            if pos != -1 and pos < earliest_pos:
+                earliest_pos = pos
+        
+        return text[:earliest_pos].rstrip()
