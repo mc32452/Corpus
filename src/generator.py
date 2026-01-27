@@ -39,7 +39,7 @@ class MlxGenerator:
                 self._tokenizer,
                 prompt,
                 max_tokens=cfg.max_tokens,
-                temp=cfg.temperature,
+                temperature=cfg.temperature,
                 top_p=cfg.top_p,
             )
         except Exception as exc:  # pragma: no cover - dependency runtime
