@@ -7,6 +7,11 @@ import textwrap
 from pathlib import Path
 from typing import Iterable
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 v2 only supports OpenSSL.*",
+)
+
 from .config import select_model_config
 from .generator import MlxGenerator
 from .ingest import ingest_file_to_storage
@@ -28,12 +33,6 @@ def _dedupe_context(texts: Iterable[str]) -> str:
 
 def run() -> None:
     logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
-    try:
-        from urllib3.exceptions import NotOpenSSLWarning
-
-        warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
-    except Exception:
-        pass
 
     parser = argparse.ArgumentParser(description="Offline RAG CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
