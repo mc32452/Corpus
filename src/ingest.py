@@ -269,8 +269,31 @@ def ingest_pdf(
                 children.extend(_split_child_chunks(parent))
 
     if not parents:
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+        except Exception as exc:  # pragma: no cover - dependency runtime
+            raise RuntimeError(
+                "pytesseract and pdf2image are required for OCR PDF extraction."
+            ) from exc
+
+        images = convert_from_path(str(path))
+        for index, image in enumerate(images, start=1):
+            page_text = (pytesseract.image_to_string(image) or "").strip()
+            if not page_text:
+                continue
+            section = _Section(header_path="Document", text=page_text)
+            for parent in _split_parent_chunks(
+                section,
+                source_id=source_id.strip(),
+                page_number=index,
+            ):
+                parents.append(parent)
+                children.extend(_split_child_chunks(parent))
+
+    if not parents:
         raise ValueError(
-            "No extractable text found in PDF. This file may require OCR."
+            "No extractable text found in PDF, even after OCR."
         )
     if not children:
         raise ValueError("No child chunks produced from PDF content.")
