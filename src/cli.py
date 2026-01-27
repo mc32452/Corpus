@@ -13,7 +13,7 @@ warnings.filterwarnings(
 )
 
 from .config import select_model_config
-from .generation import build_prompt
+from .generation import build_prompt, postprocess_bullets
 from .generator import MlxGenerator
 from .ingest import ingest_file_to_storage
 from .retrieval import RetrievalEngine
@@ -135,7 +135,7 @@ def run() -> None:
     model_id = args.model or config.llm_model
     generator = MlxGenerator(model_id)
     answer = generator.generate(prompt)
-    print(answer)
+    print(postprocess_bullets(answer))
 
 
 if __name__ == "__main__":

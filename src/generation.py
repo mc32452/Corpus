@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+
+_BULLET_RE = re.compile(r"^\s*[-•]\s+")
+
 
 def build_prompt(context: str, question: str) -> str:
     instruction = (
@@ -17,3 +21,40 @@ def build_prompt(context: str, question: str) -> str:
         f"Context:\n{context}\n\n"
         f"Question: {question}\nAnswer:"
     )
+
+
+def postprocess_bullets(text: str) -> str:
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    bullets: list[str] = []
+    current: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Assistant:") or stripped.startswith("Human:"):
+            continue
+        if stripped.startswith("Note:"):
+            continue
+        if _BULLET_RE.match(stripped):
+            if current:
+                bullets.append(" ".join(current).strip())
+            current = [_BULLET_RE.sub("", stripped).strip()]
+        else:
+            if current:
+                current.append(stripped)
+
+    if current:
+        bullets.append(" ".join(current).strip())
+
+    bullets = [b for b in bullets if b]
+    if not bullets:
+        return text.strip()
+
+    if len(bullets) >= 3:
+        bullets = bullets[:5]
+
+    return "\n".join(f"- {bullet}" for bullet in bullets)
