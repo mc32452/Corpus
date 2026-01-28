@@ -175,11 +175,22 @@ class StorageEngine:
         if not path.exists():
             raise FileNotFoundError(f"BM25 index file not found: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        self._bm25_ids = list(payload.get("ids", []))
-        self._bm25_corpus = list(payload.get("corpus", []))
-        self._bm25_source_ids = list(payload.get("source_ids", []))
+        ids = list(payload.get("ids", []))
+        corpus = list(payload.get("corpus", []))
+        source_ids = list(payload.get("source_ids", []))
+        if not (len(ids) == len(corpus) == len(source_ids)):
+            raise ValueError(
+                "Inconsistent BM25 index data in "
+                f"{path}: 'ids', 'corpus', and 'source_ids' must have the same "
+                "length. Delete this file and rebuild the BM25 index."
+            )
+        self._bm25_ids = ids
+        self._bm25_corpus = corpus
+        self._bm25_source_ids = source_ids
         if self._bm25_corpus:
             self._bm25 = BM25Okapi(self._bm25_corpus)
+        else:
+            self._bm25 = None
 
     def list_source_ids(self) -> list[str]:
         cursor = self._conn.execute(
