@@ -3,6 +3,101 @@
 **Objective:** Build a high-performance, offline-first RAG (Retrieval-Augmented Generation) system optimized for Apple Silicon (M-series chips).
 **Constraints:** strict offline functionality, highly optimized VRAM usage, Python-based.
 
+---
+
+## v2 Architecture: Three-Mode RAG Configuration
+
+### Operating Modes
+
+The system supports three operating modes, each optimized for different use cases and hardware configurations:
+
+| Mode | LLM Model | Quantization | Context Window | Retrieval Budget | RAM Requirement |
+|------|-----------|--------------|----------------|------------------|-----------------|
+| `regular` | Qwen3-30B-A3B-Instruct-4bit | 4-bit | 128K | 100K | 32GB |
+| `power-fast` | Qwen3-30B-A3B-Instruct-8bit | 8-bit | 128K | 100K | 48GB |
+| `power-deep-research` | Qwen3-Next-80B-A3B-Instruct-4bit | 4-bit | 32K | 20K | 96GB |
+
+#### Mode Selection Precedence
+
+1. **CLI flag**: `--mode regular|power-fast|power-deep-research`
+2. **Environment variable**: `RAG_MODE=power-fast`
+3. **Auto-detection**: Based on system RAM (uses psutil if available)
+
+#### Retrieval Parameters by Mode
+
+| Parameter | Regular | Power-Fast / Deep-Research |
+|-----------|---------|---------------------------|
+| `top_k_dense` | 100 | 300 |
+| `top_k_sparse` | 100 | 300 |
+| `top_k_fused` | 50 | 150 |
+| `top_k_rerank` | 20 | 80 |
+| `top_k_final` | 5 | 15 |
+
+---
+
+### Token Budget Packing
+
+The system implements **greedy token budget packing** to maximize context utilization:
+
+1. **Greedy Selection**: Documents are packed in priority order (by rerank score)
+2. **Consecutive Fail Guard**: Stops after 3 consecutive documents that don't fit
+3. **Truncation Fallback**: Large documents are truncated at sentence boundaries
+4. **Accurate Counting**: Uses MLX native tokenizer for precise token counts
+
+```
+Algorithm: enforce_token_budget(docs, max_tokens, tokenizer)
+  packed = []
+  consecutive_fails = 0
+  for doc in docs (priority order):
+    if doc fits:
+      pack it, reset fails
+    elif truncation possible:
+      truncate and pack
+    else:
+      skip, increment fails
+      if fails >= 3: STOP
+  return packed
+```
+
+---
+
+### Metrics Collection
+
+The retrieval pipeline collects comprehensive metrics:
+
+#### Budget Metrics
+- `budget_tokens`: Maximum allowed tokens
+- `used_tokens`: Actual tokens used
+- `utilization_pct`: Budget utilization percentage
+- `docs_packed/skipped/truncated`: Document counts
+
+#### Timing Metrics (per stage)
+- `dense_search_ms`: Embedding search time
+- `sparse_search_ms`: BM25 search time
+- `rrf_fusion_ms`: RRF fusion time
+- `rerank_ms`: Reranking time
+- `dedup_ms`: Deduplication time
+- `total_ms`: Total pipeline time
+
+#### Reranker Metrics
+- Score distribution: min, max, mean, std
+
+#### Deduplication Metrics
+- Before/after counts, reduction percentage
+
+---
+
+### Early Parent-Level Deduplication
+
+To reduce redundant reranking computations, deduplication runs **before** reranking:
+
+1. After RRF fusion, group children by `parent_id`
+2. Keep only the highest-scored child per parent
+3. Trim to `top_k_fused` results
+4. Track reduction metrics for analysis
+
+---
+
 ### 1. Technology Stack
 *   **LLM Inference:** `mlx-lm` (Apple Machine Learning/Metal optimized).
 *   **Embeddings:** `sentence-transformers` (Run on CPU to save VRAM).
@@ -28,28 +123,35 @@ Do not use simple character splitting. Implement a hierarchical class structure:
 #### Module C: The Hybrid Retrieval Pipeline (Two-Stage)
 Implement a class `RetrievalEngine` with this exact flow:
 1.  **Parallel Search**:
-    *   *Dense*: Cosine similarity on Vector Index (Top 30).
-    *   *Sparse*: BM25 score on Lexical Index (Top 30).
+    *   *Dense*: Cosine similarity on Vector Index (configurable top_k).
+    *   *Sparse*: BM25 score on Lexical Index (configurable top_k).
 2.  **Fusion (RRF)**: Combine results using Reciprocal Rank Fusion:
     $$Score = \sum (1 / (60 + rank))$$
-3.  **Re-Ranking (The Filter)**:
-    *   Take top 20 fused results.
+3.  **Early Deduplication**: Keep highest-RRF-scored child per unique parent_id.
+4.  **Re-Ranking (The Filter)**:
+    *   Take top N fused results (configurable).
     *   Pass query + text pairs through `BGE-Reranker-v2-m3`.
-    *   Select Top 5 absolute best matches.
-4.  **Context Expansion**:
-    *   Map the final Top 5 `ChildChunks` back to their `ParentChunks`.
+    *   Collect score distribution metrics.
+    *   Select Top K absolute best matches (configurable).
+5.  **Context Expansion**:
+    *   Map the final results to their `ParentChunks`.
+    *   Apply token budget packing with greedy algorithm.
     *   Return the *Parent* text to the LLM to ensure full context.
 
 #### Module D: Hardware Configuration & Model Loader
-Implement a configuration manager `config.py` that detects system RAM or allows manual overrides based on these tiers:
+Implement a configuration manager `config.py` that:
+1. Detects system RAM (using psutil if available, with platform fallbacks)
+2. Supports CLI override (`--mode`) and environment variable (`RAG_MODE`)
+3. Validates RAM requirements and warns if insufficient
+4. Maintains backward compatibility with legacy tier names
 
-**Tier 1: High Performance (M4 Max / 64GB+)**
-*   **LLM**: Qwen 2.5/3 - 32B (Instruct) - 4bit/8bit
-*   **Embedding**: BAAI BGE-M3 (Full precision)
+**Mode Configurations (v2):**
 
-**Tier 2: Efficiency (M1/M2/M3 Pro / 32GB)**
-*   **LLM**: Mistral Small 3.1 (24B) or Gemma 3 (12B) - 4bit
-*   **Embedding**: BAAI BGE-M3 (Quantized)
+| Mode | Use Case | Model | Notes |
+|------|----------|-------|-------|
+| `regular` | Daily queries | Qwen3-30B-4bit | Balanced speed/quality |
+| `power-fast` | Deep retrieval | Qwen3-30B-8bit | Higher precision |
+| `power-deep-research` | Complex research | Qwen3-Next-80B-4bit | Best reasoning |
 
 *Note: All embedding and BM25 operations must be forced to CPU (`device='cpu'`) to reserve Metal/GPU VRAM strictly for the LLM.*
 
@@ -58,9 +160,40 @@ Implement a configuration manager `config.py` that detects system RAM or allows 
 1.  **Setup**: Create a clean Python project structure (`/src`, `/data`, `/models`).
 2.  **Data Structures**: Define the Pydantic models for `ParentChunk` and `ChildChunk`.
 3.  **Ingestion**: Write the Markdown/PDF ingestion script that populates the Vector Store and SQLite.
-4.  **Retrieval Logic**: Implement the Hybrid Search + RRF + Reranker pipeline.
-5.  **Generation**: Implement the `mlx-lm` generator class that takes the retrieved Parent Context and prompts the specific LLM.
-6.  **CLI/Interface**: A simple script to query the system.
+4.  **Retrieval Logic**: Implement the Hybrid Search + RRF + Early Dedup + Reranker pipeline with metrics.
+5.  **Generation**: Implement the `mlx-lm` generator class with tokenizer exposure and budget packing.
+6.  **CLI/Interface**: A simple script to query the system with mode selection and metrics reporting.
+
+---
+
+### CLI Usage
+
+```bash
+# Auto-detect mode based on RAM
+python -m src.cli query "What is the main argument?"
+
+# Specify mode explicitly
+python -m src.cli query "Analyze the methodology" --mode power-fast
+
+# Set mode via environment variable
+export RAG_MODE=power-deep-research
+python -m src.cli query "Compare the two approaches"
+
+# Ingest with specific mode
+python -m src.cli ingest document.md --source-id doc1 --mode regular
+```
+
+---
+
+### Dependencies
+
+**Required:**
+- chromadb, rank-bm25, pydantic, sentence-transformers
+- FlagEmbedding, mlx-lm, pypdf, pdfminer.six, PyMuPDF
+- pytesseract, pdf2image
+
+**Optional:**
+- psutil (for cross-platform RAM detection)
 
 ***
 
