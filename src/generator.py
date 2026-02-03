@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import re
-from typing import Optional
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,24 @@ class MlxGenerator:
             self._model, self._tokenizer = load(model_path)
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError(f"Failed to load mlx-lm model at {model_path}.") from exc
+
+    @property
+    def tokenizer(self) -> Any:
+        """Expose the MLX tokenizer for external token counting.
+        
+        Returns:
+            The tokenizer instance loaded with the model.
+        """
+        return self._tokenizer
+
+    @property
+    def model_id(self) -> str:
+        """Get the model identifier.
+        
+        Returns:
+            The model path/ID used to load this generator.
+        """
+        return self._model_id
 
     @staticmethod
     def _infer_model_size_b(model_id: str) -> Optional[float]:
@@ -176,3 +197,217 @@ class MlxGenerator:
                 earliest_pos = pos
         
         return text[:earliest_pos].rstrip()
+
+
+# =============================================================================
+# Token Counting and Budget Packing
+# =============================================================================
+
+def count_tokens(text: str, tokenizer: Any) -> int:
+    """Count tokens in text using the MLX tokenizer.
+    
+    Args:
+        text: Text to tokenize
+        tokenizer: MLX tokenizer instance (from MlxGenerator.tokenizer)
+        
+    Returns:
+        Number of tokens in text
+    """
+    if not text:
+        return 0
+    
+    try:
+        # MLX tokenizers typically have an encode method
+        if hasattr(tokenizer, 'encode'):
+            tokens = tokenizer.encode(text)
+            return len(tokens)
+        # Fallback: try tokenize method
+        if hasattr(tokenizer, 'tokenize'):
+            tokens = tokenizer.tokenize(text)
+            return len(tokens)
+        # Last resort: approximate by characters (rough estimate)
+        logger.warning("Tokenizer lacks encode/tokenize method, using character approximation")
+        return len(text) // 4
+    except Exception as exc:
+        logger.warning(f"Token counting failed: {exc}, using character approximation")
+        return len(text) // 4
+
+
+@dataclass
+class BudgetPackResult:
+    """Result of greedy budget packing.
+    
+    Attributes:
+        packed_docs: List of documents that fit within budget
+        used_tokens: Total tokens used
+        skipped_count: Number of documents skipped
+        truncated_count: Number of documents truncated
+        consecutive_fails: Number of consecutive documents that didn't fit
+    """
+    packed_docs: list[str]
+    used_tokens: int
+    skipped_count: int
+    truncated_count: int
+    consecutive_fails: int
+
+
+def enforce_token_budget(
+    docs: list[str],
+    max_tokens: int,
+    tokenizer: Any,
+    *,
+    consecutive_fail_threshold: int = 3,
+    allow_truncation: bool = True,
+    min_doc_tokens: int = 50,
+    log: Optional[logging.Logger] = None,
+) -> BudgetPackResult:
+    """Greedy token budget packing with consecutive fail guard.
+    
+    Packs documents into the token budget using a greedy algorithm.
+    Stops early if consecutive documents fail to fit (guard against
+    spending time on documents that are all too large).
+    
+    Args:
+        docs: List of document texts to pack (in priority order)
+        max_tokens: Maximum token budget
+        tokenizer: MLX tokenizer for accurate counting
+        consecutive_fail_threshold: Stop after this many consecutive skips
+        allow_truncation: Whether to truncate large docs as fallback
+        min_doc_tokens: Minimum tokens for a truncated doc to be useful
+        log: Logger for decision logging
+        
+    Returns:
+        BudgetPackResult with packed documents and statistics
+    """
+    if log is None:
+        log = logger
+    
+    packed: list[str] = []
+    used_tokens = 0
+    skipped = 0
+    truncated = 0
+    consecutive_fails = 0
+    
+    for i, doc in enumerate(docs):
+        if not doc or not doc.strip():
+            continue
+        
+        doc_tokens = count_tokens(doc, tokenizer)
+        remaining = max_tokens - used_tokens
+        
+        # Document fits entirely
+        if doc_tokens <= remaining:
+            packed.append(doc)
+            used_tokens += doc_tokens
+            consecutive_fails = 0
+            log.debug(f"Doc {i}: packed ({doc_tokens} tokens, total: {used_tokens})")
+            continue
+        
+        # Document doesn't fit - try truncation
+        if allow_truncation and remaining >= min_doc_tokens:
+            # Estimate truncation point (rough: target 80% of remaining)
+            target_tokens = int(remaining * 0.8)
+            
+            # Binary search for truncation point
+            truncated_doc = _truncate_to_tokens(doc, target_tokens, tokenizer)
+            if truncated_doc:
+                truncated_tokens = count_tokens(truncated_doc, tokenizer)
+                if truncated_tokens <= remaining:
+                    packed.append(truncated_doc)
+                    used_tokens += truncated_tokens
+                    truncated += 1
+                    consecutive_fails = 0
+                    log.debug(
+                        f"Doc {i}: truncated ({doc_tokens} -> {truncated_tokens} tokens, "
+                        f"total: {used_tokens})"
+                    )
+                    continue
+        
+        # Skip document
+        skipped += 1
+        consecutive_fails += 1
+        log.debug(f"Doc {i}: skipped ({doc_tokens} tokens, remaining: {remaining})")
+        
+        # Guard: stop if too many consecutive fails
+        if consecutive_fails >= consecutive_fail_threshold:
+            log.info(
+                f"Budget packing stopped: {consecutive_fails} consecutive docs "
+                f"exceeded remaining budget ({remaining} tokens)"
+            )
+            break
+    
+    log.info(
+        f"Budget packing complete: {len(packed)} docs, {used_tokens}/{max_tokens} tokens "
+        f"({100 * used_tokens / max_tokens:.1f}%), {skipped} skipped, {truncated} truncated"
+    )
+    
+    return BudgetPackResult(
+        packed_docs=packed,
+        used_tokens=used_tokens,
+        skipped_count=skipped,
+        truncated_count=truncated,
+        consecutive_fails=consecutive_fails,
+    )
+
+
+def _truncate_to_tokens(
+    text: str,
+    target_tokens: int,
+    tokenizer: Any,
+    *,
+    tolerance: float = 0.1,
+) -> Optional[str]:
+    """Truncate text to approximately target token count.
+    
+    Uses binary search to find a good truncation point that
+    preserves complete sentences where possible.
+    
+    Args:
+        text: Text to truncate
+        target_tokens: Target token count
+        tokenizer: MLX tokenizer
+        tolerance: Acceptable deviation from target (0.1 = 10%)
+        
+    Returns:
+        Truncated text, or None if truncation not feasible
+    """
+    if target_tokens <= 0:
+        return None
+    
+    # Start with character-based estimate
+    char_estimate = target_tokens * 4  # ~4 chars per token
+    
+    if char_estimate >= len(text):
+        return text
+    
+    # Try to find a sentence boundary near the estimate
+    search_start = max(0, char_estimate - 200)
+    search_end = min(len(text), char_estimate + 200)
+    search_region = text[search_start:search_end]
+    
+    # Look for sentence endings
+    best_pos = char_estimate
+    for ending in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
+        pos = search_region.rfind(ending)
+        if pos != -1:
+            candidate = search_start + pos + len(ending)
+            if candidate < best_pos:
+                best_pos = candidate
+                break
+    
+    # Truncate and verify
+    truncated = text[:best_pos].rstrip()
+    actual_tokens = count_tokens(truncated, tokenizer)
+    
+    # Check if within tolerance
+    if actual_tokens <= target_tokens * (1 + tolerance):
+        return truncated
+    
+    # If still too long, do hard truncation
+    if actual_tokens > target_tokens:
+        # Reduce proportionally
+        ratio = target_tokens / actual_tokens
+        new_len = int(len(truncated) * ratio * 0.9)  # 10% safety margin
+        return text[:new_len].rstrip()
+    
+    return truncated
