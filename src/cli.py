@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import warnings
 import textwrap
@@ -14,7 +15,7 @@ warnings.filterwarnings(
     message=r"urllib3 v2 only supports OpenSSL.*",
 )
 
-from .config import select_model_config
+from .config import select_mode_config, ModelConfig
 from .generation import build_prompt
 from .generator import MlxGenerator
 from .ingest import ingest_file_to_storage
@@ -204,7 +205,12 @@ def run() -> None:
     ingest_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
     ingest_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
     ingest_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
-    ingest_parser.add_argument("--tier", default=None, help="Override hardware tier")
+    ingest_parser.add_argument(
+        "--mode",
+        choices=["regular", "power-fast", "power-deep-research"],
+        default=None,
+        help="Operating mode: regular (balanced), power-fast (8-bit, deeper retrieval), power-deep-research (80B model)",
+    )
     ingest_parser.add_argument(
         "--model",
         default=None,
@@ -222,7 +228,12 @@ def run() -> None:
     query_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
     query_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
     query_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
-    query_parser.add_argument("--tier", default=None, help="Override hardware tier")
+    query_parser.add_argument(
+        "--mode",
+        choices=["regular", "power-fast", "power-deep-research"],
+        default=None,
+        help="Operating mode: regular (balanced), power-fast (8-bit, deeper retrieval), power-deep-research (80B model)",
+    )
     query_parser.add_argument(
         "--source-id",
         default=None,
@@ -270,7 +281,14 @@ def run() -> None:
 
     args = parser.parse_args()
 
-    config = select_model_config(manual_tier=args.tier)
+    # Select mode configuration with CLI/env var/auto precedence
+    config = select_mode_config(manual_mode=getattr(args, 'mode', None))
+    
+    # Print resolved mode info at startup
+    mode_source = "CLI" if getattr(args, 'mode', None) else "env" if os.getenv("RAG_MODE") else "auto"
+    print(f"\n[Mode: {config.mode} | Source: {mode_source}]")
+    print(f"[LLM: {config.llm_model} | Quant: {config.quantization}]")
+    print(f"[Context: {config.context_window:,} | Budget: {config.retrieval_budget:,}]\n")
 
     try:
         from sentence_transformers import SentenceTransformer
