@@ -8,7 +8,6 @@ from typing import Any, Iterable, Optional
 from .config import ModelConfig
 from .metrics import (
     RetrievalMetrics,
-    BudgetMetrics,
     TimingMetrics,
     RerankerMetrics,
     DeduplicationMetrics,
