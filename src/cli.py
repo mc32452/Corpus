@@ -17,10 +17,10 @@ warnings.filterwarnings(
 
 from .config import select_mode_config, ModelConfig
 from .generation import build_prompt
-from .generator import MlxGenerator
+from .generator import MlxGenerator, count_tokens, enforce_token_budget
 from .ingest import ingest_file_to_storage
 from .intent import Intent, IntentClassifier, IntentResult
-from .metrics import log_metrics, format_metrics_summary, RetrievalMetrics
+from .metrics import log_metrics, format_metrics_summary, RetrievalMetrics, BudgetMetrics
 from .retrieval import RetrievalEngine
 from .storage import StorageConfig, StorageEngine
 
@@ -456,6 +456,7 @@ def run() -> None:
             context = "\n\n".join(summary_blocks)
             results = []
             source_ids = sources
+            parent_texts = []  # No parent texts for summary mode
             extra_instructions = (
                 "Provide a single consolidated answer addressing the user's question. "
                 "Do not output per-source summaries or repeat points."
@@ -469,9 +470,8 @@ def run() -> None:
                     if result.metadata.get("source_id")
                 }
             )
-            context = _dedupe_context(
-                [result.parent_text for result in results if result.parent_text]
-            )
+            # Collect parent texts for budget packing
+            parent_texts = [result.parent_text for result in results if result.parent_text]
     else:
         results = retrieval.search(search_query, source_id=args.source_id)
         source_ids = sorted(
@@ -481,17 +481,93 @@ def run() -> None:
                 if result.metadata.get("source_id")
             }
         )
-        context = _dedupe_context(
-            [result.parent_text for result in results if result.parent_text]
-        )
+        # Collect parent texts for budget packing (done later with tokenizer)
+        parent_texts = [result.parent_text for result in results if result.parent_text]
 
-    # --- Extract and Log Metrics ---
+    # --- Extract Retrieval Metrics ---
     retrieval_metrics: Optional[RetrievalMetrics] = None
     if results and results[0].metrics:
         retrieval_metrics = results[0].metrics
-        # Log detailed metrics to logger
+
+    # --- Token Budget Packing ---
+    # We need the generator's tokenizer for accurate token counting
+    budget_metrics: Optional[BudgetMetrics] = None
+    context: str = ""
+    
+    # Check if we have parent_texts to pack (not the summary path)
+    has_parent_texts = 'parent_texts' in locals() and parent_texts
+    
+    if not args.no_generate and has_parent_texts:
+        # Load generator to get tokenizer for budget packing
+        if generator is None:
+            generator = MlxGenerator(model_id)
+        
+        import time
+        pack_start = time.perf_counter()
+        
+        pack_result = enforce_token_budget(
+            docs=parent_texts,
+            max_tokens=config.retrieval_budget,
+            tokenizer=generator.tokenizer,
+            consecutive_fail_threshold=3,
+            allow_truncation=True,
+            log=logger,
+        )
+        
+        pack_time_ms = (time.perf_counter() - pack_start) * 1000
+        
+        # Build context from packed docs
+        context = "\n\n".join(pack_result.packed_docs)
+        
+        # Create budget metrics
+        budget_metrics = BudgetMetrics(
+            budget_tokens=config.retrieval_budget,
+            used_tokens=pack_result.used_tokens,
+            utilization_pct=100 * pack_result.used_tokens / config.retrieval_budget if config.retrieval_budget > 0 else 0,
+            avg_doc_tokens=pack_result.used_tokens / len(pack_result.packed_docs) if pack_result.packed_docs else 0,
+            docs_packed=len(pack_result.packed_docs),
+            docs_skipped=pack_result.skipped_count,
+            docs_truncated=pack_result.truncated_count,
+        )
+        
+        # Update retrieval metrics with budget info and packing time
+        if retrieval_metrics:
+            # Update timing with budget packing time
+            updated_timing = retrieval_metrics.timing
+            updated_timing.budget_packing_ms = pack_time_ms
+            updated_timing.total_ms += pack_time_ms
+            
+            retrieval_metrics = RetrievalMetrics(
+                budget=budget_metrics,
+                timing=updated_timing,
+                reranker=retrieval_metrics.reranker,
+                deduplication=retrieval_metrics.deduplication,
+                query=retrieval_metrics.query,
+                mode=retrieval_metrics.mode,
+            )
+        
+        logger.info(
+            f"Budget packing: {pack_result.used_tokens:,}/{config.retrieval_budget:,} tokens "
+            f"({budget_metrics.utilization_pct:.1f}%), {len(pack_result.packed_docs)} docs packed"
+        )
+    elif has_parent_texts:
+        # For --no-generate, just join texts without budget packing
+        context = _dedupe_context(parent_texts)
+    # else: context was already set in the summary branch
+
+    # --- Log Metrics ---
+    if retrieval_metrics:
+        # Update with budget metrics if available but not yet set
+        if budget_metrics and retrieval_metrics.budget.budget_tokens == 0:
+            retrieval_metrics = RetrievalMetrics(
+                budget=budget_metrics,
+                timing=retrieval_metrics.timing,
+                reranker=retrieval_metrics.reranker,
+                deduplication=retrieval_metrics.deduplication,
+                query=retrieval_metrics.query,
+                mode=retrieval_metrics.mode,
+            )
         log_metrics(retrieval_metrics, config.mode, logger)
-        # Print summary to user
         print(f"[Retrieval: {format_metrics_summary(retrieval_metrics)}]")
 
     if args.no_generate:
