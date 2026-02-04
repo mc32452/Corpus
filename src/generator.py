@@ -336,9 +336,14 @@ def enforce_token_budget(
             )
             break
     
+    if max_tokens:
+        percent_used_str = f"{100 * used_tokens / max_tokens:.1f}%"
+    else:
+        percent_used_str = "n/a"
+
     log.info(
         f"Budget packing complete: {len(packed)} docs, {used_tokens}/{max_tokens} tokens "
-        f"({100 * used_tokens / max_tokens:.1f}%), {skipped} skipped, {truncated} truncated"
+        f"({percent_used_str}), {skipped} skipped, {truncated} truncated"
     )
     
     return BudgetPackResult(
