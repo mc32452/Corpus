@@ -385,15 +385,21 @@ def _truncate_to_tokens(
     search_end = min(len(text), char_estimate + 200)
     search_region = text[search_start:search_end]
     
-    # Look for sentence endings
-    best_pos = char_estimate
+    # Look for sentence endings and choose the closest boundary *before* char_estimate
+    best_pos: Optional[int] = None
     for ending in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
-        pos = search_region.rfind(ending)
+        # Only search up to the estimated position to avoid picking later boundaries
+        relative_limit = max(0, min(char_estimate - search_start, len(search_region)))
+        if relative_limit == 0:
+            continue
+        pos = search_region.rfind(ending, 0, relative_limit)
         if pos != -1:
             candidate = search_start + pos + len(ending)
-            if candidate < best_pos:
+            if candidate <= char_estimate and (best_pos is None or candidate > best_pos):
                 best_pos = candidate
-                break
+    
+    if best_pos is None:
+        best_pos = char_estimate
     
     # Truncate and verify
     truncated = text[:best_pos].rstrip()
