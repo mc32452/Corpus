@@ -1,15 +1,13 @@
 ## Project: Offline Advanced RAG (Apple Silicon Optimized)
 
----
-
-## v2 Architecture: Three-Mode RAG Configuration
+## Three-Mode RAG Configuration
 
 ### Operating Modes
 
 The system supports three operating modes, each optimized for different use cases and hardware configurations:
 
 | Mode | LLM Model | Quantization | Context Window | Retrieval Budget | RAM Requirement |
-|------|-----------|--------------|----------------|------------------|-----------------||
+|------|-----------|--------------|----------------|------------------|-----------------|
 | `regular` | Qwen3-30B-A3B-Instruct-4bit | 4-bit | 64K | 32K | 32GB |
 | `power-fast` | Qwen3-30B-A3B-Instruct-2507-8bit | 8-bit | 96K | 50K | 64GB |
 | `power-deep-research` | Qwen3-Next-80B-A3B-Instruct-4bit | 4-bit | 32K | 20K | 64GB |
