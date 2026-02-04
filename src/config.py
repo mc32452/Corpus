@@ -270,7 +270,6 @@ def _auto_select_mode(ram_gb: float) -> str:
 def select_mode_config(
     *,
     manual_mode: Optional[str] = None,
-    validate_ram: bool = True,
 ) -> ModelConfig:
     """Select configuration based on mode with CLI/env var precedence.
     
@@ -284,7 +283,6 @@ def select_mode_config(
     
     Args:
         manual_mode: Mode override from CLI (highest priority)
-        validate_ram: Whether to check RAM meets mode requirements
         
     Returns:
         ModelConfig for the selected mode with RAM-appropriate budgets
