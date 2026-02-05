@@ -349,6 +349,10 @@ class RetrievalEngine:
         t0 = time.perf_counter()
         sparse = self._sparse_search(query, k_sparse, source_id=source_id)
         timing.sparse_search_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "Sparse search returned %s hits",
+            len(sparse),
+        )
         
         # Stage 3: RRF fusion
         t0 = time.perf_counter()

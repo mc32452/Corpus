@@ -191,7 +191,11 @@ def _classify_heuristic(query: str) -> IntentResult:
 
 def _build_classification_prompt(query: str) -> str:
     """Build a minimal prompt for LLM-based intent classification."""
-    return f"""Classify the user's intent into exactly one category.
+    return f"""You are a strict JSON generator.
+Return ONLY a single JSON object and nothing else.
+No markdown, no code fences, no explanations.
+
+Classify the user's intent into exactly one category.
 
 Categories:
 - overview: User wants a brief, high-level description of what the document is and its purpose
@@ -218,13 +222,15 @@ def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
         if match:
             response = match.group(1)
     
-    # Find JSON object in response
-    json_match = re.search(r"\{[^}]+\}", response)
-    if not json_match:
+    # Find JSON object in response (first '{' to last '}')
+    start = response.find("{")
+    end = response.rfind("}")
+    if start == -1 or end == -1 or end <= start:
         return None
+    candidate = response[start : end + 1].strip()
     
     try:
-        data = json.loads(json_match.group())
+        data = json.loads(candidate)
         intent_str = data.get("intent", "").lower().strip()
         confidence = float(data.get("confidence", 0.5))
         
