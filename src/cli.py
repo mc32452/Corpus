@@ -21,7 +21,7 @@ from .generator import MlxGenerator, count_tokens, enforce_token_budget
 from .ingest import ingest_file_to_storage
 from .intent import Intent, IntentClassifier, IntentResult
 from .metrics import log_metrics, format_metrics_summary, RetrievalMetrics, BudgetMetrics, ThresholdMetrics
-from .retrieval import RetrievalEngine
+from .retrieval import RetrievalEngine, format_context_with_citations, build_source_legend
 from .storage import StorageConfig, StorageEngine
 
 # Configure logging for intent classification
@@ -520,9 +520,15 @@ def run() -> None:
     # We need the generator's tokenizer for accurate token counting
     budget_metrics: Optional[BudgetMetrics] = None
     context: str = ""
+    source_legend: Optional[str] = None
     
     # Check if we have parent_texts to pack (not the summary path)
     has_parent_texts = 'parent_texts' in locals() and parent_texts
+    
+    # Collect result metadata for citation formatting
+    result_metadatas: list[dict] = []
+    if has_parent_texts and results:
+        result_metadatas = [result.metadata for result in results if result.parent_text]
     
     if not args.no_generate and has_parent_texts:
         # Load generator to get tokenizer for budget packing
@@ -544,7 +550,24 @@ def run() -> None:
         pack_time_ms = (time.perf_counter() - pack_start) * 1000
         
         # Build context from packed docs
-        context = "\n\n".join(pack_result.packed_docs)
+        # Track which docs made it through packing for citation metadata
+        packed_indices = []
+        for i, doc in enumerate(parent_texts):
+            if doc in pack_result.packed_docs:
+                packed_indices.append(i)
+        
+        packed_metadatas = [result_metadatas[i] for i in packed_indices if i < len(result_metadatas)]
+        
+        # Format context with citations if enabled
+        if citations_enabled and packed_metadatas:
+            context, source_mapping = format_context_with_citations(
+                texts=pack_result.packed_docs,
+                metadatas=packed_metadatas,
+            )
+            source_legend = build_source_legend(source_mapping)
+            logger.info(f"Citations enabled: formatted {len(pack_result.packed_docs)} chunks with source markers")
+        else:
+            context = "\n\n".join(pack_result.packed_docs)
         
         # Create budget metrics
         budget_metrics = BudgetMetrics(
@@ -580,7 +603,15 @@ def run() -> None:
         )
     elif has_parent_texts:
         # For --no-generate, just join texts without budget packing
-        context = _dedupe_context(parent_texts)
+        # Still format with citations if enabled
+        if citations_enabled and result_metadatas:
+            context, source_mapping = format_context_with_citations(
+                texts=parent_texts,
+                metadatas=result_metadatas,
+            )
+            source_legend = build_source_legend(source_mapping)
+        else:
+            context = _dedupe_context(parent_texts)
     # else: context was already set in the summary branch
 
     # --- Log Metrics ---
@@ -619,6 +650,8 @@ def run() -> None:
         args.query,
         intent=intent_result.intent,
         extra_instructions=extra_instructions,
+        citations_enabled=citations_enabled,
+        source_legend=source_legend,
     )
 
     if generator is None:
@@ -630,7 +663,8 @@ def run() -> None:
     answer = _sanitize_output(answer)
     
     # Print intent info and answer
-    print(f"\n[Intent: {intent_result.intent.value} | Confidence: {intent_result.confidence:.2f} | Method: {intent_result.method}]")
+    cite_mode = "Academic" if citations_enabled else "Casual"
+    print(f"\n[Intent: {intent_result.intent.value} | Confidence: {intent_result.confidence:.2f} | Method: {intent_result.method} | Citations: {cite_mode}]")
     if source_ids:
         print(f"[Sources: {', '.join(source_ids)}]\n")
     else:

@@ -26,6 +26,96 @@ _BOILERPLATE_PATTERNS = (
 )
 
 
+def format_chunk_for_citation(
+    text: str,
+    source_id: str,
+    display_page: Optional[str] = None,
+    chunk_index: int = 1,
+) -> str:
+    """Format a chunk with citation markers for Academic Mode.
+    
+    Creates a structured chunk format that enables the LLM to cite sources:
+    [CHUNK START | SOURCE: source_id | PAGE: display_page]
+    ... chunk content ...
+    [CHUNK END]
+    
+    Args:
+        text: The chunk text content
+        source_id: Source document identifier (becomes SourceID in citations)
+        display_page: Human-readable page (e.g., 'iii', '42')
+        chunk_index: Sequential index for this chunk (for reference)
+    
+    Returns:
+        Formatted chunk string with citation markers
+    """
+    page_info = f" | PAGE: {display_page}" if display_page else ""
+    header = f"[CHUNK START | SOURCE: {source_id}{page_info}]"
+    footer = "[CHUNK END]"
+    return f"{header}\n{text.strip()}\n{footer}"
+
+
+def format_context_with_citations(
+    texts: list[str],
+    metadatas: list[dict[str, Any]],
+) -> tuple[str, dict[str, str]]:
+    """Format multiple chunks with citation markers and build source mapping.
+    
+    Args:
+        texts: List of chunk text contents
+        metadatas: List of metadata dicts (must have 'source_id', optionally 'display_page')
+    
+    Returns:
+        Tuple of:
+        - Formatted context string with all chunks
+        - Source ID to document name mapping (for citation legend)
+    """
+    formatted_chunks: list[str] = []
+    source_mapping: dict[str, str] = {}
+    
+    for idx, (text, meta) in enumerate(zip(texts, metadatas), start=1):
+        source_id = meta.get("source_id", "Unknown")
+        display_page = meta.get("display_page")
+        
+        # Build source mapping (source_id -> source_id for now, can be extended)
+        if source_id not in source_mapping:
+            source_mapping[source_id] = source_id
+        
+        formatted_chunk = format_chunk_for_citation(
+            text=text,
+            source_id=source_id,
+            display_page=display_page,
+            chunk_index=idx,
+        )
+        formatted_chunks.append(formatted_chunk)
+    
+    context = "\n\n".join(formatted_chunks)
+    return context, source_mapping
+
+
+def build_source_legend(source_mapping: dict[str, str]) -> str:
+    """Build a source legend for citation reference.
+    
+    Creates a mapping list that helps readers identify sources:
+    SOURCE LEGEND:
+    - SourceID1 → Document Name 1
+    - SourceID2 → Document Name 2
+    
+    Args:
+        source_mapping: Dict of source_id -> document name
+    
+    Returns:
+        Formatted source legend string
+    """
+    if not source_mapping:
+        return ""
+    
+    lines = ["SOURCE LEGEND:"]
+    for source_id, doc_name in sorted(source_mapping.items()):
+        lines.append(f"- {source_id} → {doc_name}")
+    
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class RetrievalResult:
     """Result from retrieval pipeline.

@@ -68,12 +68,28 @@ CRITICAL: Provide the response directly. Do NOT include:
 - Phrases like "Answer ends here", "This response reflects...", "Note:", "Overall,"
 - Any text explaining what you did or why"""
 
+# Citation rules for Academic Mode
+_CITATION_RULES = """
+CITATION REQUIREMENTS (Academic Mode):
+When citing information from the context, use the following format:
+- With page number: [SourceID, p. X] where X is the page number from the chunk header
+- Without page number: [SourceID] as fallback when no page is available
+
+Rules:
+1. Every factual claim from the context MUST include a citation
+2. Use the SOURCE and PAGE values from the [CHUNK START] markers
+3. Multiple citations can be combined: [Source1, p. 5], [Source2, p. 12]
+4. Place citations immediately after the relevant statement
+5. The Source Legend at the end maps SourceIDs to document names"""
+
 
 def build_prompt(
     context: str,
     question: str,
     intent: Optional[Intent] = None,
     extra_instructions: Optional[str] = None,
+    citations_enabled: bool = False,
+    source_legend: Optional[str] = None,
 ) -> str:
     """
     Build an intent-aware prompt for the LLM.
@@ -85,6 +101,9 @@ def build_prompt(
         context: Retrieved document context
         question: User's original question
         intent: Classified intent (defaults to OVERVIEW if None)
+        extra_instructions: Additional constraints to include
+        citations_enabled: Whether to include citation rules (Academic Mode)
+        source_legend: Optional source ID to document name mapping
     
     Returns:
         Formatted prompt string
@@ -98,18 +117,43 @@ def build_prompt(
     extra_block = ""
     if extra_instructions and extra_instructions.strip():
         extra_block = f"\nAdditional constraints: {extra_instructions.strip()}"
+    
+    # Add citation rules if enabled
+    citation_block = ""
+    if citations_enabled:
+        citation_block = f"\n{_CITATION_RULES}"
+        # Override format instructions to include citation requirement
+        format_instructions = cfg['format']
+        if "Do NOT include page numbers" in format_instructions:
+            # Remove the "do not include citations" instruction for citation mode
+            format_instructions = format_instructions.replace(
+                "Do NOT include page numbers, document headers, or citation markers. ", ""
+            ).replace(
+                "Do NOT include page numbers or citation markers.", ""
+            ).replace(
+                "Do NOT include page numbers.", ""
+            )
+        format_instructions += " Include inline citations [SourceID, p. X] for factual claims."
+        cfg = {**cfg, 'format': format_instructions}
+    
     system_block = (
-        f"{_SYSTEM_MESSAGE}\n\n"
+        f"{_SYSTEM_MESSAGE}"
+        f"{citation_block}\n\n"
         f"Task: {cfg['task']}\n"
         f"Format: {cfg['format']}\n"
         f"Tone: {cfg['tone']}"
         f"{extra_block}"
     )
 
+    # Add source legend if provided and citations enabled
+    legend_block = ""
+    if citations_enabled and source_legend:
+        legend_block = f"\n\n{source_legend}"
+
     # User block contains only context and question - no trailing instructions
     return (
         f"System: {system_block}\n\n"
-        f"Context:\n{context}\n\n"
+        f"Context:\n{context}{legend_block}\n\n"
         f"Question: {question}\n\n"
         f"Answer:"
     )
