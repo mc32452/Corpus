@@ -99,8 +99,9 @@ class StorageEngine:
 
         ids = [child.id for child in child_list]
         documents = [child.text for child in child_list]
-        metadatas = [
-            {
+        metadatas = []
+        for child in child_list:
+            meta = {
                 "source_id": child.metadata.source_id,
                 "page_number": child.metadata.page_number,
                 "page_label": child.metadata.page_label,
@@ -108,8 +109,9 @@ class StorageEngine:
                 "header_path": child.metadata.header_path,
                 "parent_id": child.metadata.parent_id,
             }
-            for child in child_list
-        ]
+            # Chroma doesn't accept None values, so filter them out
+            meta = {k: v for k, v in meta.items() if v is not None}
+            metadatas.append(meta)
 
         if embeddings is not None and len(embeddings) != len(child_list):
             raise ValueError("Embeddings length must match children length.")
