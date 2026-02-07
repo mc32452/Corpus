@@ -508,7 +508,9 @@ def run() -> None:
     if generator is None:
         generator = MlxGenerator(model_id)
 
-    gen_config = GenerationConfig(max_tokens=600 if citations_enabled else None)
+    # Academic mode (citations): 600 tokens for concise, cited answers
+    # Casual mode: 1200 tokens for comprehensive, long-form responses
+    gen_config = GenerationConfig(max_tokens=600 if citations_enabled else 1200)
     answer = _sanitize_output(generator.generate_chat(messages, config=gen_config))
     
     # Print intent info and answer

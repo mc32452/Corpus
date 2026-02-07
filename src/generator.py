@@ -134,8 +134,9 @@ class MlxGenerator:
                 if processor is not None:
                     logits_processors.append(processor)
 
-            # Use explicit max_tokens if provided, otherwise default cap at 300
-            final_max_tokens = max_tokens if max_tokens is not None else 300
+            # IMPORTANT: Always pass explicit max_tokens to override mlx-lm's hidden 256 default
+            # Use 1200 tokens (~900 words) for long-form academic answers when not specified
+            final_max_tokens = max_tokens if max_tokens is not None else 1200
             output = generate(
                 self._model,
                 self._tokenizer,
