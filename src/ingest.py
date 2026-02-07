@@ -197,7 +197,7 @@ def ingest_markdown(
             section,
             source_id=source_id.strip(),
             page_number=page_number,
-            page_label=None,  # No page labels in markdown
+            page_label=None,
             display_page=display_page,
         ):
             parents.append(parent)
@@ -240,19 +240,14 @@ def ingest_pdf(
         page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
         if not page_text:
             continue
-        
-        # Extract logical page label (e.g., 'iii', 'xii', '1', '2')
-        # pypdf provides page labels through page.get_label() for the current page
+
         page_label: Optional[str] = None
         try:
-            # Use per-page API for direct label string retrieval
-            # This avoids off-by-one issues with reader.page_labels dict indexing
             if hasattr(page, 'get_label'):
                 page_label = page.get_label()
         except Exception:
-            pass  # Page label extraction is best-effort
-        
-        # display_page: prefer page_label, fallback to str(page_number)
+            pass
+
         display_page = page_label if page_label else str(index)
         
         section = _Section(header_path="Document", text=page_text)
@@ -276,7 +271,6 @@ def ingest_pdf(
 
         fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
         if fallback_text:
-            # pdfminer fallback: no page-level info available
             section = _Section(header_path="Document", text=fallback_text)
             for parent in _split_parent_chunks(
                 section,
@@ -302,17 +296,14 @@ def ingest_pdf(
             page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
             if not page_text:
                 continue
-            
-            # PyMuPDF: extract page label if available
+
             page_label: Optional[str] = None
             try:
-                # Use per-page API page.get_label() which returns the formatted string directly
-                # Note: doc.get_page_labels() returns a list of dicts, not strings
                 if hasattr(page, 'get_label'):
                     page_label = page.get_label()
             except Exception:
-                pass  # Page label extraction is best-effort
-            
+                pass
+
             page_number = index + 1
             display_page = page_label if page_label else str(page_number)
             
@@ -343,7 +334,6 @@ def ingest_pdf(
             )
             if not page_text:
                 continue
-            # OCR fallback: no page labels available from image-based extraction
             section = _Section(header_path="Document", text=page_text)
             for parent in _split_parent_chunks(
                 section,

@@ -8,42 +8,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Global Feature Defaults
-# =============================================================================
-# These can be overridden via CLI flags or environment variables
-
-# Citations toggle: When enabled, formats context with source/page headers
-# and instructs the LLM to include [SourceID, p. X] citations in responses.
-# Default is False for casual output; enable for "Academic Mode".
 CITATIONS_ENABLED_DEFAULT: bool = False
-
-# Global cache for detected RAM (avoid repeated detection)
 _detected_ram_gb: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Configuration for RAG pipeline models and retrieval parameters.
-    
-    Attributes:
-        mode: Operating mode (regular, power-fast, power-deep-research)
-        llm_model: MLX model identifier for generation
-        embedding_model: Sentence transformer model for embeddings
-        reranker_model: FlagEmbedding reranker model
-        embedding_device: Device for embedding model (cpu to preserve VRAM)
-        quantization: MLX quantization level (4-bit, 8-bit)
-        context_window: Maximum context window size in tokens
-        retrieval_budget: Token budget for retrieved context
-        top_k_dense: Number of dense search results
-        top_k_sparse: Number of sparse (BM25) search results
-        top_k_fused: Number of results after RRF fusion
-        top_k_rerank: Number of results to pass to reranker
-        top_k_final: Number of final results to return
-        reranker_threshold: Minimum reranker score to keep document
-        reranker_min_docs: Safety net minimum documents (ignores threshold)
-        system_ram_gb: Detected system RAM (for logging)
-    """
+    """Configuration for RAG pipeline models and retrieval parameters."""
     mode: str
     llm_model: str
     embedding_model: str
@@ -62,30 +33,10 @@ class ModelConfig:
     system_ram_gb: float = 0.0
 
 
-# =============================================================================
-# Hardware-Aware Mode Configurations
-# =============================================================================
-# Token budgets are dynamically adjusted based on system RAM to ensure
-# the model + KV cache fits within hardware limits.
-#
-# 32GB (M1/M2/M3 Pro): Only regular mode, constrained budgets
-# 64GB+ (M-Max): power-fast and power-deep-research available
-
 def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
-    """Get mode configuration with RAM-aware token budget adjustments.
-    
-    Args:
-        mode: Operating mode name
-        ram_gb: Detected system RAM in GB
-        
-    Returns:
-        ModelConfig with appropriate budgets for the hardware
-    """
-    # Base configurations (will be adjusted based on RAM)
+    """Get mode configuration with RAM-aware token budget adjustments."""
     if mode == "regular":
-        # Regular: 30B 4-bit model (~18GB) - works on 32GB+
         if ram_gb < 48:
-            # 32GB system: Constrained budgets to fit model + KV cache
             return ModelConfig(
                 mode="regular",
                 llm_model="mlx-community/Qwen3-30B-A3B-MLX-4bit",
@@ -105,7 +56,6 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
                 system_ram_gb=ram_gb,
             )
         else:
-            # 64GB+ system: Full budgets
             return ModelConfig(
                 mode="regular",
                 llm_model="mlx-community/Qwen3-30B-A3B-MLX-4bit",
@@ -120,18 +70,14 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
                 top_k_fused=50,
                 top_k_rerank=20,
                 top_k_final=5,
-                reranker_threshold=-6.0,  # Aggressive filtering for RAM protection
+                reranker_threshold=-6.0,
                 reranker_min_docs=3,
                 system_ram_gb=ram_gb,
             )
-    
+
     elif mode == "power-fast":
-        # Power-fast: 30B 8-bit model (~36GB) - requires 64GB+
         if ram_gb < 64:
-            logger.warning(
-                f"power-fast mode requires 64GB+ RAM for optimal performance. "
-                f"Detected {ram_gb:.0f}GB. Consider using 'regular' mode."
-            )
+            logger.warning(f"power-fast mode requires 64GB+ RAM. Detected {ram_gb:.0f}GB.")
         return ModelConfig(
             mode="power-fast",
             llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-8bit",
@@ -146,18 +92,14 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
             top_k_fused=150,
             top_k_rerank=80,
             top_k_final=15,
-            reranker_threshold=-8.0,  # Balanced filtering for speed optimization
+            reranker_threshold=-8.0,
             reranker_min_docs=5,
             system_ram_gb=ram_gb,
         )
-    
+
     elif mode == "power-deep-research":
-        # Power-deep-research: 80B 4-bit model (~48GB) - requires 64GB+
         if ram_gb < 64:
-            logger.warning(
-                f"power-deep-research mode requires 64GB+ RAM. "
-                f"Detected {ram_gb:.0f}GB. Performance will be severely degraded."
-            )
+            logger.warning(f"power-deep-research mode requires 64GB+ RAM. Detected {ram_gb:.0f}GB.")
         return ModelConfig(
             mode="power-deep-research",
             llm_model="mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit",
@@ -172,23 +114,16 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
             top_k_fused=150,
             top_k_rerank=80,
             top_k_final=15,
-            reranker_threshold=-10.0,  # Permissive filtering for max recall
+            reranker_threshold=-10.0,
             reranker_min_docs=10,
             system_ram_gb=ram_gb,
         )
-    
+
     raise ValueError(f"Unknown mode: {mode}")
 
 
-# Valid mode names
 VALID_MODES = {"regular", "power-fast", "power-deep-research"}
-
-# RAM requirements per mode (in GB) - for validation/warnings
-MODE_RAM_REQUIREMENTS: dict[str, float] = {
-    "regular": 32.0,
-    "power-fast": 64.0,
-    "power-deep-research": 64.0,
-}
+MODE_RAM_REQUIREMENTS: dict[str, float] = {"regular": 32.0, "power-fast": 64.0, "power-deep-research": 64.0}
 
 
 # =============================================================================
@@ -250,56 +185,16 @@ def _detect_ram_gb() -> float:
 
 
 def get_system_ram_gb() -> float:
-    """Public accessor for detected system RAM.
-    
-    Returns:
-        System RAM in GB (cached after first detection).
-    """
+    """Public accessor for detected system RAM (cached)."""
     return _detect_ram_gb()
 
 
 def _auto_select_mode(ram_gb: float) -> str:
-    """Auto-select the best mode based on available RAM.
-    
-    Args:
-        ram_gb: Detected system RAM in GB
-        
-    Returns:
-        Recommended mode name
-    """
-    if ram_gb >= 64:
-        return "power-fast"  # 64GB+ can handle 8-bit model comfortably
-    else:
-        return "regular"  # 32GB systems use 4-bit model
+    return "power-fast" if ram_gb >= 64 else "regular"
 
 
-# =============================================================================
-# Mode Selection
-# =============================================================================
-
-def select_mode_config(
-    *,
-    manual_mode: Optional[str] = None,
-) -> ModelConfig:
-    """Select configuration based on mode with CLI/env var precedence.
-    
-    Resolution order:
-    1. manual_mode argument (from CLI --mode flag)
-    2. RAG_MODE environment variable
-    3. Auto-detection based on system RAM
-    
-    Token budgets are automatically adjusted based on detected RAM
-    to ensure model + KV cache fits within hardware limits.
-    
-    Args:
-        manual_mode: Mode override from CLI (highest priority)
-        
-    Returns:
-        ModelConfig for the selected mode with RAM-appropriate budgets
-        
-    Raises:
-        ValueError: If specified mode is unknown
-    """
+def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
+    """Select configuration based on mode with CLI > env var > auto precedence."""
     # Detect system RAM
     ram_gb = _detect_ram_gb()
     
@@ -310,11 +205,8 @@ def select_mode_config(
     if not mode:
         mode = _auto_select_mode(ram_gb)
         source = "auto"
-        logger.info(
-            f"Auto-selected mode '{mode}' based on {ram_gb:.0f}GB detected RAM"
-        )
-    
-    # Handle legacy tier names for backward compatibility
+        logger.info(f"Auto-selected mode '{mode}' based on {ram_gb:.0f}GB detected RAM")
+
     legacy_mapping = {
         "high": "power-fast",
         "high-performance": "power-fast",
@@ -325,10 +217,7 @@ def select_mode_config(
     if mode in legacy_mapping:
         old_mode = mode
         mode = legacy_mapping[mode]
-        logger.warning(
-            f"Legacy tier '{old_mode}' mapped to mode '{mode}'. "
-            f"Please update to use --mode={mode}"
-        )
+        logger.warning(f"Legacy tier '{old_mode}' mapped to mode '{mode}'. Use --mode={mode}")
     
     if mode not in VALID_MODES:
         valid_modes = ", ".join(sorted(VALID_MODES))

@@ -5,47 +5,37 @@ import json
 import logging
 import os
 import re
-import warnings
 import textwrap
+import warnings
 from pathlib import Path
 from typing import Iterable, Optional
 
-warnings.filterwarnings(
-    "ignore",
-    message=r"urllib3 v2 only supports OpenSSL.*",
-)
+warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL.*")
 
-from .config import select_mode_config, ModelConfig, CITATIONS_ENABLED_DEFAULT
+from .config import CITATIONS_ENABLED_DEFAULT, ModelConfig, select_mode_config
 from .generation import build_messages
-from .generator import MlxGenerator, count_tokens, enforce_token_budget
+from .generator import GenerationConfig, MlxGenerator, count_tokens, enforce_token_budget
 from .ingest import ingest_file_to_storage
 from .intent import Intent, IntentClassifier, IntentResult
-from .metrics import log_metrics, format_metrics_summary, RetrievalMetrics, BudgetMetrics, ThresholdMetrics
-from .retrieval import RetrievalEngine, format_context_with_citations, build_source_legend
+from .metrics import BudgetMetrics, RetrievalMetrics, ThresholdMetrics, format_metrics_summary, log_metrics
+from .retrieval import RetrievalEngine, build_source_legend, format_context_with_citations
 from .storage import StorageConfig, StorageEngine
 
-# Configure logging for intent classification
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def _dedupe_context(texts: Iterable[str]) -> str:
-    seen = set()
-    ordered = []
+    seen: set[str] = set()
+    unique_texts = []
     for text in texts:
         cleaned = text.strip()
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        ordered.append(cleaned)
-    return "\n\n".join(ordered)
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            unique_texts.append(cleaned)
+    return "\n\n".join(unique_texts)
 
 
-# ----- Output Sanitization -----
-# Patterns that indicate instruction leakage or repetition artifacts
 _INSTRUCTION_PATTERNS = [
     re.compile(r"^\s*Important:.*$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\s*Grounding rule:.*$", re.IGNORECASE | re.MULTILINE),
@@ -56,13 +46,8 @@ _INSTRUCTION_PATTERNS = [
     re.compile(r"^\s*Tone:.*$", re.IGNORECASE | re.MULTILINE),
 ]
 
-# Pattern to detect repeating headers/page numbers (e.g., "4. A Review of..." repeated)
-_REPETITION_PATTERN = re.compile(
-    r"(\d+\.\s+[A-Z][^.]{10,50}\.?)(\s*\1)+",
-    re.IGNORECASE,
-)
+_REPETITION_PATTERN = re.compile(r"(\d+\.\s+[A-Z][^.]{10,50}\.?)(\s*\1)+", re.IGNORECASE)
 
-# Common "chatter" phrases that slip past stop tokens (case-insensitive)
 _CHATTER_PHRASES = [
     "answer ends here",
     "this answer acknowledges",
@@ -80,144 +65,76 @@ _CHATTER_PHRASES = [
 
 
 def _strip_chatter(text: str) -> str:
-    """
-    Remove common trailing chatter phrases that may slip past stop tokens.
-    Case-insensitive matching.
-    """
+    """Remove trailing chatter phrases near end of text (last 20%)."""
     if not text:
         return text
-    
     result = text
-    text_lower = result.lower()
-    
+    lowered = result.lower()
     for phrase in _CHATTER_PHRASES:
-        idx = text_lower.rfind(phrase)
-        if idx != -1:
-            # Only strip if it's near the end (last 20% of text)
-            if idx > len(result) * 0.8:
-                result = result[:idx].rstrip()
-                text_lower = result.lower()
-    
+        idx = lowered.rfind(phrase)
+        if idx != -1 and idx > len(result) * 0.8:
+            result = result[:idx].rstrip()
+            lowered = result.lower()
     return result
 
 
 def _dedupe_repeated_blocks(text: str) -> str:
-    if not text:
+    """Remove duplicated halves when model repeats itself (>85% similarity)."""
+    if not text or len(text) < 200:
         return text
-
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    if len(normalized) < 200:
-        return text
-
-    mid = len(text) // 2
-    first = text[:mid].strip()
-    second = text[mid:].strip()
-    if not first or not second:
-        return text
-
     import difflib
-
-    first_norm = re.sub(r"\s+", " ", first).strip().lower()
-    second_norm = re.sub(r"\s+", " ", second).strip().lower()
-    ratio = difflib.SequenceMatcher(None, first_norm, second_norm).ratio()
-    if ratio >= 0.85:
-        return first
-
+    mid = len(text) // 2
+    first_half, second_half = text[:mid].strip(), text[mid:].strip()
+    if not first_half or not second_half:
+        return text
+    normalize = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+    if difflib.SequenceMatcher(None, normalize(first_half), normalize(second_half)).ratio() >= 0.85:
+        return first_half
     return text
 
 
+_INCOMPLETE_ENDING = re.compile(r"\b(the|a|an|to|of|in|for|and|or|but|is|are|was|were|that|this|with)\s*$", re.IGNORECASE)
+
+
 def _sanitize_output(text: str) -> str:
-    """
-    Post-process LLM output to remove noise and artifacts.
-    
-    - Strips trailing instruction-like phrases
-    - Removes meta-commentary and chatter
-    - Truncates repeating headers/page citations
-    - Cleans up incomplete sentences
-    """
+    """Post-process LLM output: remove instruction leakage, chatter, and incomplete sentences."""
     if not text:
         return text
-    
     result = text
-    
-    # Remove instruction leakage from the end
     for pattern in _INSTRUCTION_PATTERNS:
         result = pattern.sub("", result)
-    
-    # Remove chatter phrases
     result = _strip_chatter(result)
-
-    # Remove repeated blocks (common double-response artifact)
     result = _dedupe_repeated_blocks(result)
-    
-    # Remove repeating headers/page numbers
     result = _REPETITION_PATTERN.sub(r"\1", result)
     
-    # Remove any trailing incomplete sentences after stop (ends mid-word or with odd punctuation)
-    # Find last complete sentence
     lines = result.rstrip().split("\n")
     if lines:
         last_line = lines[-1]
-        # If last line looks incomplete (no ending punctuation, or ends with "the", "a", "to", etc.)
-        incomplete_endings = re.compile(r"\b(the|a|an|to|of|in|for|and|or|but|is|are|was|were|that|this|with)\s*$", re.IGNORECASE)
-        if incomplete_endings.search(last_line) or (last_line and last_line[-1] not in ".!?:"):
-            # Try to find a good truncation point
-            for end_char in [". ", ".\n", "! ", "!\n", "? ", "?\n"]:
-                last_good = result.rfind(end_char)
-                if last_good > len(result) * 0.5:  # Only truncate if we keep most of the content
-                    result = result[:last_good + 1]
+        if _INCOMPLETE_ENDING.search(last_line) or (last_line and last_line[-1] not in ".!?:"):
+            for sentinel in [". ", ".\n", "! ", "!\n", "? ", "?\n"]:
+                truncate_pos = result.rfind(sentinel)
+                if truncate_pos > len(result) * 0.5:
+                    result = result[:truncate_pos + 1]
                     break
-    
     return result.strip()
 
 
-# ----- Query Expansion -----
-# Query expansion terms by intent (used when --enable-query-expansion is set)
-# NOTE: expansion_enabled is hardcoded to False by default - only active with explicit flag
 _EXPANSION_TERMS: dict[Intent, list[str]] = {
-    Intent.OVERVIEW: [],  # No expansion for overview - keep high-level
+    Intent.OVERVIEW: [],
     Intent.SUMMARIZE: ["main argument", "thesis", "conclusion", "key points"],
-    Intent.EXPLAIN: [],  # No expansion for explain - keep broad
+    Intent.EXPLAIN: [],
     Intent.ANALYZE: ["criticism", "critique", "debate", "objection", "response", "controversy"],
 }
 
 
 def _expand_query(query: str, intent: Intent) -> str:
-    """
-    Expand query with intent-specific terms.
-    
-    This is behind a feature flag (--enable-query-expansion) because it
-    modifies retrieval input and could degrade results for some queries.
-    """
+    """Append intent-specific expansion terms to query (feature-flagged)."""
     terms = _EXPANSION_TERMS.get(intent, [])
-    if not terms:
-        return query
-    
-    # Append expansion terms to query
-    expansion = " ".join(terms)
-    return f"{query} {expansion}"
+    return f"{query} {' '.join(terms)}" if terms else query
 
 
-def _log_query(
-    original_query: str,
-    expanded_query: Optional[str],
-    intent: IntentResult,
-    expansion_enabled: bool,
-) -> None:
-    """
-    Log query details for analysis and A/B comparison.
-    
-    Logs: {original_query, expanded_query, intent, expansion_enabled}
-    """
-    log_entry = {
-        "original_query": original_query,
-        "expanded_query": expanded_query,
-        "intent": intent.intent.value,
-        "intent_confidence": intent.confidence,
-        "intent_method": intent.method,
-        "expansion_enabled": expansion_enabled,
-    }
-    logger.info(f"Query log: {json.dumps(log_entry)}")
+def _log_query(original: str, expanded: Optional[str], intent: IntentResult, expansion_enabled: bool) -> None:
+    logger.info(f"Query log: {json.dumps({'original_query': original, 'expanded_query': expanded, 'intent': intent.intent.value, 'intent_confidence': intent.confidence, 'intent_method': intent.method, 'expansion_enabled': expansion_enabled})}")
 
 
 def run() -> None:
@@ -283,7 +200,6 @@ def run() -> None:
         action="store_true",
         help="Only show retrieved context without LLM generation",
     )
-    # Intent classification options
     query_parser.add_argument(
         "--intent",
         choices=["overview", "summarize", "explain", "analyze"],
@@ -291,27 +207,19 @@ def run() -> None:
         help="Override automatic intent classification",
     )
     query_parser.add_argument(
-        "--intent-confidence-threshold",
-        type=float,
-        default=0.6,
+        "--intent-confidence-threshold", type=float, default=0.6,
         help="Minimum confidence for intent classification (default: 0.6)",
     )
     query_parser.add_argument(
-        "--no-llm-intent",
-        action="store_true",
+        "--no-llm-intent", action="store_true",
         help="Use heuristic-only intent classification (faster, no extra LLM call)",
     )
-    # Query expansion options (feature flag, default OFF)
     query_parser.add_argument(
-        "--enable-query-expansion",
-        action="store_true",
+        "--enable-query-expansion", action="store_true",
         help="Enable intent-based query expansion for retrieval (experimental)",
     )
-    # Citation options (Academic Mode)
     query_parser.add_argument(
-        "--cite",
-        action="store_true",
-        default=None,
+        "--cite", action="store_true", default=None,
         help="Enable inline citations in output (Academic Mode). Formats context with source/page markers and requires [SourceID, p. X] citations.",
     )
     query_parser.add_argument(
@@ -323,10 +231,7 @@ def run() -> None:
 
     args = parser.parse_args()
 
-    # Select mode configuration with CLI/env var/auto precedence
     config = select_mode_config(manual_mode=getattr(args, 'mode', None))
-    
-    # Print resolved mode info at startup with hardware details
     mode_source = "CLI" if getattr(args, 'mode', None) else "env" if os.getenv("RAG_MODE") else "auto"
     print(f"\n[Hardware: {config.system_ram_gb:.0f}GB | Mode: {config.mode} ({mode_source})]")
     print(f"[LLM: {config.llm_model} | Quant: {config.quantization}]")
@@ -399,74 +304,39 @@ def run() -> None:
         config=config,
     )
 
-    # --- Intent Classification ---
     model_id = args.model or config.llm_model
     generator: Optional[MlxGenerator] = None
     
-    # --- Resolve citations mode ---
-    # Precedence: --cite/--no-cite CLI flags > CITATIONS_ENABLED_DEFAULT
-    if args.cite:
-        citations_enabled = True
-    elif args.no_cite:
-        citations_enabled = False
-    else:
-        citations_enabled = CITATIONS_ENABLED_DEFAULT
+    citations_enabled = args.cite if args.cite else (not args.no_cite and CITATIONS_ENABLED_DEFAULT)
+    logger.info(f"Citations mode: {'ENABLED (Academic Mode)' if citations_enabled else 'DISABLED (Casual Mode)'}")
     
-    if citations_enabled:
-        logger.info("Citations mode: ENABLED (Academic Mode)")
-    else:
-        logger.info("Citations mode: DISABLED (Casual Mode)")
-    
-    # Determine intent (manual override or automatic classification)
     intent_result: Optional[IntentResult] = None
-    
     if args.intent:
-        # Manual override - use specified intent with full confidence
         intent_map = {
-            "overview": Intent.OVERVIEW,
-            "summarize": Intent.SUMMARIZE,
-            "explain": Intent.EXPLAIN,
-            "analyze": Intent.ANALYZE,
+            "overview": Intent.OVERVIEW, "summarize": Intent.SUMMARIZE,
+            "explain": Intent.EXPLAIN, "analyze": Intent.ANALYZE,
         }
-        intent = intent_map[args.intent]
-        intent_result = IntentResult(intent=intent, confidence=1.0, method="manual")
-        logger.info(f"Using manual intent override: {intent.value}")
+        intent_result = IntentResult(intent=intent_map[args.intent], confidence=1.0, method="manual")
+        logger.info(f"Using manual intent override: {intent_result.intent.value}")
     else:
-        # Automatic classification
-        # Only load generator for LLM-based classification if needed
         use_llm_intent = not args.no_llm_intent and not args.no_generate
-        
         if use_llm_intent:
             generator = MlxGenerator(model_id)
-        
         classifier = IntentClassifier(
             generator=generator,
             confidence_threshold=args.intent_confidence_threshold,
             use_llm=use_llm_intent,
         )
         intent_result = classifier.classify(args.query)
-        logger.info(
-            f"Classified intent: {intent_result.intent.value} "
-            f"(confidence={intent_result.confidence:.2f}, method={intent_result.method})"
-        )
-    
-    # --- Query Expansion (behind feature flag) ---
+        logger.info(f"Classified intent: {intent_result.intent.value} (confidence={intent_result.confidence:.2f}, method={intent_result.method})")
+
     search_query = args.query
     if args.enable_query_expansion:
         search_query = _expand_query(args.query, intent_result.intent)
-        logger.info(
-            f"Query expansion enabled: original='{args.query}' -> expanded='{search_query}'"
-        )
-    
-    # Log query details for analysis
-    _log_query(
-        original_query=args.query,
-        expanded_query=search_query if args.enable_query_expansion else None,
-        intent=intent_result,
-        expansion_enabled=args.enable_query_expansion,
-    )
+        logger.info(f"Query expansion enabled: original='{args.query}' -> expanded='{search_query}'")
 
-    # --- Retrieval ---
+    _log_query(args.query, search_query if args.enable_query_expansion else None, intent_result, args.enable_query_expansion)
+
     extra_instructions: Optional[str] = None
 
     if intent_result.intent == Intent.SUMMARIZE and not args.source_id:
@@ -511,61 +381,34 @@ def run() -> None:
             context = "\n\n".join(summary_blocks)
             results = []
             source_ids = sources
-            parent_texts = []  # No parent texts for summary mode
+            parent_texts = []
             extra_instructions = (
                 "Provide a single consolidated answer addressing the user's question. "
                 "Do not output per-source summaries or repeat points."
             )
         else:
             results = retrieval.search(search_query, source_id=args.source_id)
-            source_ids = sorted(
-                {
-                    result.metadata.get("source_id")
-                    for result in results
-                    if result.metadata.get("source_id")
-                }
-            )
-            # Collect parent texts for budget packing
-            parent_texts = [result.parent_text for result in results if result.parent_text]
+            source_ids = sorted({r.metadata.get("source_id") for r in results if r.metadata.get("source_id")})
+            parent_texts = [r.parent_text for r in results if r.parent_text]
     else:
         results = retrieval.search(search_query, source_id=args.source_id)
-        source_ids = sorted(
-            {
-                result.metadata.get("source_id")
-                for result in results
-                if result.metadata.get("source_id")
-            }
-        )
-        # Collect parent texts for budget packing (done later with tokenizer)
-        parent_texts = [result.parent_text for result in results if result.parent_text]
+        source_ids = sorted({r.metadata.get("source_id") for r in results if r.metadata.get("source_id")})
+        parent_texts = [r.parent_text for r in results if r.parent_text]
 
-    # --- Extract Retrieval Metrics ---
-    retrieval_metrics: Optional[RetrievalMetrics] = None
-    if results and results[0].metrics:
-        retrieval_metrics = results[0].metrics
+    retrieval_metrics: Optional[RetrievalMetrics] = results[0].metrics if results and results[0].metrics else None
 
-    # --- Token Budget Packing ---
-    # We need the generator's tokenizer for accurate token counting
     budget_metrics: Optional[BudgetMetrics] = None
     context: str = ""
     source_legend: Optional[str] = None
-    
-    # Check if we have parent_texts to pack (not the summary path)
     has_parent_texts = 'parent_texts' in locals() and parent_texts
-    
-    # Collect result metadata for citation formatting
-    result_metadatas: list[dict] = []
-    if has_parent_texts and results:
-        result_metadatas = [result.metadata for result in results if result.parent_text]
+    result_metadatas: list[dict] = [r.metadata for r in results if r.parent_text] if has_parent_texts and results else []
     
     if not args.no_generate and has_parent_texts:
-        # Load generator to get tokenizer for budget packing
         if generator is None:
             generator = MlxGenerator(model_id)
-        
+
         import time
         pack_start = time.perf_counter()
-        
         pack_result = enforce_token_budget(
             docs=parent_texts,
             max_tokens=config.retrieval_budget,
@@ -576,17 +419,9 @@ def run() -> None:
         )
         
         pack_time_ms = (time.perf_counter() - pack_start) * 1000
+
+        packed_metadatas = [result_metadatas[i] for i in pack_result.packed_indices if i < len(result_metadatas)]
         
-        # Build context from packed docs
-        # Use packed_indices from the pack_result to preserve metadata alignment
-        # even when documents are truncated (string matching would fail)
-        packed_metadatas = [
-            result_metadatas[i]
-            for i in pack_result.packed_indices
-            if i < len(result_metadatas)
-        ]
-        
-        # Format context with citations if enabled
         if citations_enabled and packed_metadatas:
             context, source_mapping = format_context_with_citations(
                 texts=pack_result.packed_docs,
@@ -596,8 +431,7 @@ def run() -> None:
             logger.info(f"Citations enabled: formatted {len(pack_result.packed_docs)} chunks with source markers")
         else:
             context = "\n\n".join(pack_result.packed_docs)
-        
-        # Create budget metrics
+
         budget_metrics = BudgetMetrics(
             budget_tokens=config.retrieval_budget,
             used_tokens=pack_result.used_tokens,
@@ -607,10 +441,8 @@ def run() -> None:
             docs_skipped=pack_result.skipped_count,
             docs_truncated=pack_result.truncated_count,
         )
-        
-        # Update retrieval metrics with budget info and packing time
+
         if retrieval_metrics:
-            # Update timing with budget packing time
             updated_timing = retrieval_metrics.timing
             updated_timing.budget_packing_ms = pack_time_ms
             updated_timing.total_ms += pack_time_ms
@@ -624,14 +456,9 @@ def run() -> None:
                 query=retrieval_metrics.query,
                 mode=retrieval_metrics.mode,
             )
-        
-        logger.info(
-            f"Budget packing: {pack_result.used_tokens:,}/{config.retrieval_budget:,} tokens "
-            f"({budget_metrics.utilization_pct:.1f}%), {len(pack_result.packed_docs)} docs packed"
-        )
+
+        logger.info(f"Budget packing: {pack_result.used_tokens:,}/{config.retrieval_budget:,} tokens ({budget_metrics.utilization_pct:.1f}%), {len(pack_result.packed_docs)} docs packed")
     elif has_parent_texts:
-        # For --no-generate, just join texts without budget packing
-        # Still format with citations if enabled
         if citations_enabled and result_metadatas:
             context, source_mapping = format_context_with_citations(
                 texts=parent_texts,
@@ -640,11 +467,8 @@ def run() -> None:
             source_legend = build_source_legend(source_mapping)
         else:
             context = _dedupe_context(parent_texts)
-    # else: context was already set in the summary branch
 
-    # --- Log Metrics ---
     if retrieval_metrics:
-        # Update with budget metrics if available but not yet set
         if budget_metrics and retrieval_metrics.budget.budget_tokens == 0:
             retrieval_metrics = RetrievalMetrics(
                 budget=budget_metrics,
@@ -672,7 +496,6 @@ def run() -> None:
             print("-" * 80)
         return
 
-    # --- Generation ---
     messages = build_messages(
         context,
         args.query,
@@ -684,14 +507,9 @@ def run() -> None:
 
     if generator is None:
         generator = MlxGenerator(model_id)
-    
-    # Use higher token limit for academic mode (citations add overhead)
-    from .generator import GenerationConfig
+
     gen_config = GenerationConfig(max_tokens=600 if citations_enabled else None)
-    answer = generator.generate_chat(messages, config=gen_config)
-    
-    # --- Output Sanitization ---
-    answer = _sanitize_output(answer)
+    answer = _sanitize_output(generator.generate_chat(messages, config=gen_config))
     
     # Print intent info and answer
     cite_mode = "Academic" if citations_enabled else "Casual"
