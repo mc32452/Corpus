@@ -68,26 +68,13 @@ def build_prompt(
     citations_enabled: bool = False,
     source_legend: Optional[str] = None,
 ) -> str:
-    """Build an intent-aware prompt for the LLM."""
-    if intent is None:
-        intent = Intent.OVERVIEW
+    """Build an intent-aware prompt for the LLM.
 
-    cfg = INTENT_INSTRUCTIONS.get(intent, INTENT_INSTRUCTIONS[Intent.OVERVIEW])
-    extra_block = f"\nAdditional constraints: {extra_instructions.strip()}" if extra_instructions and extra_instructions.strip() else ""
-
-    citation_block = ""
-    if citations_enabled:
-        citation_block = f"\n{_CITATION_RULES}"
-        format_instructions = cfg['format']
-        for pattern in ["Do NOT include page numbers, document headers, or citation markers. ", "Do NOT include page numbers or citation markers.", "Do NOT include page numbers."]:
-            format_instructions = format_instructions.replace(pattern, "")
-        format_instructions += " Include inline citations [SourceID, p. X] for factual claims."
-        cfg = {**cfg, 'format': format_instructions}
-
-    system_block = (
-        f"{_SYSTEM_MESSAGE}{citation_block}\n\n"
-        f"Task: {cfg['task']}\nFormat: {cfg['format']}\nTone: {cfg['tone']}{extra_block}"
-    )
+    Delegates to the shared ``_prepare_config`` / ``_build_system_block``
+    helpers so citation-rule injection has a single source of truth.
+    """
+    cfg, citation_block, extra_block = _prepare_config(intent, citations_enabled, extra_instructions)
+    system_block = _build_system_block(cfg, citation_block, extra_block)
     legend_block = f"\n\n{source_legend}" if citations_enabled and source_legend else ""
 
     return f"System: {system_block}\n\nContext:\n{context}{legend_block}\n\nQuestion: {question}\n\nAnswer:"

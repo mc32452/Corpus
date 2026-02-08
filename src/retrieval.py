@@ -32,9 +32,14 @@ def format_chunk_for_citation(
     display_page: Optional[str] = None,
     chunk_index: int = 1,
 ) -> str:
-    """Format a chunk with citation markers for Academic Mode."""
-    page_info = f" | PAGE: {display_page}" if display_page else ""
-    header = f"[CHUNK START | SOURCE: {source_id}{page_info}]"
+    """Format a chunk with citation markers for Academic Mode.
+
+    The PAGE: marker is always present so the LLM never has to guess
+    or hallucinate a page number.  When metadata is missing the value
+    falls back to ``"Unknown"``.
+    """
+    page_value = display_page if display_page else "Unknown"
+    header = f"[CHUNK START | SOURCE: {source_id} | PAGE: {page_value}]"
     return f"{header}\n{text.strip()}\n[CHUNK END]"
 
 

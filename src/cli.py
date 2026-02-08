@@ -386,6 +386,11 @@ def run() -> None:
                 "Provide a single consolidated answer addressing the user's question. "
                 "Do not output per-source summaries or repeat points."
             )
+            # Summary-based context lacks [CHUNK START] markers, so
+            # citations must be disabled to prevent hallucinated references.
+            if citations_enabled:
+                logger.info("Auto-disabling citations: context is built from document summaries (no chunk markers)")
+                citations_enabled = False
         else:
             results = retrieval.search(search_query, source_id=args.source_id)
             source_ids = sorted({r.metadata.get("source_id") for r in results if r.metadata.get("source_id")})
