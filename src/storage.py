@@ -52,7 +52,10 @@ class StorageEngine:
 
         settings = Settings(anonymized_telemetry=False, is_persistent=True)
         self._chroma = chromadb.PersistentClient(path=str(config.chroma_dir), settings=settings)
-        self._collection = self._chroma.get_or_create_collection(config.chroma_collection)
+        self._collection = self._chroma.get_or_create_collection(
+            config.chroma_collection,
+            metadata={"hnsw:space": "cosine"},
+        )
 
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_corpus: list[list[str]] = []
