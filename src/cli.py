@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+# Set offline mode BEFORE importing any model-loading libraries
+import os
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+
 import argparse
 import gc
 import json
 import logging
-import os
 import re
 import textwrap
 import warnings
