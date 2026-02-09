@@ -129,7 +129,8 @@ class StorageEngine:
         self._bm25_source_ids.extend(
             [child.metadata.source_id for child in child_list]
         )
-        self._bm25 = BM25Okapi(self._bm25_corpus)
+        # Mark BM25 dirty; rebuilt lazily on next property access
+        self._bm25 = None
 
     def get_parent_text(self, parent_id: str) -> Optional[str]:
         cursor = self._conn.execute(
@@ -242,6 +243,8 @@ class StorageEngine:
 
     @property
     def bm25(self) -> Optional[BM25Okapi]:
+        if self._bm25 is None and self._bm25_corpus:
+            self._bm25 = BM25Okapi(self._bm25_corpus)
         return self._bm25
 
     @property
