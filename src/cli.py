@@ -1,9 +1,35 @@
 from __future__ import annotations
 
-# Set offline mode BEFORE importing any model-loading libraries
 import os
-os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
+from pathlib import Path
+
+# Check if required models are cached locally before enabling offline mode
+def _check_models_cached() -> bool:
+    """Check if all required models exist in Hugging Face cache."""
+    required_models = [
+        "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+        "BAAI/bge-m3",
+        "BAAI/bge-reranker-v2-m3",
+    ]
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    
+    if not cache_dir.exists():
+        return False
+    
+    for model_id in required_models:
+        # Convert model ID to cache folder format: models--org--model
+        cache_folder = f"models--{model_id.replace('/', '--')}"
+        model_cache_path = cache_dir / cache_folder
+        if not model_cache_path.exists():
+            return False
+    
+    return True
+
+
+# Set offline mode BEFORE importing any model-loading libraries (only if models are cached)
+if _check_models_cached():
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 import argparse
 import gc
