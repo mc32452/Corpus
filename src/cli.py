@@ -13,6 +13,10 @@ from typing import Iterable, Optional
 
 warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL.*")
 
+# Apply compatibility patches BEFORE importing other modules
+from .compat_patch import patch_transformers_compatibility
+patch_transformers_compatibility()
+
 from .config import CITATIONS_ENABLED_DEFAULT, ModelConfig, select_mode_config
 from .generation import build_messages
 from .generator import GenerationConfig, MlxGenerator, count_tokens, enforce_token_budget
@@ -142,6 +146,11 @@ def run() -> None:
     logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
     parser = argparse.ArgumentParser(description="Offline RAG CLI")
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging (show httpx, huggingface_hub, and detailed retrieval metrics)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ingest_parser = subparsers.add_parser("ingest", help="Ingest a Markdown file")
@@ -234,6 +243,14 @@ def run() -> None:
 
     if args.cite and args.no_cite:
         parser.error("Conflicting flags: use only one of --cite or --no-cite.")
+
+    # ---- logging verbosity ----
+    verbose = getattr(args, "verbose", False)
+    if not verbose:
+        # Suppress noisy third-party loggers in normal mode
+        for noisy in ("httpx", "huggingface_hub", "chromadb", "urllib3",
+                       "sentence_transformers", "filelock", "fsspec"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
     config = select_mode_config(manual_mode=getattr(args, 'mode', None))
     mode_source = "CLI" if getattr(args, 'mode', None) else "env" if os.getenv("RAG_MODE") else "auto"
@@ -506,8 +523,9 @@ def run() -> None:
                 query=retrieval_metrics.query,
                 mode=retrieval_metrics.mode,
             )
-        log_metrics(retrieval_metrics, config.mode, logger)
-        print(f"[Retrieval: {format_metrics_summary(retrieval_metrics)}]")
+        if verbose:
+            log_metrics(retrieval_metrics, config.mode, logger)
+            print(f"[Retrieval: {format_metrics_summary(retrieval_metrics)}]")
 
     if args.no_generate:
         print("Top retrieved context:\n")
