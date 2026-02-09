@@ -37,6 +37,7 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
     """Get mode configuration with RAM-aware token budget adjustments."""
     if mode == "regular":
         if ram_gb < 48:
+            # 32GB systems: reduced context to avoid swap thrashing
             return ModelConfig(
                 mode="regular",
                 llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
@@ -44,8 +45,8 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
                 reranker_model="BAAI/bge-reranker-v2-m3",
                 embedding_device="cpu",
                 quantization="4-bit",
-                context_window=64_000,
-                retrieval_budget=32_000,
+                context_window=16_000,
+                retrieval_budget=8_000,
                 top_k_dense=100,
                 top_k_sparse=100,
                 top_k_fused=50,
@@ -56,6 +57,7 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
                 system_ram_gb=ram_gb,
             )
         else:
+            # 48GB+ systems (e.g. M4 Max 64GB) can handle full context
             return ModelConfig(
                 mode="regular",
                 llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",

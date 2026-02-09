@@ -139,6 +139,15 @@ class MlxGenerator:
             # Use 1200 tokens (~900 words) for long-form academic answers when not specified
             final_max_tokens = max_tokens if max_tokens is not None else 1200
             prompt_tokens = count_tokens(prompt, self._tokenizer)
+            
+            # Warn if approaching typical context window limits
+            if prompt_tokens > 12_000:
+                logger.warning(
+                    "High prompt token count: %d tokens (approaching 16K context limit). "
+                    "Consider reducing context if using 16K window.",
+                    prompt_tokens
+                )
+            
             start_time = time.perf_counter()
             output = generate(
                 self._model,
