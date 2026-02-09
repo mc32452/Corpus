@@ -22,7 +22,7 @@ The system implements a **hybrid retrieval-augmented generation (RAG) pipeline**
 *   **Embeddings:** `sentence-transformers` (Run on CPU to save VRAM).
 *   **Re-ranking:** `FlagEmbedding` (BGE-Reranker-v2-m3).
 *   **Sparse Search:** `rank_bm25`.
-*   **Vector Store:** `chromadb` (Local) or `faiss-cpu`.
+*   **Vector Store:** `chromadb` (Local, HNSW with cosine distance).
 *   **Key-Value Store:** `sqlite3` (for Parent Chunks).
 
 ---
@@ -39,7 +39,7 @@ Hierarchical chunk structure for efficient retrieval and context expansion:
 
 ### Module B: Storage Engine
 
-*   **Vector Index**: Embeddings of child chunks with int8 quantization (Chroma/FAISS).
+*   **Vector Index**: Embeddings of child chunks stored in Chroma (HNSW, cosine distance).
 *   **Lexical Index**: BM25 index of child chunk text for keyword-based search.
 *   **Context Store**: SQLite database mapping `parent_id` to full parent text for context expansion.
 
@@ -261,7 +261,7 @@ python -m src.cli query "Search for key terms" --no-generate
 ## 10. Dependencies
 
 ### Required
-- `chromadb` - Vector database
+- `chromadb` - Vector database (HNSW, cosine distance)
 - `rank-bm25` - Sparse search indexing
 - `pydantic` - Configuration validation
 - `sentence-transformers` - Embedding model inference
