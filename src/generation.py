@@ -60,26 +60,6 @@ CITATION REQUIREMENTS:
 - REQUIRED: Every claim must have a citation"""
 
 
-def build_prompt(
-    context: str,
-    question: str,
-    intent: Optional[Intent] = None,
-    extra_instructions: Optional[str] = None,
-    citations_enabled: bool = False,
-    source_legend: Optional[str] = None,
-) -> str:
-    """Build an intent-aware prompt for the LLM.
-
-    Delegates to the shared ``_prepare_config`` / ``_build_system_block``
-    helpers so citation-rule injection has a single source of truth.
-    """
-    cfg, citation_block, extra_block = _prepare_config(intent, citations_enabled, extra_instructions)
-    system_block = _build_system_block(cfg, citation_block, extra_block)
-    legend_block = f"\n\n{source_legend}" if citations_enabled and source_legend else ""
-
-    return f"System: {system_block}\n\nContext:\n{context}{legend_block}\n\nQuestion: {question}\n\nAnswer:"
-
-
 def _build_system_block(cfg: dict[str, str], citation_block: str, extra_block: str) -> str:
     return f"{_SYSTEM_MESSAGE}{citation_block}\n\nTask: {cfg['task']}\nFormat: {cfg['format']}\nTone: {cfg['tone']}{extra_block}"
 

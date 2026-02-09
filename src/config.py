@@ -239,23 +239,3 @@ def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
     
     return config
 
-
-# =============================================================================
-# Legacy API (Deprecated)
-# =============================================================================
-
-def select_model_config(*, manual_tier: Optional[str] = None) -> ModelConfig:
-    """Legacy function for backward compatibility.
-    
-    Deprecated: Use select_mode_config() instead.
-    
-    Args:
-        manual_tier: Legacy tier name
-        
-    Returns:
-        ModelConfig from the mapped mode
-    """
-    logger.warning(
-        "select_model_config() is deprecated. Use select_mode_config() instead."
-    )
-    return select_mode_config(manual_mode=manual_tier)
