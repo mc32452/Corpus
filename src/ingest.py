@@ -327,11 +327,21 @@ def ingest_pdf(
                 "pytesseract and pdf2image are required for OCR PDF extraction."
             ) from exc
 
-        images = convert_from_path(str(path))
-        for index, image in enumerate(images, start=1):
-            page_text = clean_ocr_artifacts(
-                (pytesseract.image_to_string(image) or "").strip()
+        # Process pages one at a time to avoid loading all rasterized
+        # images into memory simultaneously.  A 200-page PDF at 300 DPI
+        # can consume 4-6 GB when fully rasterized, risking OOM on 32 GB
+        # Apple Silicon machines.
+        page_count = len(reader.pages)
+        for index in range(1, page_count + 1):
+            page_images = convert_from_path(
+                str(path), first_page=index, last_page=index,
             )
+            if not page_images:
+                continue
+            page_text = clean_ocr_artifacts(
+                (pytesseract.image_to_string(page_images[0]) or "").strip()
+            )
+            del page_images  # release rasterized image immediately
             if not page_text:
                 continue
             section = _Section(header_path="Document", text=page_text)
