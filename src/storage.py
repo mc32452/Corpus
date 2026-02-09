@@ -33,6 +33,8 @@ class StorageEngine:
                 parent_id TEXT PRIMARY KEY,
                 source_id TEXT NOT NULL,
                 page_number INTEGER,
+                page_label TEXT,
+                display_page TEXT,
                 header_path TEXT NOT NULL,
                 text TEXT NOT NULL
             )
@@ -66,6 +68,8 @@ class StorageEngine:
                 parent.id,
                 parent.metadata.source_id,
                 parent.metadata.page_number,
+                parent.metadata.page_label,
+                parent.metadata.display_page,
                 parent.metadata.header_path,
                 parent.text,
             )
@@ -77,8 +81,8 @@ class StorageEngine:
             self._conn.executemany(
                 """
                 INSERT OR REPLACE INTO parent_chunks
-                    (parent_id, source_id, page_number, header_path, text)
-                VALUES (?, ?, ?, ?, ?)
+                    (parent_id, source_id, page_number, page_label, display_page, header_path, text)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -95,15 +99,19 @@ class StorageEngine:
 
         ids = [child.id for child in child_list]
         documents = [child.text for child in child_list]
-        metadatas = [
-            {
+        metadatas = []
+        for child in child_list:
+            meta = {
                 "source_id": child.metadata.source_id,
                 "page_number": child.metadata.page_number,
+                "page_label": child.metadata.page_label,
+                "display_page": child.metadata.display_page,
                 "header_path": child.metadata.header_path,
                 "parent_id": child.metadata.parent_id,
             }
-            for child in child_list
-        ]
+            # Chroma doesn't accept None values, so filter them out
+            meta = {k: v for k, v in meta.items() if v is not None}
+            metadatas.append(meta)
 
         if embeddings is not None and len(embeddings) != len(child_list):
             raise ValueError("Embeddings length must match children length.")

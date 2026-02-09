@@ -7,7 +7,7 @@ from typing import Iterable, Optional
 
 from .models import ChildChunk, Metadata, ParentChunk
 from .intent import Intent
-from .generation import build_prompt
+from .generation import build_messages
 from .generator import MlxGenerator
 from .storage import StorageEngine
 
@@ -106,6 +106,8 @@ def _split_parent_chunks(
     *,
     source_id: str,
     page_number: Optional[int],
+    page_label: Optional[str] = None,
+    display_page: Optional[str] = None,
 ) -> list[ParentChunk]:
     tokens = _tokenize(section.text)
     if not tokens:
@@ -125,6 +127,8 @@ def _split_parent_chunks(
         metadata = Metadata(
             source_id=source_id,
             page_number=page_number,
+            page_label=page_label,
+            display_page=display_page,
             header_path=section.header_path,
             parent_id=None,
         )
@@ -150,6 +154,8 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
         metadata = Metadata(
             source_id=parent.metadata.source_id,
             page_number=parent.metadata.page_number,
+            page_label=parent.metadata.page_label,
+            display_page=parent.metadata.display_page,
             header_path=parent.metadata.header_path,
             parent_id=parent.id,
         )
@@ -180,6 +186,9 @@ def ingest_markdown(
     if not sections:
         raise ValueError("No parsable content found in markdown file.")
 
+    # For markdown, display_page is simply str(page_number) if provided
+    display_page = str(page_number) if page_number is not None else None
+
     parents: list[ParentChunk] = []
     children: list[ChildChunk] = []
 
@@ -188,6 +197,8 @@ def ingest_markdown(
             section,
             source_id=source_id.strip(),
             page_number=page_number,
+            page_label=None,
+            display_page=display_page,
         ):
             parents.append(parent)
             children.extend(_split_child_chunks(parent))
@@ -229,11 +240,23 @@ def ingest_pdf(
         page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
         if not page_text:
             continue
+
+        page_label: Optional[str] = None
+        try:
+            if hasattr(page, 'get_label'):
+                page_label = page.get_label()
+        except Exception:
+            pass
+
+        display_page = page_label if page_label else str(index)
+        
         section = _Section(header_path="Document", text=page_text)
         for parent in _split_parent_chunks(
             section,
             source_id=source_id.strip(),
             page_number=index,
+            page_label=page_label,
+            display_page=display_page,
         ):
             parents.append(parent)
             children.extend(_split_child_chunks(parent))
@@ -253,6 +276,8 @@ def ingest_pdf(
                 section,
                 source_id=source_id.strip(),
                 page_number=None,
+                page_label=None,
+                display_page=None,
             ):
                 parents.append(parent)
                 children.extend(_split_child_chunks(parent))
@@ -271,11 +296,24 @@ def ingest_pdf(
             page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
             if not page_text:
                 continue
+
+            page_label: Optional[str] = None
+            try:
+                if hasattr(page, 'get_label'):
+                    page_label = page.get_label()
+            except Exception:
+                pass
+
+            page_number = index + 1
+            display_page = page_label if page_label else str(page_number)
+            
             section = _Section(header_path="Document", text=page_text)
             for parent in _split_parent_chunks(
                 section,
                 source_id=source_id.strip(),
-                page_number=index + 1,
+                page_number=page_number,
+                page_label=page_label,
+                display_page=display_page,
             ):
                 parents.append(parent)
                 children.extend(_split_child_chunks(parent))
@@ -301,6 +339,8 @@ def ingest_pdf(
                 section,
                 source_id=source_id.strip(),
                 page_number=index,
+                page_label=None,
+                display_page=str(index),
             ):
                 parents.append(parent)
                 children.extend(_split_child_chunks(parent))
@@ -396,12 +436,12 @@ def ingest_file_to_storage(
         context = "\n\n".join(parent.text for parent in parents)
         if len(context) > 12000:
             context = context[:12000]
-        prompt = build_prompt(
+        messages = build_messages(
             context=context,
             question="Summarize this document.",
             intent=Intent.SUMMARIZE,
         )
-        summary = generator.generate(prompt)
+        summary = generator.generate_chat(messages)
         storage.upsert_source_summary(source_id=source_id, summary=summary)
 
     return len(parents), len(children)

@@ -7,10 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Metadata(BaseModel):
+    """Metadata for document chunks."""
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_id: str = Field(..., min_length=1)
     page_number: Optional[int] = Field(default=None, ge=1)
+    page_label: Optional[str] = Field(default=None, description="Logical page label from PDF")
+    display_page: Optional[str] = Field(default=None, description="Human-readable page for citations")
     header_path: str = Field(..., min_length=1)
     parent_id: Optional[str] = None
 
