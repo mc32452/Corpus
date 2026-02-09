@@ -177,7 +177,8 @@ class RetrievalEngine:
 
         source_ids = self._storage.bm25_source_ids
         source_filter = bool(source_id)
-        if source_filter and (not source_ids or len(source_ids) != len(self._storage.bm25_ids)):
+        bm25_id_list = self._storage.bm25_ids  # cache once to avoid list copy per iteration
+        if source_filter and (not source_ids or len(source_ids) != len(bm25_id_list)):
             raise RuntimeError(
                 "BM25 index source_ids are missing or misaligned; "
                 "rebuild the BM25 index to use source_id filtering."
@@ -186,7 +187,7 @@ class RetrievalEngine:
         results: list[dict[str, Any]] = []
         rank = 1
         for idx, score in ranked:
-            child_id = self._storage.bm25_ids[idx]
+            child_id = bm25_id_list[idx]
             if source_filter:
                 if source_ids[idx] != source_id:
                     continue
