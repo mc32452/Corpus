@@ -223,7 +223,7 @@ class RetrievalEngine:
             payloads.setdefault(item["id"], item)
 
         fused = [
-            {"id": cid, "score": score, **payloads.get(cid, {})}
+            {**payloads.get(cid, {}), "id": cid, "score": score}
             for cid, score in scores.items()
         ]
         fused.sort(key=lambda item: item["score"], reverse=True)
