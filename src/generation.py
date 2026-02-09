@@ -34,18 +34,20 @@ INTENT_INSTRUCTIONS: dict[Intent, dict[str, str]] = {
     },
     Intent.ANALYZE: {
         "task": (
-            "Analyze and synthesize the theoretical conflicts within the context. "
-            "Identify not just surface similarities, but underlying principles. "
-            "Look for 'invariant flaws' (errors the author believes are repeated across different eras) "
-            "and 'explanatory gaps' (what the author claims both models fail to explain)."
+            "Analyze the provided context to identify core themes, systemic patterns, or "
+            "theoretical conflicts. Move beyond surface-level descriptions to explain "
+            "the 'why' behind the information. Specifically, look for points of "
+            "convergence (where sources agree on a fundamental truth) and divergence "
+            "(where methods or conclusions differ)."
         ),
         "format": (
             "Present a synthesized analysis with evidence - do NOT use bullet points. "
-            "Write in flowing paragraphs that connect ideas, moving from surface comparison "
-            "to deeper structural or philosophical implications."
+            "Structure the response to build a logical argument, connecting separate "
+            "observations into a cohesive whole."
         ),
-        "tone": "Thoughtful, academic, and balanced.",
+        "tone": "Analytical, objective, and scholarly.",
     },
+
 
 }
 
