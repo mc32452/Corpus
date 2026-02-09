@@ -63,7 +63,7 @@ Do NOT include meta-commentary, self-evaluations, or phrases like "Answer ends h
 _CITATION_RULES = """
 CITATION REQUIREMENTS:
 - Context chunks are marked with [CHUNK START | SOURCE: SourceID | PAGE: X] or [CHUNK START | SOURCE: SourceID] (when page is unavailable)
-- Extract the SourceID and PAGE from these markers
+- Extract the SourceID and PAGE (if present) from these markers
 - When PAGE is present, cite as [SourceID, p. X]
 - When PAGE is absent, cite as [SourceID]
 - Example with page: [Chomsky_Skinner_Review, p. 1]
