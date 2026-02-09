@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -298,7 +299,7 @@ def run() -> None:
         )
 
     storage.load_bm25(bm25_path)
-    reranker = FlagReranker(config.reranker_model, use_fp16=True)
+    reranker = FlagReranker(config.reranker_model, use_fp16=True, device="cpu")
 
     retrieval = RetrievalEngine(
         storage=storage,
@@ -409,6 +410,13 @@ def run() -> None:
         parent_texts = [r.parent_text for r in results if r.parent_text]
 
     retrieval_metrics: Optional[RetrievalMetrics] = results[0].metrics if results and results[0].metrics else None
+
+    # Release retrieval-only models to free memory before LLM generation.
+    # On 32GB Apple Silicon, the reranker (~1.1GB) and embedding model (~2GB)
+    # competing with the MLX LLM for unified memory can cause swap thrashing.
+    del reranker, embedding_model, retrieval
+    gc.collect()
+    logger.debug("Released reranker and embedding model to free memory for LLM generation")
 
     budget_metrics: Optional[BudgetMetrics] = None
     context: str = ""
