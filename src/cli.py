@@ -196,6 +196,8 @@ def run() -> None:
         default=None,
         help="Operating mode: regular (balanced), power-fast (8-bit, deeper retrieval), power-deep-research (80B model)",
     )
+    # Allow verbosity flag after the subcommand as well
+    ingest_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging (show httpx, huggingface_hub, and detailed retrieval metrics)")
     ingest_parser.add_argument(
         "--model",
         default=None,
@@ -219,6 +221,8 @@ def run() -> None:
         default=None,
         help="Operating mode: regular (balanced), power-fast (8-bit, deeper retrieval), power-deep-research (80B model)",
     )
+    # Allow verbosity flag after the subcommand as well
+    query_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging (show httpx, huggingface_hub, and detailed retrieval metrics)")
     query_parser.add_argument(
         "--source-id",
         default=None,
