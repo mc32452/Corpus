@@ -9,7 +9,7 @@ The system implements a **hybrid retrieval-augmented generation (RAG) pipeline**
 - **Dense retrieval** (embedding-based semantic search)
 - **Sparse retrieval** (BM25 keyword search)
 - **Reciprocal Rank Fusion** (RRF) for combining results
-- **Reranking** (BGE-Reranker-v2-m3 for relevance scoring)
+- **Reranking** (Jina Reranker v3 MLX – listwise cosine scoring with hardware-aware context windowing)
 - **Token budget packing** (greedy document packing with truncation fallback)
 - **Intent-based generation** (task-specific prompt engineering)
 - **Toggleable citations** (optional academic-style source attribution)
@@ -50,7 +50,7 @@ Hierarchical chunk structure for efficient retrieval and context expansion:
     *   **Sparse**: BM25 search on lexical index (configurable `top_k`).
 2.  **RRF Fusion**: Combine dense and sparse results using Reciprocal Rank Fusion ($$Score = \sum (1 / (60 + rank))$$).
 3.  **Early Deduplication**: Keep highest-scored child per unique `parent_id` to reduce redundancy before expensive reranking.
-4.  **Reranking**: Score document pairs with BGE-Reranker-v2-m3 for relevance assessment.
+4.  **Reranking**: Jina Reranker v3 (MLX-native) performs listwise scoring via cosine similarity between projected query and document embeddings. A context-window safety guard dynamically truncates the document list to stay within the backbone’s 131K context limit.
 5.  **Threshold Filtering**: Remove documents below score threshold based on operating mode.
 6.  **Context Expansion**: Map child chunks to parent chunks and apply token budget packing.
 
@@ -96,7 +96,7 @@ The system supports two operating modes, with `regular` mode auto-scaling based 
 
 #### Reranker Threshold Filtering
 
-Documents are filtered after reranking based on score thresholds:
+Documents are filtered after reranking based on score thresholds.  Jina v3 scores are cosine similarities in the **0.0–1.0** range:
 
 | Mode | Threshold Score | Minimum Documents |
 |------|----------------|-------------------|
@@ -281,6 +281,10 @@ python -m src.cli query "Search for key terms" --no-generate
 
 ## 11. Known Limitations & Future Improvements
 
+- **Reranker Context Safety**: A dynamic guard truncates the document list via binary search so the listwise prompt never exceeds the backbone’s 131K context window
+- **Tokenizer Robustness**: Special token IDs (`<|embed_token|>`, `<|rerank_token|>`) are resolved from the tokenizer vocabulary at runtime; hard-coded fallbacks are used only when lookup fails
+- **Numerical Stability**: An $\epsilon$ term is added to the cosine similarity denominator to prevent NaN from zero-vector embeddings
+- **Offline Mode**: `_enable_offline_if_cached` verifies that model snapshots contain actual weight files before forcing `HF_HUB_OFFLINE`
 - **Metadata Alignment**: Now correctly preserved across truncation (tracked via indices)
 - **PDF Page Labels**: Uses per-page API for consistent label extraction across PyMuPDF and pypdf
 - **Source Legend**: Filters out redundant mappings to reduce noise

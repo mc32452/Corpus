@@ -28,7 +28,7 @@ class ModelConfig:
     top_k_fused: int = 50
     top_k_rerank: int = 20
     top_k_final: int = 5
-    reranker_threshold: float = -6.0
+    reranker_threshold: float = 0.05
     reranker_min_docs: int = 3
     system_ram_gb: float = 0.0
 
