@@ -55,14 +55,15 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
             "First, silently identify the key themes, arguments, and tensions in the context. "
             "Then write a synthesized analysis that explains core themes, patterns, or conflicts. "
             "Go beyond description — explain WHY things are the way they are. "
-            "Highlight where ideas converge and where they diverge."
+            "Highlight where ideas converge and where they diverge. "
+            "Cover a range of DISTINCT points — do not revisit the same example or argument more than once."
         ),
         "format": (
             "Write a cohesive narrative — do NOT use bullet points. "
             "Structure: (1) a 1-2 sentence opening framing the topic, "
             "(2) a middle section developing themes with specific evidence from the context, "
-            "(3) a brief closing (1-2 sentences) stating the broader significance or implications. "
-            "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
+            "(3) a brief closing (1-2 sentences) drawn directly from the context — no speculation or hedging beyond what the text states. "
+            "Keep to 2-4 paragraphs total. Do NOT repeat points, examples, or paraphrases across paragraphs."
         ),
         "tone": "Analytical, objective, and scholarly.",
     },
@@ -79,7 +80,7 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
             "Structure: (1) a 1-2 sentence opening that names the items being compared and the axis of comparison, "
             "(2) a section on points of convergence with evidence from the context, "
             "(3) a section on points of divergence with evidence from the context, "
-            "(4) a brief closing (1-2 sentences) on what the comparison reveals. "
+            "(4) a brief closing (1-2 sentences) on what the comparison reveals — grounded in the context, not speculation. "
             "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
         ),
         "tone": "Balanced, precise, and scholarly.",
@@ -90,15 +91,16 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
             "Report how the text itself evaluates, defends, or challenges that argument. "
             "Surface any critiques, objections, limitations, or counterpoints that the text raises. "
             "If the text is one-sided, say so — do NOT invent counterarguments or limitations not present in the context. "
-            "You may note what the text leaves unaddressed, but label it clearly as an omission rather than a flaw."
+            "You may note what the text leaves unaddressed, but label it clearly as an omission rather than a flaw. "
+            "Present a range of DISTINCT arguments from the text — do not revisit the same point or example more than once."
         ),
         "format": (
             "Write a structured evaluative narrative — do NOT use bullet points. "
             "Structure: (1) a 1-2 sentence opening that states the argument being examined, "
             "(2) a section reporting how the text supports or defends the argument with specific evidence, "
             "(3) a section on critiques, limitations, or counterpoints the text itself raises (if any), "
-            "(4) a brief closing (1-2 sentences) noting overall assessment or what the text leaves open. "
-            "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
+            "(4) a brief closing (1-2 sentences) that summarizes the text's own position — do NOT add speculative hedges or possibilities not stated in the text. "
+            "Keep to 2-4 paragraphs total. Do NOT repeat points, examples, or paraphrases across paragraphs."
         ),
         "tone": "Evaluative, text-grounded, and intellectually rigorous.",
     },
@@ -181,14 +183,15 @@ INTENT_INSTRUCTIONS_DEEP_RESEARCH: dict[Intent, dict[str, str]] = {
             "First, silently identify the key themes, arguments, and tensions in the context. "
             "Then write a synthesized analysis that explains core themes, patterns, or conflicts. "
             "Go beyond description — explain WHY things are the way they are. "
-            "Highlight where ideas converge and where they diverge."
+            "Highlight where ideas converge and where they diverge. "
+            "Cover a range of DISTINCT points — do not revisit the same example or argument more than once."
         ),
         "format": (
             "Write a cohesive narrative — do NOT use bullet points. "
             "Structure: (1) a 1-2 sentence opening framing the topic, "
             "(2) a middle section developing themes with specific evidence from the context, "
-            "(3) a brief closing (1-2 sentences) stating the broader significance or implications. "
-            "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
+            "(3) a brief closing (1-2 sentences) drawn directly from the context — no speculation or hedging beyond what the text states. "
+            "Keep to 2-4 paragraphs total. Do NOT repeat points, examples, or paraphrases across paragraphs."
         ),
         "tone": "Analytical, objective, and scholarly.",
     },
@@ -205,7 +208,7 @@ INTENT_INSTRUCTIONS_DEEP_RESEARCH: dict[Intent, dict[str, str]] = {
             "Structure: (1) a 1-2 sentence opening that names the items being compared and the axis of comparison, "
             "(2) a section on points of convergence with evidence from the context, "
             "(3) a section on points of divergence with evidence from the context, "
-            "(4) a brief closing (1-2 sentences) on what the comparison reveals. "
+            "(4) a brief closing (1-2 sentences) on what the comparison reveals — grounded in the context, not speculation. "
             "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
         ),
         "tone": "Balanced, precise, and scholarly.",
@@ -216,15 +219,16 @@ INTENT_INSTRUCTIONS_DEEP_RESEARCH: dict[Intent, dict[str, str]] = {
             "Report how the text itself evaluates, defends, or challenges that argument. "
             "Surface any critiques, objections, limitations, or counterpoints that the text raises. "
             "If the text is one-sided, say so — do NOT invent counterarguments or limitations not present in the context. "
-            "You may note what the text leaves unaddressed, but label it clearly as an omission rather than a flaw."
+            "You may note what the text leaves unaddressed, but label it clearly as an omission rather than a flaw. "
+            "Present a range of DISTINCT arguments from the text — do not revisit the same point or example more than once."
         ),
         "format": (
             "Write a structured evaluative narrative — do NOT use bullet points. "
             "Structure: (1) a 1-2 sentence opening that states the argument being examined, "
             "(2) a section reporting how the text supports or defends the argument with specific evidence, "
             "(3) a section on critiques, limitations, or counterpoints the text itself raises (if any), "
-            "(4) a brief closing (1-2 sentences) noting overall assessment or what the text leaves open. "
-            "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
+            "(4) a brief closing (1-2 sentences) that summarizes the text's own position — do NOT add speculative hedges or possibilities not stated in the text. "
+            "Keep to 2-4 paragraphs total. Do NOT repeat points, examples, or paraphrases across paragraphs."
         ),
         "tone": "Evaluative, text-grounded, and intellectually rigorous.",
     },
@@ -271,9 +275,10 @@ _SYSTEM_MESSAGE = """You are a research assistant. Follow these rules strictly:
 
 1. Use ONLY the provided context. Do not rely on outside knowledge.
 2. Answer the user's SPECIFIC question — do not provide unrelated information.
-3. If the context lacks sufficient information, state: "The provided context does not contain sufficient information to address this."
+3. You may synthesize ideas across multiple context chunks, even if the sources do not reference each other — this is expected. Only state "The provided context does not contain sufficient information to address this" if you genuinely cannot construct ANY relevant answer from the context. NEVER append this disclaimer after a substantive answer.
 4. Stop generating immediately after completing your answer.
-5. Do NOT include meta-commentary, self-evaluations, filler phrases, or sign-offs."""
+5. Do NOT include meta-commentary, self-evaluations, filler phrases, or sign-offs.
+6. Do NOT end with speculative hedges, "future possibilities," or softening statements not grounded in the context."""
 
 _CITATION_RULES = """
 CITATION REQUIREMENTS:

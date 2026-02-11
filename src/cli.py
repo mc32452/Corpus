@@ -62,7 +62,17 @@ _CHATTER_PHRASES = [
     "let me know if",
     "feel free to ask",
     "is there anything else",
+    "the texts leave open the possibility",
+    "future research may",
+    "it remains to be seen",
+    "only time will tell",
 ]
+
+
+_RECURSIVE_DENIAL = re.compile(
+    r"\n+\s*The provided context does not contain sufficient information[^\n]*$",
+    re.IGNORECASE,
+)
 
 
 def _strip_chatter(text: str) -> str:
@@ -70,6 +80,9 @@ def _strip_chatter(text: str) -> str:
     if not text:
         return text
     result = text
+    # Strip recursive denial: substantive answer followed by "insufficient info" disclaimer
+    if len(result) > 200:
+        result = _RECURSIVE_DENIAL.sub("", result).rstrip()
     lowered = result.lower()
     for phrase in _CHATTER_PHRASES:
         idx = lowered.rfind(phrase)
