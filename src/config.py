@@ -28,7 +28,7 @@ class ModelConfig:
     top_k_fused: int = 50
     top_k_rerank: int = 20
     top_k_final: int = 5
-    reranker_threshold: float = -6.0
+    reranker_threshold: float = 0.05
     reranker_min_docs: int = 3
     system_ram_gb: float = 0.0
 
@@ -92,7 +92,7 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
             top_k_dense=300,
             top_k_sparse=300,
             top_k_fused=150,
-            top_k_rerank=80,
+            top_k_rerank=40,
             top_k_final=15,
             reranker_threshold=0.02,
             reranker_min_docs=5,
@@ -114,7 +114,7 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
             top_k_dense=300,
             top_k_sparse=300,
             top_k_fused=150,
-            top_k_rerank=80,
+            top_k_rerank=40,
             top_k_final=15,
             reranker_threshold=0.01,
             reranker_min_docs=10,

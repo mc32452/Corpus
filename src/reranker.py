@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
 _JINA_MLX_REPO = "jinaai/jina-reranker-v3-mlx"
 _PROJECTOR_FILENAME = "projector.safetensors"
 
-_DOC_EMBED_TOKEN_ID = 151670   # <|embed_token|>
-_QUERY_EMBED_TOKEN_ID = 151671  # <|rerank_token|>
+# Fallback IDs – used only when the tokenizer lacks the special tokens.
+_FALLBACK_DOC_EMBED_TOKEN_ID = 151670   # <|embed_token|>
+_FALLBACK_QUERY_EMBED_TOKEN_ID = 151671  # <|rerank_token|>
 
 _SPECIAL_TOKENS: Dict[str, str] = {
     "query_embed_token": "<|rerank_token|>",
@@ -42,6 +43,12 @@ _SPECIAL_TOKENS: Dict[str, str] = {
 
 _MAX_DOC_TOKENS = 2048
 _MAX_QUERY_TOKENS = 512
+
+# Context-window safety: leave headroom below the 131 K backbone limit.
+_MAX_RERANK_PROMPT_TOKENS = 120_000
+
+# Numerical stability for cosine similarity.
+_EPS = 1e-8
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +172,48 @@ class JinaRerankerMLX:
         proj_path = hf_hub_download(model_id, _PROJECTOR_FILENAME)
         self._projector = _load_projector(proj_path)
 
+        # Resolve special-token IDs from the tokenizer at runtime so that
+        # model swaps don't silently break position detection.
+        self._doc_embed_token_id = self._resolve_token_id(
+            _SPECIAL_TOKENS["doc_embed_token"], _FALLBACK_DOC_EMBED_TOKEN_ID,
+        )
+        self._query_embed_token_id = self._resolve_token_id(
+            _SPECIAL_TOKENS["query_embed_token"], _FALLBACK_QUERY_EMBED_TOKEN_ID,
+        )
+
         elapsed = time.perf_counter() - t0
         logger.info(
             "Jina Reranker v3 MLX ready in %.1fs  (backbone + projector)", elapsed
         )
+
+    # -- Helpers ------------------------------------------------------------
+
+    def _resolve_token_id(self, token_text: str, fallback_id: int) -> int:
+        """Resolve a special token to its ID via the tokenizer, with fallback."""
+        try:
+            vocab = self._tokenizer.get_vocab() if hasattr(self._tokenizer, "get_vocab") else {}
+            if token_text in vocab:
+                resolved = vocab[token_text]
+                logger.debug("Resolved %s -> %d (vocab lookup)", token_text, resolved)
+                return resolved
+
+            ids = self._tokenizer.encode(token_text, add_special_tokens=False)
+            if ids:
+                resolved = ids[-1]
+                logger.debug("Resolved %s -> %d (encode)", token_text, resolved)
+                return resolved
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve %s dynamically (%s); using fallback %d",
+                token_text, exc, fallback_id,
+            )
+
+        logger.warning(
+            "Could not resolve %s from tokenizer; using hard-coded fallback %d. "
+            "This may break on a different model checkpoint.",
+            token_text, fallback_id,
+        )
+        return fallback_id
 
     # -- Public interface (compatible with FlagReranker) --------------------
 
@@ -191,6 +236,10 @@ class JinaRerankerMLX:
         # Truncate documents that are excessively long
         docs = self._truncate_docs(docs)
 
+        # Context-window safety: trim the document list so the
+        # listwise prompt stays within the backbone's context limit.
+        docs = self._enforce_context_budget(query, docs)
+
         scores = self._score_listwise(query, docs)
         return scores
 
@@ -206,6 +255,36 @@ class JinaRerankerMLX:
                 doc = self._tokenizer.decode(tok_ids)
             truncated.append(doc)
         return truncated
+
+    def _enforce_context_budget(self, query: str, docs: List[str]) -> List[str]:
+        """Trim the document list so the listwise prompt fits the context window."""
+        if not docs:
+            return docs
+
+        prompt = _build_prompt(query, docs)
+        token_count = len(self._tokenizer.encode(prompt))
+
+        if token_count <= _MAX_RERANK_PROMPT_TOKENS:
+            return docs
+
+        logger.warning(
+            "Reranker prompt (%d tokens) exceeds context budget (%d). "
+            "Truncating document list from %d docs.",
+            token_count, _MAX_RERANK_PROMPT_TOKENS, len(docs),
+        )
+
+        # Binary search for the largest prefix of docs that fits.
+        lo, hi = 1, len(docs) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            trial = _build_prompt(query, docs[:mid])
+            if len(self._tokenizer.encode(trial)) <= _MAX_RERANK_PROMPT_TOKENS:
+                lo = mid
+            else:
+                hi = mid - 1
+
+        logger.warning("Truncated to %d documents to fit context window.", lo)
+        return docs[:lo]
 
     def _score_listwise(self, query: str, docs: List[str]) -> List[float]:
         """Run a single-pass listwise forward and return per-doc scores."""
@@ -225,8 +304,8 @@ class JinaRerankerMLX:
 
         # Locate special-token positions
         ids_np = np.array(input_ids)
-        doc_positions = np.where(ids_np == _DOC_EMBED_TOKEN_ID)[0]
-        query_positions = np.where(ids_np == _QUERY_EMBED_TOKEN_ID)[0]
+        doc_positions = np.where(ids_np == self._doc_embed_token_id)[0]
+        query_positions = np.where(ids_np == self._query_embed_token_id)[0]
 
         if len(doc_positions) == 0:
             raise RuntimeError(
@@ -253,6 +332,7 @@ class JinaRerankerMLX:
         cos_sim = mx.sum(doc_embeds * query_expanded, axis=-1) / (
             mx.sqrt(mx.sum(doc_embeds * doc_embeds, axis=-1))
             * mx.sqrt(mx.sum(query_expanded * query_expanded, axis=-1))
+            + _EPS
         )  # [num_docs]
 
         # Force evaluation & convert to Python floats

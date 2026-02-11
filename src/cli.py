@@ -179,8 +179,33 @@ def _enable_offline_if_cached(config: ModelConfig) -> None:
 
     for model_id in required_models:
         cache_folder = f"models--{model_id.replace('/', '--')}"
-        if not (cache_dir / cache_folder).exists():
+        model_cache = cache_dir / cache_folder
+        if not model_cache.exists():
             logger.debug("Model %s not cached; staying online", model_id)
+            return
+
+        # Verify that at least one snapshot with actual files exists.
+        snapshots_dir = model_cache / "snapshots"
+        if not snapshots_dir.is_dir():
+            logger.debug("Model %s cached but missing snapshots/; staying online", model_id)
+            return
+        snapshot_dirs = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+        if not snapshot_dirs:
+            logger.debug("Model %s has empty snapshots/; staying online", model_id)
+            return
+        # Check that the latest snapshot contains at least one weight file.
+        latest = max(snapshot_dirs, key=lambda d: d.stat().st_mtime)
+        weight_exts = {".safetensors", ".bin", ".gguf", ".npz"}
+        has_weights = any(
+            f.suffix in weight_exts or f.name == "config.json"
+            for f in latest.iterdir()
+            if f.is_file() or f.is_symlink()
+        )
+        if not has_weights:
+            logger.debug(
+                "Model %s snapshot %s has no weight files; staying online",
+                model_id, latest.name,
+            )
             return
 
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -220,15 +245,18 @@ def run() -> None:
         default=None,
         help="Path or Hugging Face ID for mlx-lm model (used for summaries)",
     )
-    ingest_parser.add_argument(
+    _summarize_group = ingest_parser.add_mutually_exclusive_group()
+    _summarize_group.add_argument(
         "--summarize",
         action="store_true",
+        dest="summarize",
         default=True,
         help="Generate and store a per-source summary during ingest (default: enabled)",
     )
-    ingest_parser.add_argument(
+    _summarize_group.add_argument(
         "--no-summarize",
-        action="store_true",
+        action="store_false",
+        dest="summarize",
         help="Disable automatic summary generation during ingest",
     )
 
@@ -335,7 +363,7 @@ def run() -> None:
     bm25_path = Path(args.bm25)
 
     if args.command == "ingest":
-        do_summarize = args.summarize and not args.no_summarize
+        do_summarize = args.summarize
         generator: Optional[MlxGenerator] = None
         if do_summarize:
             model_id = args.model or config.llm_model
@@ -644,13 +672,18 @@ def run() -> None:
         print(f"[Intent: {intent_result.intent.value} (confidence: {intent_result.confidence:.2f})]\n")
         if source_ids:
             print(f"[Sources: {', '.join(source_ids)}]\n")
-        for idx, result in enumerate(results, start=1):
-            header_path = result.metadata.get("header_path", "")
-            snippet = (result.parent_text or result.text or "").strip()
-            snippet = textwrap.shorten(snippet, width=600, placeholder="...")
-            print(f"[{idx}] score={result.score:.4f} header={header_path}")
-            print(snippet)
-            print("-" * 80)
+        if results:
+            for idx, result in enumerate(results, start=1):
+                header_path = result.metadata.get("header_path", "")
+                snippet = (result.parent_text or result.text or "").strip()
+                snippet = textwrap.shorten(snippet, width=600, placeholder="...")
+                print(f"[{idx}] score={result.score:.4f} header={header_path}")
+                print(snippet)
+                print("-" * 80)
+        elif context:
+            print(context)
+        else:
+            print("No context retrieved.")
         return
 
     messages = build_messages(

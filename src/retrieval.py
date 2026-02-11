@@ -298,11 +298,10 @@ class RetrievalEngine:
         
         raw_scores = [float(s) for s in scores]
         
-        reranked = []
-        for item, score in zip(items, scores):
-            text = (item.get("rerank_text") or item.get("text") or "").lower()
-            penalty = 0.5 if any(pat in text for pat in _BOILERPLATE_PATTERNS) else 0.0
-            reranked.append({**item, "rerank_score": float(score) - penalty})
+        reranked = [
+            {**item, "rerank_score": float(score)}
+            for item, score in zip(items, scores)
+        ]
         reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return reranked, raw_scores
 
