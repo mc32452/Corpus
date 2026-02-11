@@ -66,6 +66,33 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
         ),
         "tone": "Analytical, objective, and scholarly.",
     },
+    Intent.FACTUAL: {
+        "task": (
+            "Answer the user's question directly and concisely using ONLY the provided context. "
+            "Extract the specific fact, name, date, or detail that the question asks for. "
+            "If the answer is explicitly stated in the context, quote or paraphrase the relevant passage. "
+            "Do NOT provide analysis, background, or tangential information."
+        ),
+        "format": (
+            "Give the direct answer in 1-3 sentences. "
+            "If helpful, include a brief quote from the context that supports the answer. "
+            "Do NOT use bullet points or provide additional context beyond what is asked."
+        ),
+        "tone": "Direct, precise, and factual.",
+    },
+    Intent.COLLECTION: {
+        "task": (
+            "Describe the documents available in this collection based on the provided summaries. "
+            "Identify the topics, themes, and scope of the corpus as a whole. "
+            "Highlight how the documents relate to each other, if applicable."
+        ),
+        "format": (
+            "Start with one sentence describing the overall scope of the collection. "
+            "Then list each document with a 1-2 sentence description of its content. "
+            "End with one sentence on common themes or connections between documents."
+        ),
+        "tone": "Informative and concise.",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -128,6 +155,33 @@ INTENT_INSTRUCTIONS_DEEP_RESEARCH: dict[Intent, dict[str, str]] = {
             "Keep to 2-4 paragraphs total. Do NOT repeat points across paragraphs."
         ),
         "tone": "Analytical, objective, and scholarly.",
+    },
+    Intent.FACTUAL: {
+        "task": (
+            "Answer the user's question directly and concisely using ONLY the provided context. "
+            "Extract the specific fact, name, date, or detail that the question asks for. "
+            "If the answer is explicitly stated in the context, quote or paraphrase the relevant passage. "
+            "Do NOT provide analysis, background, or tangential information."
+        ),
+        "format": (
+            "Give the direct answer in 1-3 sentences. "
+            "If helpful, include a brief quote from the context that supports the answer. "
+            "Do NOT use bullet points or provide additional context beyond what is asked."
+        ),
+        "tone": "Direct, precise, and factual.",
+    },
+    Intent.COLLECTION: {
+        "task": (
+            "Describe the documents available in this collection based on the provided summaries. "
+            "Identify the topics, themes, and scope of the corpus as a whole. "
+            "Highlight how the documents relate to each other, if applicable."
+        ),
+        "format": (
+            "Start with one sentence describing the overall scope of the collection. "
+            "Then list each document with a 1-2 sentence description of its content. "
+            "End with one sentence on common themes or connections between documents."
+        ),
+        "tone": "Informative and concise.",
     },
 }
 

@@ -125,6 +125,8 @@ _EXPANSION_TERMS: dict[Intent, list[str]] = {
     Intent.SUMMARIZE: ["main argument", "thesis", "conclusion", "key points"],
     Intent.EXPLAIN: [],
     Intent.ANALYZE: ["criticism", "critique", "debate", "objection", "response", "controversy"],
+    Intent.FACTUAL: [],
+    Intent.COLLECTION: [],
 }
 
 
@@ -206,7 +208,13 @@ def run() -> None:
     ingest_parser.add_argument(
         "--summarize",
         action="store_true",
-        help="Generate and store a per-source summary during ingest",
+        default=True,
+        help="Generate and store a per-source summary during ingest (default: enabled)",
+    )
+    ingest_parser.add_argument(
+        "--no-summarize",
+        action="store_true",
+        help="Disable automatic summary generation during ingest",
     )
 
     query_parser = subparsers.add_parser("query", help="Query the RAG system")
@@ -245,7 +253,7 @@ def run() -> None:
     )
     query_parser.add_argument(
         "--intent",
-        choices=["overview", "summarize", "explain", "analyze"],
+        choices=["overview", "summarize", "explain", "analyze", "factual", "collection"],
         default=None,
         help="Override automatic intent classification",
     )
@@ -312,8 +320,9 @@ def run() -> None:
     bm25_path = Path(args.bm25)
 
     if args.command == "ingest":
+        do_summarize = args.summarize and not args.no_summarize
         generator: Optional[MlxGenerator] = None
-        if args.summarize:
+        if do_summarize:
             model_id = args.model or config.llm_model
             generator = MlxGenerator(model_id)
         parents_count, children_count = ingest_file_to_storage(
@@ -323,11 +332,11 @@ def run() -> None:
             storage=storage,
             embedding_model=embedding_model,
             bm25_path=bm25_path,
-            summarize=args.summarize,
+            summarize=do_summarize,
             summary_generator=generator,
         )
         print(f"Ingested {parents_count} parents and {children_count} children.")
-        if args.summarize:
+        if do_summarize:
             print(f"Stored summary for source: {args.source_id}")
         return
 
@@ -372,6 +381,7 @@ def run() -> None:
         intent_map = {
             "overview": Intent.OVERVIEW, "summarize": Intent.SUMMARIZE,
             "explain": Intent.EXPLAIN, "analyze": Intent.ANALYZE,
+            "factual": Intent.FACTUAL, "collection": Intent.COLLECTION,
         }
         intent_result = IntentResult(intent=intent_map[args.intent], confidence=1.0, method="manual")
         logger.info(f"Using manual intent override: {intent_result.intent.value}")
@@ -396,7 +406,59 @@ def run() -> None:
 
     extra_instructions: Optional[str] = None
 
-    if intent_result.intent == Intent.SUMMARIZE and not args.source_id:
+    # --- COLLECTION intent: always use document summaries ---
+    if intent_result.intent == Intent.COLLECTION:
+        sources = storage.list_source_ids()
+        if not sources:
+            print("No documents found in the database.")
+            del reranker, embedding_model, retrieval
+            gc.collect()
+            return
+
+        summaries = storage.get_source_summaries()
+        missing = [source for source in sources if source not in summaries]
+        if missing:
+            if args.no_generate:
+                print("Some sources are missing summaries. Re-run without --no-generate.")
+                for source in missing:
+                    print(f"- {source}")
+                del reranker, embedding_model, retrieval
+                gc.collect()
+                return
+
+            if generator is None:
+                generator = MlxGenerator(model_id)
+
+            for source in missing:
+                p_texts = storage.get_parent_texts_by_source(source_id=source)
+                context_text = "\n\n".join(p_texts)
+                if len(context_text) > 12000:
+                    context_text = context_text[:12000]
+                summary_messages = build_messages(
+                    context=context_text,
+                    question="Summarize this document.",
+                    intent=Intent.SUMMARIZE,
+                    mode=config.mode,
+                )
+                summary_text = generator.generate_chat(summary_messages)
+                storage.upsert_source_summary(source_id=source, summary=summary_text)
+            summaries = storage.get_source_summaries()
+
+        summary_blocks = [
+            f"Source: {source}\nSummary: {summaries[source]}"
+            for source in sources
+            if source in summaries
+        ]
+        context = "\n\n".join(summary_blocks)
+        results = []
+        source_ids = sources
+        parent_texts = []
+        if citations_enabled:
+            logger.info("Auto-disabling citations: context is built from document summaries (no chunk markers)")
+            citations_enabled = False
+
+    # --- SUMMARIZE with multiple sources (no --source-id): use summaries ---
+    elif intent_result.intent == Intent.SUMMARIZE and not args.source_id:
         sources = storage.list_source_ids()
         if len(sources) > 1:
             summaries = storage.get_source_summaries()
@@ -468,8 +530,10 @@ def run() -> None:
     logger.debug("Released reranker and embedding model to free memory for LLM generation")
 
     budget_metrics: Optional[BudgetMetrics] = None
-    context: str = ""
     source_legend: Optional[str] = None
+    # context may already be set by COLLECTION or multi-doc SUMMARIZE paths above
+    if 'context' not in locals():
+        context: str = ""
     has_parent_texts = 'parent_texts' in locals() and parent_texts
     result_metadatas: list[dict] = [r.metadata for r in results if r.parent_text] if has_parent_texts and results else []
     

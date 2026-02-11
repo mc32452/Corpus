@@ -181,6 +181,23 @@ class TestIntentClassification:
             ("How does reinforcement affect language?", Intent.ANALYZE),
             ("tl;dr", Intent.SUMMARIZE),
             ("What does this mean?", Intent.EXPLAIN),
+            # FACTUAL intent tests
+            ("What particular LLM is the author talking about?", Intent.FACTUAL),
+            ("Who wrote this paper?", Intent.FACTUAL),
+            ("When did Chomsky publish his review?", Intent.FACTUAL),
+            ("How many core counts does the chip have?", Intent.FACTUAL),
+            ("What does the author say about behaviorism?", Intent.FACTUAL),
+            ("What specific method did they use?", Intent.FACTUAL),
+            ("Name the key theorists", Intent.FACTUAL),
+            # COLLECTION intent tests
+            ("What documents do we have?", Intent.COLLECTION),
+            ("What are we looking at?", Intent.COLLECTION),
+            ("List all the documents", Intent.COLLECTION),
+            ("What are the docs in here?", Intent.COLLECTION),
+            ("Summarize all documents", Intent.COLLECTION),
+            ("Show me all the sources", Intent.COLLECTION),
+            ("What topics do the documents cover?", Intent.COLLECTION),
+            ("Give me an overview of everything", Intent.COLLECTION),
         ],
     )
     def test_heuristic_classification(self, query: str, expected: Intent):
@@ -241,6 +258,18 @@ class TestLLMResponseParsing:
         assert parsed is not None
         assert parsed[1] <= 1.0
 
+    def test_parse_factual_intent(self):
+        response = '{"intent": "factual", "confidence": 0.9}'
+        parsed = _parse_llm_response(response)
+        assert parsed is not None
+        assert parsed[0] == Intent.FACTUAL
+
+    def test_parse_collection_intent(self):
+        response = '{"intent": "collection", "confidence": 0.85}'
+        parsed = _parse_llm_response(response)
+        assert parsed is not None
+        assert parsed[0] == Intent.COLLECTION
+
 
 # ===========================================================================
 # Generation message building
@@ -286,6 +315,8 @@ class TestIntentLatency:
             "Summarize the main arguments",
             "How does Chomsky's theory compare to Skinner's?",
             "Explain the poverty of the stimulus",
+            "What particular LLM is the author talking about?",
+            "What documents do we have?",
         ]
         for q in queries:
             with Timer("intent_heuristic", query=q) as t:
@@ -295,3 +326,241 @@ class TestIntentLatency:
                 f"-> {result.intent.value} ({result.confidence:.2f})"
             )
             assert t.result.elapsed_ms < 50, "Heuristic should be very fast"
+
+
+# ===========================================================================
+# FACTUAL intent: classification + message building + cite modes
+# ===========================================================================
+
+class TestFactualIntent:
+    """Tests for the FACTUAL intent — direct fact extraction from context."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "What particular LLM is the author talking about?",
+            "Who is Chomsky?",
+            "When was the review published?",
+            "What year did this happen?",
+            "How many parameters does the model have?",
+            "What does the author say about behaviorism?",
+            "Name the key theorists mentioned",
+            "According to the text, what is Universal Grammar?",
+            "What specific technique was used?",
+            "Identify the main claim",
+            "What model is discussed in this paper?",
+            "Which framework does the author propose?",
+        ],
+    )
+    def test_factual_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.FACTUAL, (
+            f"Query '{query}': expected factual, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_factual_confidence_above_threshold(self):
+        """FACTUAL queries should have confidence above the default 0.6 threshold."""
+        result = _classify_heuristic("What particular LLM is the author talking about?")
+        assert result.confidence >= 0.60
+
+    def test_factual_generation_messages_without_cite(self):
+        """FACTUAL intent messages should contain direct-answer instructions."""
+        messages = build_messages(
+            context="Chomsky argues that language is innate.",
+            question="What does Chomsky argue?",
+            intent=Intent.FACTUAL,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "directly" in system.lower() or "direct" in system.lower()
+        assert "CITATION REQUIREMENTS" not in system
+
+    def test_factual_generation_messages_with_cite(self):
+        """FACTUAL + citations should include both extraction and citation instructions."""
+        messages = build_messages(
+            context="[CHUNK START | SOURCE: doc1 | PAGE: 3]\nChomsky argues that language is innate.\n[CHUNK END]",
+            question="What does Chomsky argue?",
+            intent=Intent.FACTUAL,
+            citations_enabled=True,
+        )
+        system = messages[0]["content"]
+        assert "directly" in system.lower() or "direct" in system.lower()
+        assert "CITATION" in system
+
+    def test_factual_not_confused_with_analyze(self):
+        """Queries like 'what does X say about Y' should be FACTUAL, not ANALYZE."""
+        queries_should_be_factual = [
+            "What does the author say about Skinner?",
+            "What particular method is used?",
+            "Who wrote the original paper?",
+        ]
+        for q in queries_should_be_factual:
+            result = _classify_heuristic(q)
+            assert result.intent == Intent.FACTUAL, (
+                f"Query '{q}': expected factual, got {result.intent.value}"
+            )
+
+    def test_factual_instructions_in_all_modes(self):
+        """FACTUAL instructions should be present in both regular and deep-research."""
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.FACTUAL in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.FACTUAL in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert "task" in INTENT_INSTRUCTIONS_REGULAR[Intent.FACTUAL]
+        assert "task" in INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.FACTUAL]
+
+
+# ===========================================================================
+# COLLECTION intent: classification + message building + summary routing
+# ===========================================================================
+
+class TestCollectionIntent:
+    """Tests for the COLLECTION intent — corpus-level document queries."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "What documents do we have?",
+            "What are we looking at?",
+            "What are the docs in here?",
+            "List all the documents",
+            "Show me all the sources",
+            "Summarize all documents",
+            "What's in this collection?",
+            "Give me an overview of everything",
+            "What topics do the documents cover?",
+            "Describe all the sources",
+            "What is in here?",
+            "Overview of all documents",
+        ],
+    )
+    def test_collection_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.COLLECTION, (
+            f"Query '{query}': expected collection, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_collection_confidence_above_threshold(self):
+        result = _classify_heuristic("What documents do we have?")
+        assert result.confidence >= 0.60
+
+    def test_collection_generation_messages(self):
+        """COLLECTION messages should contain corpus/collection-level instructions."""
+        messages = build_messages(
+            context="Source: doc1\nSummary: About linguistics.\n\nSource: doc2\nSummary: About philosophy.",
+            question="What documents do we have?",
+            intent=Intent.COLLECTION,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "collection" in system.lower() or "document" in system.lower()
+
+    def test_collection_citations_auto_disabled(self):
+        """COLLECTION intent uses summaries, so citation rules should NOT be injected."""
+        messages = build_messages(
+            context="Source: doc1\nSummary: About linguistics.",
+            question="What are the docs in here?",
+            intent=Intent.COLLECTION,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "CITATION REQUIREMENTS" not in system
+
+    def test_collection_not_confused_with_overview(self):
+        """Corpus-level queries should not fall to OVERVIEW."""
+        corpus_queries = [
+            "What are we looking at?",
+            "What documents do we have?",
+            "List all documents",
+        ]
+        for q in corpus_queries:
+            result = _classify_heuristic(q)
+            assert result.intent == Intent.COLLECTION, (
+                f"Query '{q}': expected collection, got {result.intent.value}"
+            )
+
+    def test_single_doc_overview_stays_overview(self):
+        """Single-document overview queries should still be OVERVIEW, not COLLECTION."""
+        queries_should_be_overview = [
+            "What is this paper about?",
+            "What is this document about?",
+            "Give me the gist",
+        ]
+        for q in queries_should_be_overview:
+            result = _classify_heuristic(q)
+            assert result.intent == Intent.OVERVIEW, (
+                f"Query '{q}': expected overview, got {result.intent.value}"
+            )
+
+    def test_collection_instructions_in_all_modes(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.COLLECTION in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.COLLECTION in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+
+    def test_collection_summary_context_format(self):
+        """Verify that summary-based context is properly formatted for COLLECTION."""
+        summaries = {
+            "doc_linguistics": "This document covers Chomsky's theory of generative grammar.",
+            "doc_philosophy": "This document covers epistemology and normative ethics.",
+        }
+        summary_blocks = [
+            f"Source: {source}\nSummary: {summary}"
+            for source, summary in summaries.items()
+        ]
+        context = "\n\n".join(summary_blocks)
+
+        messages = build_messages(
+            context=context,
+            question="What are the docs in here?",
+            intent=Intent.COLLECTION,
+            citations_enabled=False,
+        )
+        user_msg = messages[1]["content"]
+        assert "doc_linguistics" in user_msg
+        assert "doc_philosophy" in user_msg
+        assert "Chomsky" in user_msg
+        assert "epistemology" in user_msg
+
+
+# ===========================================================================
+# Cross-intent boundary tests
+# ===========================================================================
+
+class TestIntentBoundaries:
+    """Edge cases where queries could be ambiguous between intents."""
+
+    def test_what_is_overview_not_factual(self):
+        """'What is this?' is OVERVIEW, not FACTUAL."""
+        result = _classify_heuristic("What is this?")
+        assert result.intent == Intent.OVERVIEW
+
+    def test_what_is_paper_overview_not_factual(self):
+        result = _classify_heuristic("What is this paper about?")
+        assert result.intent == Intent.OVERVIEW
+
+    def test_summarize_all_is_collection(self):
+        """'Summarize all documents' should be COLLECTION, not SUMMARIZE."""
+        result = _classify_heuristic("Summarize all documents")
+        assert result.intent == Intent.COLLECTION
+
+    def test_summarize_single_is_summarize(self):
+        """'Summarize the key points' should be SUMMARIZE, not COLLECTION."""
+        result = _classify_heuristic("Summarize the key points")
+        assert result.intent == Intent.SUMMARIZE
+
+    def test_who_wrote_is_factual(self):
+        result = _classify_heuristic("Who wrote the original paper?")
+        assert result.intent == Intent.FACTUAL
+
+    def test_compare_is_analyze(self):
+        result = _classify_heuristic("Compare these two approaches")
+        assert result.intent == Intent.ANALYZE
+
+    def test_explain_is_explain(self):
+        result = _classify_heuristic("Explain this in simple terms")
+        assert result.intent == Intent.EXPLAIN
+
+    def test_what_model_is_factual(self):
+        result = _classify_heuristic("What LLM is being used?")
+        assert result.intent == Intent.FACTUAL

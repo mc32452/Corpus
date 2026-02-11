@@ -15,6 +15,8 @@ class Intent(Enum):
     SUMMARIZE = "summarize"
     EXPLAIN = "explain"
     ANALYZE = "analyze"
+    FACTUAL = "factual"
+    COLLECTION = "collection"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,41 @@ class IntentResult:
 
 
 _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
+    Intent.COLLECTION: [
+        re.compile(r"\bwhat\s+(documents?|docs?|files?|sources?)\s+(do\s+)?(we|i|you)\s+have\b", re.IGNORECASE),
+        re.compile(r"\bwhat('s| is)\s+(in\s+)?(here|this\s+(collection|corpus|workspace|library))\b", re.IGNORECASE),
+        re.compile(r"\blist\s+(all\s+)?(the\s+)?(documents?|docs?|files?|sources?)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+are\s+(we|these)\s+(looking\s+at|working\s+with)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+are\s+(the|all\s+the)\s+(documents?|docs?|files?|sources?)\b", re.IGNORECASE),
+        re.compile(r"\bsummari[sz]e\s+(all|every(thing)?|the\s+(whole|entire))\b", re.IGNORECASE),
+        re.compile(r"\boverview\s+of\s+(all|every|the\s+entire)\b", re.IGNORECASE),
+        re.compile(r"\bwhat('s| is)\s+the\s+(corpus|collection)\s+(about|contain)", re.IGNORECASE),
+        re.compile(r"\bshow\s+(me\s+)?(all|the)\s+(documents?|docs?|files?|sources?)\b", re.IGNORECASE),
+        re.compile(r"\bgive\s+(me\s+)?(an?\s+)?overview\s+of\s+(all|everything)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+topics?\s+(are|do)\s+(these|the)\s+(documents?|docs?)\s+cover\b", re.IGNORECASE),
+        re.compile(r"\bdescribe\s+(all|the)\s+(documents?|docs?|sources?)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+are\s+the\s+docs\s+in\s+here\b", re.IGNORECASE),
+        re.compile(r"\bshow\s+(me\s+)?all\s+(the\s+)?sources\b", re.IGNORECASE),
+        re.compile(r"\bdescribe\s+all\s+(the\s+)?sources\b", re.IGNORECASE),
+    ],
+    Intent.FACTUAL: [
+        re.compile(r"\bwhat\s+particular\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(specific|exact)\b", re.IGNORECASE),
+        re.compile(r"\bwho\s+(is|was|are|were|did|does|wrote|said)\b", re.IGNORECASE),
+        re.compile(r"\bwhen\s+(did|was|were|is)\b", re.IGNORECASE),
+        re.compile(r"\bwhere\s+(did|was|were|is|does)\b", re.IGNORECASE),
+        re.compile(r"\bwhich\s+(specific|particular)?\s*\w+\s+(is|was|are|were|did|does)\b", re.IGNORECASE),
+        re.compile(r"\bname\s+the\b", re.IGNORECASE),
+        re.compile(r"\bidentify\s+the\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(year|date|time|number|name|title|author)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(is|are|was|were)\s+the\s+(name|title|author|year|date)\b", re.IGNORECASE),
+        re.compile(r"\bhow\s+many\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(does|did)\s+\w+\s+(say|write|argue|claim|state|mention)\s+about\b", re.IGNORECASE),
+        re.compile(r"\baccording\s+to\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(llm|model|algorithm|method|technique|tool|framework)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+the\s+(author|writer)\s+(talking|writing|referring)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+does\s+the\s+(author|writer|text|document|paper)\s+(say|state|claim|argue|mention)\b", re.IGNORECASE),
+    ],
     Intent.OVERVIEW: [
         re.compile(r"^what\s+is\s+this\s*\??$", re.IGNORECASE),  # Exact "what is this?"
         re.compile(r"\bwhat\s+is\s+(this|the)\s+(paper|text|document|article)\s+(about\s*)?\??", re.IGNORECASE),
@@ -90,6 +127,9 @@ def _has_technical_terms(query: str) -> bool:
 
 
 def _is_technical_how_why(query: str) -> bool:
+    # "how many" is a factual question, not analytical
+    if re.match(r"^\s*how\s+many\b", query, re.IGNORECASE):
+        return False
     return bool(re.match(r"^\s*(how|why)\b", query, re.IGNORECASE)) and _has_technical_terms(query)
 
 
@@ -112,6 +152,14 @@ def _classify_heuristic(query: str) -> IntentResult:
         return IntentResult(intent=Intent.OVERVIEW, confidence=0.40, method="fallback")
 
     matching_intents = [i for i, s in scores.items() if s > 0]
+
+    # COLLECTION should win ties with SUMMARIZE when both match
+    # (e.g., "Summarize all documents" matches both)
+    if Intent.COLLECTION in matching_intents and Intent.SUMMARIZE in matching_intents:
+        if scores[Intent.COLLECTION] >= scores[Intent.SUMMARIZE]:
+            best_intent = Intent.COLLECTION
+            best_score = scores[Intent.COLLECTION]
+
     if len(matching_intents) > 1 and best_score == 1:
         confidence = _HEURISTIC_CONFIDENCE["weak_match"]
     elif best_score >= 2:
@@ -138,11 +186,13 @@ Categories:
 - summarize: User wants a detailed summary with key points and bullet points
 - explain: User wants the content explained simply, for non-experts
 - analyze: User wants analysis, critique, controversy, or evaluation
+- factual: User wants a direct factual answer extracted from the text (who, what, when, where, which, how many)
+- collection: User wants to know what documents are available, or wants an overview of all documents in the corpus
 
 User query: "{query}"
 
 Respond with ONLY a JSON object in this exact format:
-{{"intent": "<overview|summarize|explain|analyze>", "confidence": <0.0-1.0>}}"""
+{{"intent": "<overview|summarize|explain|analyze|factual|collection>", "confidence": <0.0-1.0>}}"""
 
 
 def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
@@ -160,7 +210,7 @@ def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
 
     try:
         data = json.loads(response[start:end + 1])
-        intent_map = {"overview": Intent.OVERVIEW, "summarize": Intent.SUMMARIZE, "explain": Intent.EXPLAIN, "analyze": Intent.ANALYZE}
+        intent_map = {"overview": Intent.OVERVIEW, "summarize": Intent.SUMMARIZE, "explain": Intent.EXPLAIN, "analyze": Intent.ANALYZE, "factual": Intent.FACTUAL, "collection": Intent.COLLECTION}
         intent = intent_map.get(data.get("intent", "").lower().strip())
         if intent is None:
             return None
