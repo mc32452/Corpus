@@ -266,6 +266,64 @@ class JinaRerankerMLX:
             sampler=sampler,
         )
 
+    def score_intent_labels(
+        self,
+        prompt: str,
+        labels: List[str],
+    ) -> Dict[str, Dict[str, float]]:
+        """Score candidate labels from backbone logits (no generation).
+
+        For each label, computes continuation scores conditioned on ``prompt``:
+        - ``raw_logit_sum``: sum of selected token logits (pre-softmax)
+        - ``avg_logit``: length-normalized raw logit sum
+        - ``logprob_sum``: sum of token log-probabilities
+        - ``avg_logprob``: length-normalized log-probability
+        """
+        if not labels:
+            return {}
+
+        base_ids = self._tokenizer.encode(prompt, add_special_tokens=False)
+        if not base_ids:
+            return {}
+
+        scores: Dict[str, Dict[str, float]] = {}
+        for label in labels:
+            label_text = label.strip()
+            if not label_text:
+                continue
+
+            label_ids = self._tokenizer.encode(label_text, add_special_tokens=False)
+            if not label_ids:
+                label_ids = self._tokenizer.encode(f" {label_text}", add_special_tokens=False)
+            if not label_ids:
+                continue
+
+            full_ids = base_ids + label_ids
+            logits = self._model(mx.array(full_ids)[None, :])[0]  # [seq_len, vocab]
+
+            raw_logit_sum = 0.0
+            logprob_sum = 0.0
+            for offset, token_id in enumerate(label_ids):
+                pos = len(base_ids) + offset - 1
+                step_logits = logits[pos]
+
+                token_logit = float(step_logits[int(token_id)].item())
+                lse = float(mx.logsumexp(step_logits).item())
+
+                raw_logit_sum += token_logit
+                logprob_sum += token_logit - lse
+
+            token_count = max(len(label_ids), 1)
+            scores[label_text] = {
+                "raw_logit_sum": raw_logit_sum,
+                "avg_logit": raw_logit_sum / token_count,
+                "logprob_sum": logprob_sum,
+                "avg_logprob": logprob_sum / token_count,
+                "token_count": float(token_count),
+            }
+
+        return scores
+
     # -- Public interface (compatible with FlagReranker) --------------------
 
     def compute_score(self, pairs: List[Tuple[str, str]]) -> List[float]:

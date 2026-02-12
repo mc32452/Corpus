@@ -373,8 +373,23 @@ def run() -> None:
         help="Minimum confidence for intent classification (default: 0.6)",
     )
     query_parser.add_argument(
+        "--llm-intent", action="store_true",
+        help="Enable LLM-based intent classification (experimental). Default is heuristic intent.",
+    )
+    query_parser.add_argument(
         "--no-llm-intent", action="store_true",
-        help="Use heuristic-only intent classification (faster, no extra LLM call)",
+        help="Disable LLM-based intent classification (kept for backward compatibility).",
+    )
+    query_parser.add_argument(
+        "--intent-backend",
+        choices=["reranker", "dedicated"],
+        default="reranker",
+        help="Intent backend: reranker (reuse Jina 0.6B backbone) or dedicated (load separate small instruct model).",
+    )
+    query_parser.add_argument(
+        "--intent-model",
+        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        help="Model ID for --intent-backend=dedicated.",
     )
     query_parser.add_argument(
         "--enable-query-expansion", action="store_true",
@@ -539,13 +554,18 @@ def run() -> None:
         logger.info(f"Using manual intent override: {intent_result.intent.value}")
     else:
         with profiler.span("Intent classification"):
-            use_llm_intent = not args.no_llm_intent and not args.no_generate
-            # Use the reranker's 0.6B backbone for intent classification —
-            # it is already loaded and runs in ~100-200 ms instead of loading
-            # the full LLM (30B/80B) which takes 5-9 s just for a 50-token
-            # JSON classification.
+            use_llm_intent = bool(args.llm_intent) and not args.no_llm_intent and not args.no_generate
+            lightweight_generator = None
+            dedicated_intent_generator = None
+
+            if use_llm_intent and args.intent_backend == "reranker":
+                lightweight_generator = reranker
+            elif use_llm_intent and args.intent_backend == "dedicated":
+                dedicated_intent_generator = MlxGenerator(args.intent_model)
+
             classifier = IntentClassifier(
-                lightweight_generator=reranker if use_llm_intent else None,
+                generator=dedicated_intent_generator,
+                lightweight_generator=lightweight_generator,
                 confidence_threshold=args.intent_confidence_threshold,
             )
             intent_result = classifier.classify(args.query)

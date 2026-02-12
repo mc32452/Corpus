@@ -189,6 +189,8 @@ class TestIntentClassification:
             ("What does the author say about behaviorism?", Intent.FACTUAL),
             ("What specific method did they use?", Intent.FACTUAL),
             ("Name the key theorists", Intent.FACTUAL),
+            ("Extract all publication years and cited authors", Intent.FACTUAL),
+            ("Format the results as a table", Intent.FACTUAL),
             # COLLECTION intent tests
             ("What documents do we have?", Intent.COLLECTION),
             ("What are we looking at?", Intent.COLLECTION),
@@ -198,6 +200,11 @@ class TestIntentClassification:
             ("Show me all the sources", Intent.COLLECTION),
             ("What topics do the documents cover?", Intent.COLLECTION),
             ("Give me an overview of everything", Intent.COLLECTION),
+            # Structural comparative / analysis
+            ("Differences between Skinner and Chomsky", Intent.COMPARE),
+            ("Critique of Skinner in light of modern LLMs", Intent.COMPARE),
+            ("Trace the chain Skinner -> Chomsky -> modern LLM criticism", Intent.ANALYZE),
+            ("What is chomskys critique of skinner", Intent.ANALYZE),
         ],
     )
     def test_heuristic_classification(self, query: str, expected: Intent):
@@ -212,6 +219,40 @@ class TestIntentClassification:
         result = classifier.classify("")
         assert result.intent == Intent.OVERVIEW
         assert result.confidence == 1.0
+
+    def test_llm_light_logits_prefers_top_label(self):
+        class MockLightweight:
+            def score_intent_labels(self, prompt, labels):
+                return {
+                    "E": {"avg_logprob": -0.10, "raw_logit_sum": 3.0},
+                    "D": {"avg_logprob": -1.20, "raw_logit_sum": 1.2},
+                    "A": {"avg_logprob": -3.10, "raw_logit_sum": -0.5},
+                }
+
+        classifier = IntentClassifier(
+            lightweight_generator=MockLightweight(),
+            confidence_threshold=0.6,
+        )
+        result = classifier.classify("Compare Skinner and Chomsky")
+        assert result.intent == Intent.COMPARE
+        assert result.method == "llm-light-logits"
+        assert result.confidence > 0.6
+
+    def test_llm_light_logits_low_margin_falls_back(self):
+        class MockLightweight:
+            def score_intent_labels(self, prompt, labels):
+                return {
+                    "E": {"avg_logprob": -0.10, "raw_logit_sum": 1.0},
+                    "D": {"avg_logprob": -0.11, "raw_logit_sum": 0.95},
+                    "A": {"avg_logprob": -3.00, "raw_logit_sum": -0.2},
+                }
+
+        classifier = IntentClassifier(
+            lightweight_generator=MockLightweight(),
+            confidence_threshold=0.6,
+        )
+        result = classifier.classify("How does this relate?")
+        assert result.intent in (Intent.COMPARE, Intent.OVERVIEW)
 
     def test_ambiguous_query_fallback(self):
         """Ambiguous queries with low confidence should fallback to OVERVIEW."""

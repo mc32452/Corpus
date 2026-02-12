@@ -156,8 +156,15 @@ class StorageEngine:
             ids = [r["parent_id"] for r in records]
             try:
                 self._parents.delete(self._where_in("parent_id", ids))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.critical(
+                    "Upsert delete failed for parents table; aborting to prevent duplicates. "
+                    "table=%s ids_count=%d error=%s",
+                    self._PARENTS_TABLE,
+                    len(ids),
+                    exc,
+                )
+                raise
             self._parents.add(records)
 
     def add_children(
@@ -394,8 +401,15 @@ class StorageEngine:
         else:
             try:
                 self._summaries.delete(self._where_eq("source_id", sid))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.critical(
+                    "Upsert delete failed for summaries table; aborting to prevent duplicates. "
+                    "table=%s source_id=%s error=%s",
+                    self._SUMMARIES_TABLE,
+                    sid,
+                    exc,
+                )
+                raise
             self._summaries.add([record])
 
     def get_source_summaries(self) -> dict[str, str]:

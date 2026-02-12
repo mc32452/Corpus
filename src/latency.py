@@ -60,17 +60,8 @@ class LatencyProfiler:
         """Manually record a span that was already measured elsewhere."""
         if not self.enabled:
             return
-        s = _Span(label=label, detail=detail)
-        s.start = 0.0
-        s.end = elapsed_ms / 1000  # store in seconds for consistency
-        # Override so elapsed_ms property works:
-        s.start = 0.0
-        s.end = elapsed_ms / 1000
-        # Actually, let's just store raw ms
-        self._spans.append(s)
-        # Patch so elapsed_ms works:
-        self._spans[-1].start = 0.0
-        self._spans[-1].end = elapsed_ms / 1000
+        elapsed_s = elapsed_ms / 1000.0
+        self._spans.append(_Span(label=label, start=0.0, end=elapsed_s, detail=detail))
 
     # -- reporting ----------------------------------------------------------
 

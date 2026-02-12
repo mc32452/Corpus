@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -136,6 +137,84 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
 _HEURISTIC_CONFIDENCE = {"strong_match": 0.85, "single_match": 0.70, "weak_match": 0.50}
 _TECHNICAL_TERM_HINTS = {"stimulus", "reinforcement", "skinner"}
 
+_COMMAND_VERB_INTENTS: dict[re.Pattern, Intent] = {
+    re.compile(r"^\s*compare\b", re.IGNORECASE): Intent.COMPARE,
+    re.compile(r"^\s*contrast\b", re.IGNORECASE): Intent.COMPARE,
+    re.compile(r"^\s*summari[sz]e\b", re.IGNORECASE): Intent.SUMMARIZE,
+    re.compile(r"^\s*explain\b", re.IGNORECASE): Intent.EXPLAIN,
+    re.compile(r"^\s*analy[sz]e\b", re.IGNORECASE): Intent.ANALYZE,
+    re.compile(r"^\s*trace\b", re.IGNORECASE): Intent.ANALYZE,
+    re.compile(r"^\s*extract\b", re.IGNORECASE): Intent.FACTUAL,
+    re.compile(r"^\s*identify\b", re.IGNORECASE): Intent.FACTUAL,
+}
+
+_COMPARATIVE_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\bvs\.?\b", re.IGNORECASE),
+    re.compile(r"\bversus\b", re.IGNORECASE),
+    re.compile(r"\bdifferences?\s+between\b", re.IGNORECASE),
+    re.compile(r"\bsimilarit(y|ies)\s+between\b", re.IGNORECASE),
+    re.compile(r"\bin\s+light\s+of\b", re.IGNORECASE),
+    re.compile(r"\bbetween\b.+\band\b", re.IGNORECASE),
+]
+
+_EXTRACTION_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\bextract\b", re.IGNORECASE),
+    re.compile(r"\blist\s+all\s+(names?|dates?|years?|titles?|authors?|citations?)\b", re.IGNORECASE),
+    re.compile(r"\bgive\s+me\s+the\s+(dates?|years?|names?|citations?)\b", re.IGNORECASE),
+    re.compile(r"\bformat\b.*\bas\s+(a\s+)?table\b", re.IGNORECASE),
+    re.compile(r"\btabular\b", re.IGNORECASE),
+]
+
+_SUMMARIZATION_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\btl;?dr\b", re.IGNORECASE),
+    re.compile(r"\bmain\s+points?\b", re.IGNORECASE),
+    re.compile(r"\bkey\s+points?\b", re.IGNORECASE),
+    re.compile(r"\boverview\s+of\b", re.IGNORECASE),
+]
+
+
+def _apply_structural_intent_signals(query: str, scores: dict[Intent, int]) -> None:
+    """Apply structure-aware intent boosts beyond plain keyword presence."""
+    normalized = query.strip()
+
+    corpus_scope = bool(
+        re.search(r"\b(all|every|entire|whole)\b", normalized, re.IGNORECASE)
+        and re.search(r"\b(documents?|docs?|sources?|collection|corpus)\b", normalized, re.IGNORECASE)
+    )
+    overview_everything_scope = bool(
+        re.search(r"\boverview\s+of\s+everything\b", normalized, re.IGNORECASE)
+        or re.search(r"\bsummari[sz]e\s+everything\b", normalized, re.IGNORECASE)
+    )
+
+    for pattern, intent in _COMMAND_VERB_INTENTS.items():
+        if pattern.search(normalized):
+            if intent in (Intent.SUMMARIZE, Intent.FACTUAL) and corpus_scope:
+                continue
+            scores[intent] += 3
+
+    if any(pattern.search(normalized) for pattern in _COMPARATIVE_STRUCTURES):
+        scores[Intent.COMPARE] += 2
+
+    if any(pattern.search(normalized) for pattern in _EXTRACTION_STRUCTURES):
+        scores[Intent.FACTUAL] += 3
+
+    if any(pattern.search(normalized) for pattern in _SUMMARIZATION_STRUCTURES):
+        scores[Intent.SUMMARIZE] += 2
+
+    if corpus_scope or overview_everything_scope:
+        scores[Intent.COLLECTION] += 4
+
+    # Noun-phrase analytical framing: "X's critique of Y" usually asks for analysis
+    # of arguments, not an imperative to "critique".
+    if re.search(r"\b\w+(?:'s|s)\s+critique\s+of\b", normalized, re.IGNORECASE):
+        scores[Intent.ANALYZE] += 2
+
+    # Causal chain phrasing is analytical/multi-hop.
+    if re.search(r"\btrace\b.*\b(chain|path|link)\b", normalized, re.IGNORECASE):
+        scores[Intent.ANALYZE] += 3
+    if "->" in normalized:
+        scores[Intent.ANALYZE] += 2
+
 
 def _has_technical_terms(query: str) -> bool:
     if re.search(r"['\"`].+?['\"`]", query) or re.search(r"\b[A-Z][a-z]{2,}\b", query):
@@ -157,6 +236,8 @@ def _classify_heuristic(query: str) -> IntentResult:
         for pattern in patterns:
             if pattern.search(query):
                 scores[intent] += 1
+
+    _apply_structural_intent_signals(query, scores)
 
     # ---- noun-phrase de-boost ----
     # "Chomsky's critique", "chomskys critique", "the critique of X" → the
@@ -193,9 +274,11 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     matching_intents = [i for i, s in scores.items() if s > 0]
 
-    # COMPARE/CRITIQUE should win over generic ANALYZE when both match
+    # COMPARE/CRITIQUE should win over generic ANALYZE only when ANALYZE
+    # evidence is weak (avoid overriding strong structural analyze signals).
     if best_intent == Intent.ANALYZE and (
-        scores[Intent.COMPARE] > 0 or scores[Intent.CRITIQUE] > 0
+        scores[Intent.ANALYZE] <= 1
+        and (scores[Intent.COMPARE] > 0 or scores[Intent.CRITIQUE] > 0)
     ):
         if scores[Intent.COMPARE] >= scores[Intent.CRITIQUE]:
             best_intent = Intent.COMPARE
@@ -262,6 +345,34 @@ User query: "{query}"
 
 Respond with ONLY a JSON object in this exact format:
 {{"intent": "<overview|summarize|explain|compare|critique|analyze|factual|collection>", "confidence": <0.0-1.0>}}"""
+
+
+def _build_logit_classification_prompt(query: str) -> str:
+    """Prompt for logits-based single-label intent scoring."""
+    return f"""Classify the user query into exactly one intent label.
+Choose one label from: overview, summarize, explain, analyze, compare, critique, factual, collection.
+
+User query: {query}
+
+Intent label:"""
+
+
+def _build_mc_logit_prompt(query: str) -> str:
+    """Prompt for option-token intent classification (A-H)."""
+    return f"""Choose exactly one best intent for the query.
+Reply with one letter only: A, B, C, D, E, F, G, or H.
+
+A = overview
+B = summarize
+C = explain
+D = analyze
+E = compare
+F = critique
+G = factual
+H = collection
+
+Query: {query}
+Answer:"""
 
 
 def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
@@ -340,6 +451,111 @@ class IntentClassifier:
     
     def _classify_with_llm(self, query: str) -> Optional[IntentResult]:
         """Classify using LLM generator (lightweight or full)."""
+        intent_map = {
+            "overview": Intent.OVERVIEW,
+            "summarize": Intent.SUMMARIZE,
+            "explain": Intent.EXPLAIN,
+            "analyze": Intent.ANALYZE,
+            "compare": Intent.COMPARE,
+            "critique": Intent.CRITIQUE,
+            "factual": Intent.FACTUAL,
+            "collection": Intent.COLLECTION,
+        }
+
+        logits_model = None
+        logits_backend = ""
+        if self._lightweight_generator is not None and hasattr(self._lightweight_generator, "score_intent_labels"):
+            logits_model = self._lightweight_generator
+            logits_backend = "llm-light-logits"
+        elif self._generator is not None and hasattr(self._generator, "score_intent_labels"):
+            logits_model = self._generator
+            logits_backend = "llm-dedicated-logits"
+
+        if logits_model is not None:
+            try:
+                option_to_intent = {
+                    "A": Intent.OVERVIEW,
+                    "B": Intent.SUMMARIZE,
+                    "C": Intent.EXPLAIN,
+                    "D": Intent.ANALYZE,
+                    "E": Intent.COMPARE,
+                    "F": Intent.CRITIQUE,
+                    "G": Intent.FACTUAL,
+                    "H": Intent.COLLECTION,
+                }
+                options = list(option_to_intent.keys())
+
+                prompt = _build_mc_logit_prompt(query)
+                raw_scores = logits_model.score_intent_labels(prompt, options)
+                prior_prompt = _build_mc_logit_prompt("N/A")
+                prior_scores = logits_model.score_intent_labels(prior_prompt, options)
+
+                if raw_scores:
+                    score_values = {
+                        opt: float(metrics.get("avg_logprob", metrics.get("logprob_sum", float("-inf"))))
+                        for opt, metrics in raw_scores.items()
+                        if opt in option_to_intent
+                    }
+                    prior_values = {
+                        opt: float(metrics.get("avg_logprob", metrics.get("logprob_sum", 0.0)))
+                        for opt, metrics in prior_scores.items()
+                        if opt in score_values
+                    }
+                    calibrated_values = {
+                        opt: score_values[opt] - prior_values.get(opt, 0.0)
+                        for opt in score_values
+                    }
+
+                    heuristic = _classify_heuristic(query)
+                    heuristic_option = next((opt for opt, intent in option_to_intent.items() if intent == heuristic.intent), None)
+                    if heuristic_option in calibrated_values:
+                        heuristic_conf = min(max(heuristic.confidence, 1e-4), 1 - 1e-4)
+                        heuristic_log_odds = math.log(heuristic_conf / (1.0 - heuristic_conf))
+                        calibrated_values[heuristic_option] += 0.25 * heuristic_log_odds
+
+                    if score_values:
+                        ordered = sorted(calibrated_values.items(), key=lambda item: item[1], reverse=True)
+                        best_option, best_score = ordered[0]
+                        second_score = ordered[1][1] if len(ordered) > 1 else float("-inf")
+
+                        max_score = max(calibrated_values.values())
+                        exp_scores = {k: math.exp(v - max_score) for k, v in calibrated_values.items()}
+                        norm = sum(exp_scores.values())
+                        probs = {k: (v / norm if norm > 0 else 0.0) for k, v in exp_scores.items()}
+
+                        top_prob = probs.get(best_option, 0.0)
+                        second_prob = 0.0
+                        if len(ordered) > 1:
+                            second_option = ordered[1][0]
+                            second_prob = probs.get(second_option, 0.0)
+
+                        margin = best_score - second_score if second_score != float("-inf") else best_score
+                        confidence = 1.0 / (1.0 + math.exp(-4.0 * margin))
+
+                        raw_logit_debug = {
+                            opt: round(float(metrics.get("raw_logit_sum", 0.0)), 4)
+                            for opt, metrics in raw_scores.items()
+                            if opt in score_values
+                        }
+                        prob_debug = {opt: round(prob, 4) for opt, prob in probs.items()}
+                        logger.info(
+                            "Intent logits | backend=%s best=%s margin=%.4f raw_logits=%s calibrated=%s probs=%s",
+                            logits_backend,
+                            best_option,
+                            margin,
+                            raw_logit_debug,
+                            {opt: round(value, 4) for opt, value in calibrated_values.items()},
+                            prob_debug,
+                        )
+
+                        return IntentResult(
+                            intent=option_to_intent[best_option],
+                            confidence=max(0.0, min(1.0, confidence)),
+                            method=logits_backend,
+                        )
+            except Exception as e:
+                logger.warning("Logits intent classification failed (%s): %s", logits_backend, e)
+
         prompt = _build_classification_prompt(query)
         response: Optional[str] = None
 
