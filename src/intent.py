@@ -1,8 +1,19 @@
-"""Intent classification for RAG query processing."""
+"""Intent classification for RAG query processing.
+
+Architecture
+~~~~~~~~~~~~
+1. **Heuristic classifier** (primary) — fast regex + structural signal scoring.
+   Returns an ``IntentResult`` with confidence in (0, 1].
+2. **LLM fallback** (optional) — when heuristic confidence is below
+    ``llm_fallback_threshold``, uses an MLX language model to classify via
+    JSON generation.
+3. **Overview gate** — any result below ``confidence_threshold`` is demoted to
+   ``OVERVIEW`` so vague / garbage queries don't trigger specialised pipelines.
+"""
 from __future__ import annotations
 
+import json
 import logging
-import math
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -10,6 +21,8 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+# ── Data types ────────────────────────────────────────────────────────────────
 
 class Intent(Enum):
     OVERVIEW = "overview"
@@ -33,9 +46,27 @@ class IntentResult:
             raise ValueError("Confidence must be between 0.0 and 1.0")
 
 
+# ── Intent → JSON mapping (shared) ───────────────────────────────────────────
+
+_INTENT_MAP: dict[str, Intent] = {
+    "overview": Intent.OVERVIEW,
+    "summarize": Intent.SUMMARIZE,
+    "explain": Intent.EXPLAIN,
+    "analyze": Intent.ANALYZE,
+    "compare": Intent.COMPARE,
+    "critique": Intent.CRITIQUE,
+    "factual": Intent.FACTUAL,
+    "collection": Intent.COLLECTION,
+}
+
+
+# ── Heuristic patterns ───────────────────────────────────────────────────────
+
 _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
+    # ---- COLLECTION: corpus-level queries about available documents ----
     Intent.COLLECTION: [
         re.compile(r"\bwhat\s+(documents?|docs?|files?|sources?)\s+(do\s+)?(we|i|you)\s+have\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(documents?|docs?|files?|sources?)\s+(are|is)\s+(in\s+)?(here|there|available)\b", re.IGNORECASE),
         re.compile(r"\bwhat('s| is)\s+(in\s+)?(here|this\s+(collection|corpus|workspace|library))\b", re.IGNORECASE),
         re.compile(r"\blist\s+(all\s+)?(the\s+)?(documents?|docs?|files?|sources?)\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+are\s+(we|these)\s+(looking\s+at|working\s+with)\b", re.IGNORECASE),
@@ -50,7 +81,12 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bwhat\s+are\s+the\s+docs\s+in\s+here\b", re.IGNORECASE),
         re.compile(r"\bshow\s+(me\s+)?all\s+(the\s+)?sources\b", re.IGNORECASE),
         re.compile(r"\bdescribe\s+all\s+(the\s+)?sources\b", re.IGNORECASE),
+        # Informal corpus queries
+        re.compile(r"\bwhat\s+(do|can)\s+(we|i|you)\s+(have|see|access|read)\b", re.IGNORECASE),
+        re.compile(r"\bwhat('s| is)\s+available\b", re.IGNORECASE),
+        re.compile(r"\bwhat('s| is)\s+in\s+(the\s+)?(database|index|system)\b", re.IGNORECASE),
     ],
+    # ---- FACTUAL: direct fact extraction (who/what/when/where/which) ----
     Intent.FACTUAL: [
         re.compile(r"\bwhat\s+particular\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+(specific|exact)\b", re.IGNORECASE),
@@ -68,9 +104,11 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bwhat\s+(llm|model|algorithm|method|technique|tool|framework)\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+is\s+the\s+(author|writer)\s+(talking|writing|referring)\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+does\s+the\s+(author|writer|text|document|paper)\s+(say|state|claim|argue|mention)\b", re.IGNORECASE),
+        re.compile(r"\bfind\s+(me\s+)?(the|a|all)\b", re.IGNORECASE),
     ],
+    # ---- OVERVIEW: high-level single-document description ----
     Intent.OVERVIEW: [
-        re.compile(r"^what\s+is\s+this\s*\??$", re.IGNORECASE),  # Exact "what is this?"
+        re.compile(r"^what\s+is\s+this\s*\??$", re.IGNORECASE),
         re.compile(r"\bwhat\s+is\s+(this|the)\s+(paper|text|document|article)\s+(about\s*)?\??", re.IGNORECASE),
         re.compile(r"\bwhat\s+is\s+this\s+about\b", re.IGNORECASE),
         re.compile(r"\btell\s+me\s+about\s+(this|the)\s*(document|paper|text|article)?\b", re.IGNORECASE),
@@ -81,6 +119,7 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bin\s+a\s+nutshell\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+is\s+this\s+paper\b", re.IGNORECASE),
     ],
+    # ---- EXPLAIN: simplification for non-experts ----
     Intent.EXPLAIN: [
         re.compile(r"\bexplain\b", re.IGNORECASE),
         re.compile(r"\bsimple\s+terms\b", re.IGNORECASE),
@@ -91,7 +130,11 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bbreak\s*(it\s*)?down\b", re.IGNORECASE),
         re.compile(r"\bELI5\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+does\s+(this|that|it)\s+mean\b", re.IGNORECASE),
+        re.compile(r"\bhelp\s+(me\s+)?understand\b", re.IGNORECASE),
+        re.compile(r"\bin\s+(plain|everyday)\s+(english|language|words)\b", re.IGNORECASE),
+        re.compile(r"\bdumb\s+(it|this|that)?\s*down\b", re.IGNORECASE),
     ],
+    # ---- COMPARE: side-by-side comparative analysis ----
     Intent.COMPARE: [
         re.compile(r"\bcompare\b", re.IGNORECASE),
         re.compile(r"\bcontrast\b", re.IGNORECASE),
@@ -103,6 +146,7 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bside.by.side\b", re.IGNORECASE),
         re.compile(r"\bhow\s+(is|are|does|do)\b.*\b(like|unlike)\b", re.IGNORECASE),
     ],
+    # ---- CRITIQUE: evaluative analysis of arguments ----
     Intent.CRITIQUE: [
         re.compile(r"\bcritique\b", re.IGNORECASE),
         re.compile(r"\bcritici[sz]", re.IGNORECASE),
@@ -117,12 +161,18 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bpros?\s+and\s+cons?\b", re.IGNORECASE),
         re.compile(r"\bto\s+what\s+extent\b", re.IGNORECASE),
         re.compile(r"\bhow\s+(valid|sound|strong|weak|convincing)\b", re.IGNORECASE),
+        re.compile(r"\bis\s+(it|this|that|the\s+\w+)\b.*\b(valid|sound|convincing|justified|well.supported)\b", re.IGNORECASE),
+        re.compile(r"\bhow\s+well\s+does\b", re.IGNORECASE),
     ],
+    # ---- ANALYZE: mechanism / cause / theme analysis ----
     Intent.ANALYZE: [
         re.compile(r"\bhow\s+does\b", re.IGNORECASE),
         re.compile(r"\bin\s+what\s+way\b", re.IGNORECASE),
         re.compile(r"\banalyze\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+role\s+does\b", re.IGNORECASE),
+        re.compile(r"\bwhy\s+(is|are|does|do|did|was|were)\b", re.IGNORECASE),
     ],
+    # ---- SUMMARIZE: detailed summary with key points ----
     Intent.SUMMARIZE: [
         re.compile(r"\bsummari[sz]e\b", re.IGNORECASE),
         re.compile(r"\bdetailed\s+(summary|overview)\b", re.IGNORECASE),
@@ -136,6 +186,14 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
 
 _HEURISTIC_CONFIDENCE = {"strong_match": 0.85, "single_match": 0.70, "weak_match": 0.50}
 _TECHNICAL_TERM_HINTS = {"stimulus", "reinforcement", "skinner"}
+_LOW_INFO_COMMON_WORDS = {
+    "what", "why", "how", "who", "when", "where", "which", "explain", "summarize",
+    "compare", "analyze", "critique", "document", "docs", "paper", "text", "about",
+    "mean", "help", "understand", "list", "show", "tell", "overview", "details",
+}
+
+
+# ── Structural signal patterns ────────────────────────────────────────────────
 
 _COMMAND_VERB_INTENTS: dict[re.Pattern, Intent] = {
     re.compile(r"^\s*compare\b", re.IGNORECASE): Intent.COMPARE,
@@ -155,6 +213,7 @@ _COMPARATIVE_STRUCTURES: list[re.Pattern] = [
     re.compile(r"\bsimilarit(y|ies)\s+between\b", re.IGNORECASE),
     re.compile(r"\bin\s+light\s+of\b", re.IGNORECASE),
     re.compile(r"\bbetween\b.+\band\b", re.IGNORECASE),
+    re.compile(r"\brelate\s+to\b", re.IGNORECASE),
 ]
 
 _EXTRACTION_STRUCTURES: list[re.Pattern] = [
@@ -172,6 +231,8 @@ _SUMMARIZATION_STRUCTURES: list[re.Pattern] = [
     re.compile(r"\boverview\s+of\b", re.IGNORECASE),
 ]
 
+
+# ── Heuristic helpers ─────────────────────────────────────────────────────────
 
 def _apply_structural_intent_signals(query: str, scores: dict[Intent, int]) -> None:
     """Apply structure-aware intent boosts beyond plain keyword presence."""
@@ -204,12 +265,12 @@ def _apply_structural_intent_signals(query: str, scores: dict[Intent, int]) -> N
     if corpus_scope or overview_everything_scope:
         scores[Intent.COLLECTION] += 4
 
-    # Noun-phrase analytical framing: "X's critique of Y" usually asks for analysis
-    # of arguments, not an imperative to "critique".
+    # Noun-phrase analytical framing: "X's critique of Y" usually asks for
+    # analysis of arguments, not an imperative to "critique".
     if re.search(r"\b\w+(?:'s|s)\s+critique\s+of\b", normalized, re.IGNORECASE):
         scores[Intent.ANALYZE] += 2
 
-    # Causal chain phrasing is analytical/multi-hop.
+    # Causal chain phrasing is analytical / multi-hop.
     if re.search(r"\btrace\b.*\b(chain|path|link)\b", normalized, re.IGNORECASE):
         scores[Intent.ANALYZE] += 3
     if "->" in normalized:
@@ -223,14 +284,14 @@ def _has_technical_terms(query: str) -> bool:
 
 
 def _is_technical_how_why(query: str) -> bool:
-    # "how many" is a factual question, not analytical
+    # "how many" is a factual question, not analytical.
     if re.match(r"^\s*how\s+many\b", query, re.IGNORECASE):
         return False
     return bool(re.match(r"^\s*(how|why)\b", query, re.IGNORECASE)) and _has_technical_terms(query)
 
 
 def _classify_heuristic(query: str) -> IntentResult:
-    """Classify intent using regex pattern matching."""
+    """Classify intent using regex pattern matching + structural signals."""
     scores: dict[Intent, int] = {intent: 0 for intent in Intent}
     for intent, patterns in _INTENT_PATTERNS.items():
         for pattern in patterns:
@@ -240,10 +301,8 @@ def _classify_heuristic(query: str) -> IntentResult:
     _apply_structural_intent_signals(query, scores)
 
     # ---- noun-phrase de-boost ----
-    # "Chomsky's critique", "chomskys critique", "the critique of X" → the
-    # word "critique" is a noun, NOT an instruction to critique.  De-boost
-    # CRITIQUE so it doesn't tie with COMPARE / ANALYZE on queries that
-    # merely *mention* a critique.
+    # "Chomsky's critique", "the critique of X" → the word "critique" is a
+    # noun, NOT an instruction to critique.
     if scores[Intent.CRITIQUE] > 0:
         noun_critique = re.search(
             r"(?:\b\w+(?:'s|s)\s+|(?:the|a|an|this|that|his|her|their|its)\s+)critique\b",
@@ -258,7 +317,6 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     analyze_bias = _is_technical_how_why(query)
     if analyze_bias:
-        # Boost whichever analytical intent scored highest, or ANALYZE as default
         analytical = [Intent.COMPARE, Intent.CRITIQUE, Intent.ANALYZE]
         best_analytical = max(analytical, key=lambda k: scores[k])
         if any(scores[i] > 0 for i in analytical):
@@ -274,8 +332,9 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     matching_intents = [i for i, s in scores.items() if s > 0]
 
-    # COMPARE/CRITIQUE should win over generic ANALYZE only when ANALYZE
-    # evidence is weak (avoid overriding strong structural analyze signals).
+    # ---- Tie-break rules ----
+
+    # COMPARE/CRITIQUE wins over weak ANALYZE evidence.
     if best_intent == Intent.ANALYZE and (
         scores[Intent.ANALYZE] <= 1
         and (scores[Intent.COMPARE] > 0 or scores[Intent.CRITIQUE] > 0)
@@ -287,15 +346,13 @@ def _classify_heuristic(query: str) -> IntentResult:
             best_intent = Intent.CRITIQUE
             best_score = scores[Intent.CRITIQUE]
 
-    # COLLECTION should win ties with SUMMARIZE when both match
-    # (e.g., "Summarize all documents" matches both)
+    # COLLECTION wins ties with SUMMARIZE ("Summarize all documents").
     if Intent.COLLECTION in matching_intents and Intent.SUMMARIZE in matching_intents:
         if scores[Intent.COLLECTION] >= scores[Intent.SUMMARIZE]:
             best_intent = Intent.COLLECTION
             best_score = scores[Intent.COLLECTION]
 
-    # COMPARE should win ties with CRITIQUE when both match at score 1
-    # ("What is a similarity in Chomsky's critique" → COMPARE, not CRITIQUE)
+    # COMPARE wins ties with CRITIQUE ("similarity in Chomsky's critique").
     if (
         scores[Intent.COMPARE] > 0
         and scores[Intent.CRITIQUE] > 0
@@ -303,11 +360,9 @@ def _classify_heuristic(query: str) -> IntentResult:
     ):
         best_intent = Intent.COMPARE
         best_score = scores[Intent.COMPARE]
-        # Zero out CRITIQUE so the confidence calc doesn't penalise the
-        # false tie — we've resolved the ambiguity.
         scores[Intent.CRITIQUE] = 0
 
-    # Recalculate matching intents after all tiebreaks / de-boosts.
+    # Recalculate after tie-breaks.
     matching_intents = [i for i, s in scores.items() if s > 0]
 
     if len(matching_intents) > 1 and best_score == 1:
@@ -322,6 +377,38 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     return IntentResult(intent=best_intent, confidence=confidence, method="heuristic")
 
+
+def is_low_information_query(query: str) -> bool:
+    """Return True when query is likely underspecified or gibberish-like."""
+    normalized = query.strip().lower()
+    if not normalized:
+        return True
+
+    tokens = re.findall(r"[a-zA-Z']+", normalized)
+    if not tokens:
+        return True
+
+    # Repeated-token noise, e.g. "wa wa wa"
+    if len(tokens) >= 2 and len(set(tokens)) == 1:
+        return True
+
+    has_pattern_signal = any(
+        pattern.search(normalized)
+        for patterns in _INTENT_PATTERNS.values()
+        for pattern in patterns
+    )
+    has_common_intent_word = any(token in _LOW_INFO_COMMON_WORDS for token in tokens)
+    has_question_mark = "?" in normalized
+
+    if len(tokens) <= 2 and not has_pattern_signal and not has_common_intent_word:
+        return True
+    if len(tokens) <= 3 and not has_pattern_signal and not has_common_intent_word and not has_question_mark:
+        return True
+
+    return False
+
+
+# ── LLM classification helpers ────────────────────────────────────────────────
 
 def _build_classification_prompt(query: str) -> str:
     """Build a minimal prompt for LLM-based intent classification."""
@@ -347,37 +434,8 @@ Respond with ONLY a JSON object in this exact format:
 {{"intent": "<overview|summarize|explain|compare|critique|analyze|factual|collection>", "confidence": <0.0-1.0>}}"""
 
 
-def _build_logit_classification_prompt(query: str) -> str:
-    """Prompt for logits-based single-label intent scoring."""
-    return f"""Classify the user query into exactly one intent label.
-Choose one label from: overview, summarize, explain, analyze, compare, critique, factual, collection.
-
-User query: {query}
-
-Intent label:"""
-
-
-def _build_mc_logit_prompt(query: str) -> str:
-    """Prompt for option-token intent classification (A-H)."""
-    return f"""Choose exactly one best intent for the query.
-Reply with one letter only: A, B, C, D, E, F, G, or H.
-
-A = overview
-B = summarize
-C = explain
-D = analyze
-E = compare
-F = critique
-G = factual
-H = collection
-
-Query: {query}
-Answer:"""
-
-
 def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
     """Parse JSON intent classification from LLM response."""
-    import json
     response = response.strip()
     if "```" in response:
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
@@ -390,8 +448,7 @@ def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
 
     try:
         data = json.loads(response[start:end + 1])
-        intent_map = {"overview": Intent.OVERVIEW, "summarize": Intent.SUMMARIZE, "explain": Intent.EXPLAIN, "analyze": Intent.ANALYZE, "compare": Intent.COMPARE, "critique": Intent.CRITIQUE, "factual": Intent.FACTUAL, "collection": Intent.COLLECTION}
-        intent = intent_map.get(data.get("intent", "").lower().strip())
+        intent = _INTENT_MAP.get(data.get("intent", "").lower().strip())
         if intent is None:
             return None
         return (intent, max(0.0, min(1.0, float(data.get("confidence", 0.5)))))
@@ -399,208 +456,146 @@ def _parse_llm_response(response: str) -> Optional[Tuple[Intent, float]]:
         return None
 
 
+# ── Main classifier ───────────────────────────────────────────────────────────
+
 class IntentClassifier:
-    """Classifies user queries into intent types with LLM or heuristic fallback.
+    """Classifies user queries into intents.
 
-    Supports two kinds of LLM backend:
+    Flow: heuristic → (optional) LLM fallback → overview gate.
 
-    * **lightweight_generator** – an object with a ``generate_text(prompt, max_tokens)``
-      method (e.g. the reranker's 0.6B backbone).  Preferred because it is
-      already loaded and adds only ~100-200 ms.
-    * **generator** – a full ``MlxGenerator`` instance.  Only used when no
-      lightweight generator is supplied and ``use_llm=True``.
+    Parameters
+    ----------
+    confidence_threshold:
+        Final confidence gate.  Results below this are demoted to OVERVIEW.
+    llm_model_id:
+        HuggingFace / MLX model ID for the LLM fallback (e.g.
+        ``mlx-community/LFM2-8B-A1B-4bit``).  ``None`` disables the fallback.
+    llm_fallback_threshold:
+        If the heuristic confidence is below this value *and* an LLM model is
+        configured, the LLM fallback is invoked.
     """
 
     def __init__(
         self,
-        generator: Optional[object] = None,
         confidence_threshold: float = 0.6,
-        use_llm: bool = True,
-        lightweight_generator: Optional[object] = None,
-        mode: Optional[str] = None,   # kept for backward compat; unused
+        llm_model_id: Optional[str] = None,
+        llm_fallback_threshold: float = 0.70,
+        eager_load_llm: bool = True,
     ) -> None:
-        self._generator = generator
-        self._lightweight_generator = lightweight_generator
         self._confidence_threshold = confidence_threshold
-        # Prefer lightweight generator (already loaded, fast).
-        if lightweight_generator is not None:
-            self._use_llm = True
-        else:
-            self._use_llm = use_llm and generator is not None
+        self._llm_model_id = llm_model_id
+        self._llm_fallback_threshold = llm_fallback_threshold
+        self._eager_load_llm = eager_load_llm
+        # LLM state
+        self._llm_model = None
+        self._llm_tokenizer = None
+        if self._llm_model_id is not None and self._eager_load_llm:
+            self._load_llm_model()
+
+    # ── public API ────────────────────────────────────────────────────────
 
     def classify(self, query: str) -> IntentResult:
-        """Classify query intent. Falls back to OVERVIEW if confidence < threshold."""
+        """Classify query intent.  Falls back to OVERVIEW when uncertain."""
         if not query.strip():
             return IntentResult(intent=Intent.OVERVIEW, confidence=1.0, method="fallback")
 
-        result: Optional[IntentResult] = None
-        if self._use_llm and (self._lightweight_generator is not None or self._generator is not None):
-            try:
-                result = self._classify_with_llm(query)
-            except Exception as e:
-                logger.warning(f"LLM classification failed: {e}, falling back to heuristic")
+        result = _classify_heuristic(query)
 
-        if result is None:
-            result = _classify_heuristic(query)
+        # If heuristic is confident enough, skip the LLM.
+        if result.confidence >= self._llm_fallback_threshold or self._llm_model_id is None:
+            return self._apply_overview_gate(result)
 
+        # Low-confidence heuristic → try LLM fallback.
+        logger.info(
+            "Heuristic confidence %.2f < %.2f — invoking LLM fallback (%s)",
+            result.confidence, self._llm_fallback_threshold, self._llm_model_id,
+        )
+        try:
+            llm_result = self._classify_with_llm(query)
+            if llm_result is not None:
+                # Use LLM result if it's confident; otherwise keep heuristic.
+                if llm_result.confidence >= self._confidence_threshold:
+                    return llm_result
+                logger.info(
+                    "LLM fallback confidence %.2f still below threshold; keeping heuristic",
+                    llm_result.confidence,
+                )
+        except Exception as exc:
+            logger.warning("LLM intent classification failed: %s", exc)
+
+        return self._apply_overview_gate(result)
+
+    # ── private helpers ───────────────────────────────────────────────────
+
+    def _apply_overview_gate(self, result: IntentResult) -> IntentResult:
+        """Demote to OVERVIEW if confidence is below the final threshold."""
         if result.confidence < self._confidence_threshold:
-            logger.info(f"Intent '{result.intent.value}' confidence {result.confidence:.2f} below threshold, falling back to overview")
-            return IntentResult(intent=Intent.OVERVIEW, confidence=result.confidence, method=f"{result.method}+overview_fallback")
-
+            logger.info(
+                "Intent '%s' confidence %.2f below threshold — falling back to overview",
+                result.intent.value, result.confidence,
+            )
+            return IntentResult(
+                intent=Intent.OVERVIEW,
+                confidence=result.confidence,
+                method=f"{result.method}+overview_fallback",
+            )
         return result
-    
+
+    def _load_llm_model(self) -> None:
+        """Hard-load the LLM fallback model when classifier is created."""
+        if self._llm_model is not None:
+            return
+        if self._llm_model_id is None:
+            return
+        logger.info("Loading intent fallback model: %s", self._llm_model_id)
+        import mlx_lm  # noqa: local lazy import
+        self._llm_model, self._llm_tokenizer = mlx_lm.load(self._llm_model_id)
+
     def _classify_with_llm(self, query: str) -> Optional[IntentResult]:
-        """Classify using LLM generator (lightweight or full)."""
-        intent_map = {
-            "overview": Intent.OVERVIEW,
-            "summarize": Intent.SUMMARIZE,
-            "explain": Intent.EXPLAIN,
-            "analyze": Intent.ANALYZE,
-            "compare": Intent.COMPARE,
-            "critique": Intent.CRITIQUE,
-            "factual": Intent.FACTUAL,
-            "collection": Intent.COLLECTION,
-        }
+        """Classify intent using the LLM fallback model."""
+        self._load_llm_model()
+        if self._llm_model is None:
+            return None
 
-        logits_model = None
-        logits_backend = ""
-        if self._lightweight_generator is not None and hasattr(self._lightweight_generator, "score_intent_labels"):
-            logits_model = self._lightweight_generator
-            logits_backend = "llm-light-logits"
-        elif self._generator is not None and hasattr(self._generator, "score_intent_labels"):
-            logits_model = self._generator
-            logits_backend = "llm-dedicated-logits"
-
-        if logits_model is not None:
-            try:
-                option_to_intent = {
-                    "A": Intent.OVERVIEW,
-                    "B": Intent.SUMMARIZE,
-                    "C": Intent.EXPLAIN,
-                    "D": Intent.ANALYZE,
-                    "E": Intent.COMPARE,
-                    "F": Intent.CRITIQUE,
-                    "G": Intent.FACTUAL,
-                    "H": Intent.COLLECTION,
-                }
-                options = list(option_to_intent.keys())
-
-                prompt = _build_mc_logit_prompt(query)
-                raw_scores = logits_model.score_intent_labels(prompt, options)
-                prior_prompt = _build_mc_logit_prompt("N/A")
-                prior_scores = logits_model.score_intent_labels(prior_prompt, options)
-
-                if raw_scores:
-                    score_values = {
-                        opt: float(metrics.get("avg_logprob", metrics.get("logprob_sum", float("-inf"))))
-                        for opt, metrics in raw_scores.items()
-                        if opt in option_to_intent
-                    }
-                    prior_values = {
-                        opt: float(metrics.get("avg_logprob", metrics.get("logprob_sum", 0.0)))
-                        for opt, metrics in prior_scores.items()
-                        if opt in score_values
-                    }
-                    calibrated_values = {
-                        opt: score_values[opt] - prior_values.get(opt, 0.0)
-                        for opt in score_values
-                    }
-
-                    heuristic = _classify_heuristic(query)
-                    heuristic_option = next((opt for opt, intent in option_to_intent.items() if intent == heuristic.intent), None)
-                    if heuristic_option in calibrated_values:
-                        heuristic_conf = min(max(heuristic.confidence, 1e-4), 1 - 1e-4)
-                        heuristic_log_odds = math.log(heuristic_conf / (1.0 - heuristic_conf))
-                        calibrated_values[heuristic_option] += 0.25 * heuristic_log_odds
-
-                    if score_values:
-                        ordered = sorted(calibrated_values.items(), key=lambda item: item[1], reverse=True)
-                        best_option, best_score = ordered[0]
-                        second_score = ordered[1][1] if len(ordered) > 1 else float("-inf")
-
-                        max_score = max(calibrated_values.values())
-                        exp_scores = {k: math.exp(v - max_score) for k, v in calibrated_values.items()}
-                        norm = sum(exp_scores.values())
-                        probs = {k: (v / norm if norm > 0 else 0.0) for k, v in exp_scores.items()}
-
-                        top_prob = probs.get(best_option, 0.0)
-                        second_prob = 0.0
-                        if len(ordered) > 1:
-                            second_option = ordered[1][0]
-                            second_prob = probs.get(second_option, 0.0)
-
-                        margin = best_score - second_score if second_score != float("-inf") else best_score
-                        confidence = 1.0 / (1.0 + math.exp(-4.0 * margin))
-
-                        raw_logit_debug = {
-                            opt: round(float(metrics.get("raw_logit_sum", 0.0)), 4)
-                            for opt, metrics in raw_scores.items()
-                            if opt in score_values
-                        }
-                        prob_debug = {opt: round(prob, 4) for opt, prob in probs.items()}
-                        logger.info(
-                            "Intent logits | backend=%s best=%s margin=%.4f raw_logits=%s calibrated=%s probs=%s",
-                            logits_backend,
-                            best_option,
-                            margin,
-                            raw_logit_debug,
-                            {opt: round(value, 4) for opt, value in calibrated_values.items()},
-                            prob_debug,
-                        )
-
-                        return IntentResult(
-                            intent=option_to_intent[best_option],
-                            confidence=max(0.0, min(1.0, confidence)),
-                            method=logits_backend,
-                        )
-            except Exception as e:
-                logger.warning("Logits intent classification failed (%s): %s", logits_backend, e)
+        import mlx_lm  # noqa: local lazy import
 
         prompt = _build_classification_prompt(query)
-        response: Optional[str] = None
 
-        if self._lightweight_generator is not None:
-            # Fast path: reranker's 0.6B backbone (~100-200 ms)
-            try:
-                response = self._lightweight_generator.generate_text(
-                    prompt, max_tokens=50, temperature=0.1,
-                )
-            except Exception as e:
-                logger.warning("Lightweight LLM intent classification failed: %s", e)
-                return None
-        elif self._generator is not None:
-            # Slow path: full LLM
-            from .generator import GenerationConfig
-            config = GenerationConfig(max_tokens=50, temperature=0.1, top_p=0.9)
-            response = self._generator.generate(prompt, config=config)
+        # Apply chat template if the tokenizer supports it.
+        if hasattr(self._llm_tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": prompt}]
+            formatted = self._llm_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
         else:
-            return None
+            formatted = prompt
 
-        if response is None:
-            return None
+        response = mlx_lm.generate(
+            self._llm_model,
+            self._llm_tokenizer,
+            prompt=formatted,
+            max_tokens=60,
+        )
 
         parsed = _parse_llm_response(response)
-
         if parsed is None:
             logger.warning("Failed to parse LLM intent response: %s", response[:200])
             return None
 
-        method = "llm-light" if self._lightweight_generator is not None else "llm"
-        return IntentResult(intent=parsed[0], confidence=parsed[1], method=method)
+        return IntentResult(intent=parsed[0], confidence=parsed[1], method="llm-fallback")
 
+
+# ── Convenience function ──────────────────────────────────────────────────────
 
 def classify_intent(
     query: str,
-    generator: Optional[object] = None,
     confidence_threshold: float = 0.6,
-    use_llm: bool = True,
-    lightweight_generator: Optional[object] = None,
-    mode: Optional[str] = None,
+    llm_model_id: Optional[str] = None,
+    llm_fallback_threshold: float = 0.70,
 ) -> IntentResult:
-    """Convenience function to classify query intent."""
+    """One-shot convenience wrapper around :class:`IntentClassifier`."""
     return IntentClassifier(
-        generator=generator,
         confidence_threshold=confidence_threshold,
-        use_llm=use_llm,
-        lightweight_generator=lightweight_generator,
+        llm_model_id=llm_model_id,
+        llm_fallback_threshold=llm_fallback_threshold,
     ).classify(query)

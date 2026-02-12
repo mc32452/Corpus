@@ -17,7 +17,7 @@ from .config import CITATIONS_ENABLED_DEFAULT, ModelConfig, select_mode_config
 from .generation import build_messages
 from .generator import GenerationConfig, MlxGenerator, count_tokens, enforce_token_budget
 from .ingest import ingest_file_to_storage
-from .intent import Intent, IntentClassifier, IntentResult
+from .intent import Intent, IntentClassifier, IntentResult, is_low_information_query
 from .latency import LatencyProfiler
 from .metrics import BudgetMetrics, RetrievalMetrics, ThresholdMetrics, format_metrics_summary, log_metrics
 from .retrieval import RetrievalEngine, build_source_legend, format_context_with_citations
@@ -373,23 +373,21 @@ def run() -> None:
         help="Minimum confidence for intent classification (default: 0.6)",
     )
     query_parser.add_argument(
-        "--llm-intent", action="store_true",
-        help="Enable LLM-based intent classification (experimental). Default is heuristic intent.",
+        "--llm-fallback", action="store_true",
+        help="Deprecated compatibility flag. LLM intent fallback is now enabled by default.",
     )
     query_parser.add_argument(
-        "--no-llm-intent", action="store_true",
-        help="Disable LLM-based intent classification (kept for backward compatibility).",
+        "--no-llm-fallback", action="store_true",
+        help="Disable LLM intent fallback and use heuristic-only intent classification.",
     )
     query_parser.add_argument(
-        "--intent-backend",
-        choices=["reranker", "dedicated"],
-        default="reranker",
-        help="Intent backend: reranker (reuse Jina 0.6B backbone) or dedicated (load separate small instruct model).",
+        "--llm-fallback-threshold", type=float, default=0.70,
+        help="Heuristic confidence below this triggers LLM fallback (default: 0.70).",
     )
     query_parser.add_argument(
         "--intent-model",
-        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        help="Model ID for --intent-backend=dedicated.",
+        default="mlx-community/LFM2-8B-A1B-4bit",
+        help="Model ID for LLM intent fallback (default: mlx-community/LFM2-8B-A1B-4bit).",
     )
     query_parser.add_argument(
         "--enable-query-expansion", action="store_true",
@@ -554,19 +552,14 @@ def run() -> None:
         logger.info(f"Using manual intent override: {intent_result.intent.value}")
     else:
         with profiler.span("Intent classification"):
-            use_llm_intent = bool(args.llm_intent) and not args.no_llm_intent and not args.no_generate
-            lightweight_generator = None
-            dedicated_intent_generator = None
-
-            if use_llm_intent and args.intent_backend == "reranker":
-                lightweight_generator = reranker
-            elif use_llm_intent and args.intent_backend == "dedicated":
-                dedicated_intent_generator = MlxGenerator(args.intent_model)
+            llm_fallback_enabled = not args.no_generate and not getattr(args, "no_llm_fallback", False)
+            llm_model_id = args.intent_model if llm_fallback_enabled else None
+            llm_fallback_threshold = 1.0 if llm_fallback_enabled else getattr(args, "llm_fallback_threshold", 0.70)
 
             classifier = IntentClassifier(
-                generator=dedicated_intent_generator,
-                lightweight_generator=lightweight_generator,
                 confidence_threshold=args.intent_confidence_threshold,
+                llm_model_id=llm_model_id,
+                llm_fallback_threshold=llm_fallback_threshold,
             )
             intent_result = classifier.classify(args.query)
         logger.info(f"Classified intent: {intent_result.intent.value} (confidence={intent_result.confidence:.2f}, method={intent_result.method})")
@@ -579,9 +572,32 @@ def run() -> None:
     _log_query(args.query, search_query if args.enable_query_expansion else None, intent_result, args.enable_query_expansion)
 
     extra_instructions: Optional[str] = None
+    query_looks_unclear = is_low_information_query(args.query)
+    bypass_retrieval_unclear_query = (
+        query_looks_unclear
+        and not args.no_generate
+    )
+
+    if bypass_retrieval_unclear_query:
+        logger.info(
+            "Skipping retrieval for low-information query; delegating directly to generation model"
+        )
+        context = ""
+        results = []
+        source_ids = []
+        parent_texts = []
+        if citations_enabled:
+            logger.info("Auto-disabling citations: no retrieval context for unclear query")
+            citations_enabled = False
+        extra_instructions = (
+            "The user query is unclear or nonsensical. Ask a concise clarifying question first, "
+            "and optionally suggest 2-3 concrete ways they can rephrase it."
+        )
 
     # --- COLLECTION intent: always use document summaries ---
-    if intent_result.intent == Intent.COLLECTION:
+    if bypass_retrieval_unclear_query:
+        pass
+    elif intent_result.intent == Intent.COLLECTION:
         sources = storage.list_source_ids()
         if not sources:
             print("No documents found in the database.")
