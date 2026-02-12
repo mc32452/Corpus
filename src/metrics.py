@@ -138,7 +138,7 @@ def log_metrics(
     th = metrics.threshold
     if th.items_before_threshold > 0:
         logger.info("THRESHOLD FILTER:")
-        logger.info(f"   Threshold: {th.threshold_value:.1f}")
+        logger.info(f"   Threshold: {th.threshold_value:.4f}")
         logger.info(f"   Before: {th.items_before_threshold} docs")
         logger.info(f"   After: {th.items_after_threshold} docs")
         if th.safety_net_triggered:

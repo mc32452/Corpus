@@ -43,6 +43,36 @@ class TestParentStore:
         texts = tmp_storage.get_parent_texts_by_source(source_id="test_doc_linguistics")
         assert len(texts) > 0
 
+    def test_get_parent_text_handles_quotes_in_id(self, tmp_path: Path):
+        config = StorageConfig(lance_dir=tmp_path / "lance")
+        engine = StorageEngine(config)
+        quoted_parent = ParentChunk(
+            id="parent-'quoted'",
+            text="Quoted parent text",
+            metadata=Metadata(
+                source_id="doc-1",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        engine.add_parents([quoted_parent])
+        assert engine.get_parent_text("parent-'quoted'") == "Quoted parent text"
+
+    def test_get_parent_texts_batch(self, tmp_storage: StorageEngine, mock_embedder: MockEmbeddingModel):
+        q_vec = mock_embedder.encode(["Chomsky theory epistemology"], normalize_embeddings=True)[0]
+        hits = tmp_storage.hybrid_search(query_text="Chomsky theory epistemology", query_vector=q_vec, top_k=5)
+        parent_ids = [r["metadata"].get("parent_id") for r in hits if r.get("metadata")]
+        parent_ids = [pid for pid in parent_ids if isinstance(pid, str)]
+        assert parent_ids
+
+        found = tmp_storage.get_parent_texts(parent_ids + ["nonexistent-id"])
+        for parent_id in parent_ids:
+            assert parent_id in found
+        assert "nonexistent-id" not in found
+
 
 # ===========================================================================
 # Child chunk store (LanceDB vectors + FTS)
@@ -111,6 +141,47 @@ class TestChildStore:
         for r in results:
             assert r["metadata"].get("source_id") == "test_doc_philosophy"
 
+    def test_hybrid_search_source_filter_handles_quotes(self, tmp_path: Path, mock_embedder: MockEmbeddingModel):
+        config = StorageConfig(lance_dir=tmp_path / "lance")
+        engine = StorageEngine(config)
+        quoted_source = "doc-'quoted'"
+        parent = ParentChunk(
+            id="p-quoted",
+            text="Parent text",
+            metadata=Metadata(
+                source_id=quoted_source,
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        child = ChildChunk(
+            text="quoted source child text",
+            metadata=Metadata(
+                source_id=quoted_source,
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=parent.id,
+            ),
+        )
+        engine.add_parents([parent])
+        embedding = mock_embedder.encode([child.text], normalize_embeddings=True)
+        engine.add_children([child], embeddings=embedding)
+
+        q_vec = mock_embedder.encode(["quoted source child"], normalize_embeddings=True)[0]
+        results = engine.hybrid_search(
+            query_text="quoted source child",
+            query_vector=q_vec,
+            top_k=5,
+            source_id=quoted_source,
+        )
+        assert results
+        assert all(r["metadata"].get("source_id") == quoted_source for r in results)
+
     def test_persist_reopen(self, tmp_path: Path, mock_embedder: MockEmbeddingModel):
         """Data should survive close + reopen."""
         config = StorageConfig(lance_dir=tmp_path / "lance")
@@ -152,6 +223,13 @@ class TestSourceSummaries:
     def test_empty_summary_rejected(self, tmp_storage: StorageEngine):
         with pytest.raises(ValueError):
             tmp_storage.upsert_source_summary(source_id="doc", summary="")
+
+    def test_upsert_summary_handles_quotes_in_source_id(self, tmp_storage: StorageEngine):
+        quoted_source = "doc-'quoted'"
+        tmp_storage.upsert_source_summary(source_id=quoted_source, summary="v1")
+        tmp_storage.upsert_source_summary(source_id=quoted_source, summary="v2")
+        summaries = tmp_storage.get_source_summaries()
+        assert summaries[quoted_source] == "v2"
 
 
 # ===========================================================================

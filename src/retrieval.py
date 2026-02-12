@@ -238,7 +238,7 @@ class RetrievalEngine:
         # sparse_search_ms and rrf_fusion_ms are zero — LanceDB does it all in one call
         timing.sparse_search_ms = 0.0
         timing.rrf_fusion_ms = 0.0
-        logger.info("LanceDB hybrid search returned %d hits in %.1fms", len(fused), timing.dense_search_ms)
+        logger.info("LanceDB hybrid search returned %d hits in %.3fms", len(fused), timing.dense_search_ms)
 
         # Stage 2: Deduplicate by parent
         t0 = time.perf_counter()
@@ -247,17 +247,17 @@ class RetrievalEngine:
         logger.debug(f"Early dedup: {dedup_metrics.children_before_dedup} -> {dedup_metrics.children_after_dedup} ({dedup_metrics.reduction_pct:.1f}% reduction)")
 
         # Stage 3: Enrich with parent text for reranking
-        parent_cache: dict[str, str] = {}
+        parent_ids = {
+            metadata.get("parent_id")
+            for metadata in (item.get("metadata") or {} for item in deduped)
+            if isinstance(metadata.get("parent_id"), str) and metadata.get("parent_id")
+        }
+        parent_cache = self._storage.get_parent_texts(parent_ids)
         for item in deduped:
             metadata = item.get("metadata") or {}
             parent_id = metadata.get("parent_id")
-            if isinstance(parent_id, str):
-                if parent_id not in parent_cache:
-                    parent_text = self._storage.get_parent_text(parent_id)
-                    if parent_text:
-                        parent_cache[parent_id] = parent_text
-                if parent_id in parent_cache:
-                    item["rerank_text"] = parent_cache[parent_id]
+            if isinstance(parent_id, str) and parent_id in parent_cache:
+                item["rerank_text"] = parent_cache[parent_id]
 
         # Stage 4: Rerank
         t0 = time.perf_counter()
@@ -268,7 +268,7 @@ class RetrievalEngine:
         # Stage 5: Threshold filtering
         threshold_metrics = ThresholdMetrics()
         if cfg and reranked:
-            threshold = cfg.reranker_threshold
+            threshold = float(cfg.reranker_threshold)
             min_docs = cfg.reranker_min_docs
             items_before = len(reranked)
 
@@ -291,7 +291,12 @@ class RetrievalEngine:
                     min_docs=min_docs,
                 )
             else:
-                logger.debug(f"Threshold filter: {len(reranked)} -> {len(threshold_filtered)} docs (threshold: {threshold:.1f})")
+                logger.debug(
+                    "Threshold filter: %d -> %d docs (threshold: %.4f)",
+                    len(reranked),
+                    len(threshold_filtered),
+                    threshold,
+                )
                 reranked = threshold_filtered
                 threshold_metrics = ThresholdMetrics(
                     threshold_value=threshold, items_before_threshold=items_before,
@@ -299,6 +304,15 @@ class RetrievalEngine:
                 )
 
         reranker_metrics = compute_reranker_stats(raw_scores)
+        if reranker_metrics.items_reranked > 0:
+            logger.debug(
+                "Rerank score stats: min=%.4f max=%.4f mean=%.4f std=%.4f (n=%d)",
+                reranker_metrics.score_min,
+                reranker_metrics.score_max,
+                reranker_metrics.score_mean,
+                reranker_metrics.score_std,
+                reranker_metrics.items_reranked,
+            )
 
         # Stage 6: Final dedup + boilerplate filter
         final: list[dict[str, Any]] = []
@@ -323,11 +337,20 @@ class RetrievalEngine:
             if len(final) >= k_final:
                 break
 
+        final_parent_ids = {
+            metadata.get("parent_id")
+            for metadata in (item.get("metadata") or {} for item in final)
+            if isinstance(metadata.get("parent_id"), str) and metadata.get("parent_id")
+        }
+        missing_parent_ids = [pid for pid in final_parent_ids if pid not in parent_cache]
+        if missing_parent_ids:
+            parent_cache.update(self._storage.get_parent_texts(missing_parent_ids))
+
         results: list[RetrievalResult] = []
         for item in final:
             metadata = item.get("metadata") or {}
             parent_id = metadata.get("parent_id")
-            parent_text = self._storage.get_parent_text(parent_id) if isinstance(parent_id, str) else None
+            parent_text = parent_cache.get(parent_id) if isinstance(parent_id, str) else None
             results.append(RetrievalResult(
                 child_id=item["id"], text=item.get("text", ""), metadata=metadata,
                 score=float(item.get("rerank_score", item.get("score", 0.0))), parent_text=parent_text,

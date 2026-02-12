@@ -26,6 +26,37 @@ from .storage import StorageConfig, StorageEngine
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+_VALID_FTS_POLICIES = ("immediate", "deferred", "batch")
+
+
+def _get_fts_policy_default() -> str:
+    raw = os.getenv("RAG_FTS_REBUILD_POLICY", "deferred").strip().lower()
+    if raw in _VALID_FTS_POLICIES:
+        return raw
+    if raw:
+        logger.warning(
+            "Invalid RAG_FTS_REBUILD_POLICY='%s'; falling back to 'deferred'",
+            raw,
+        )
+    return "deferred"
+
+
+def _get_fts_batch_size_default() -> int:
+    raw = os.getenv("RAG_FTS_REBUILD_BATCH_SIZE", "0").strip()
+    if not raw:
+        return 0
+    try:
+        parsed = int(raw)
+        if parsed < 0:
+            raise ValueError
+        return parsed
+    except ValueError:
+        logger.warning(
+            "Invalid RAG_FTS_REBUILD_BATCH_SIZE='%s'; falling back to 0",
+            raw,
+        )
+        return 0
+
 
 def _dedupe_context(texts: Iterable[str]) -> str:
     seen: set[str] = set()
@@ -218,6 +249,8 @@ def run() -> None:
     logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
     parser = argparse.ArgumentParser(description="Offline RAG CLI")
+    fts_policy_default = _get_fts_policy_default()
+    fts_batch_size_default = _get_fts_batch_size_default()
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
@@ -231,6 +264,25 @@ def run() -> None:
     ingest_parser.add_argument("--page-number", type=int, default=None, help="Page number")
     ingest_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
     ingest_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
+    ingest_parser.add_argument(
+        "--fts-rebuild-policy",
+        choices=list(_VALID_FTS_POLICIES),
+        default=fts_policy_default,
+        help=(
+            "FTS index rebuild policy after ingest writes: immediate, deferred, or batch "
+            "(default: %(default)s). Deferred rebuilds on the next query and may add a one-time "
+            "search latency spike while the index is refreshed."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=fts_batch_size_default,
+        help=(
+            "Row threshold for --fts-rebuild-policy=batch (default: %(default)s). "
+            "Ignored for other policies."
+        ),
+    )
     ingest_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -263,6 +315,25 @@ def run() -> None:
     query_parser.add_argument("query", help="User query")
     query_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
     query_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
+    query_parser.add_argument(
+        "--fts-rebuild-policy",
+        choices=list(_VALID_FTS_POLICIES),
+        default=fts_policy_default,
+        help=(
+            "FTS index rebuild policy after ingest writes: immediate, deferred, or batch "
+            "(default: %(default)s). Deferred rebuilds on the next query and may add a one-time "
+            "search latency spike while the index is refreshed."
+        ),
+    )
+    query_parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=fts_batch_size_default,
+        help=(
+            "Row threshold for --fts-rebuild-policy=batch (default: %(default)s). "
+            "Ignored for other policies."
+        ),
+    )
     query_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -329,6 +400,8 @@ def run() -> None:
 
     if getattr(args, "cite", None) and getattr(args, "no_cite", None):
         parser.error("Conflicting flags: use only one of --cite or --no-cite.")
+    if getattr(args, "fts_rebuild_batch_size", 0) < 0:
+        parser.error("--fts-rebuild-batch-size must be >= 0.")
 
     # ---- logging verbosity ----
     verbose = getattr(args, "verbose", False)
@@ -398,6 +471,8 @@ def run() -> None:
             StorageConfig(
                 lance_dir=Path(args.lance),
                 lance_table=args.collection,
+                fts_rebuild_policy=args.fts_rebuild_policy,
+                fts_rebuild_batch_size=args.fts_rebuild_batch_size,
             )
         )
 

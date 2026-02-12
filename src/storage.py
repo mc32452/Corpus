@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import lancedb
-import pyarrow as pa
 
 from .models import ChildChunk, ParentChunk
 
@@ -17,6 +16,8 @@ logger = logging.getLogger(__name__)
 class StorageConfig:
     lance_dir: Path
     lance_table: str = "child_chunks"
+    fts_rebuild_policy: str = "deferred"
+    fts_rebuild_batch_size: int = 0
 
 
 class StorageEngine:
@@ -24,9 +25,14 @@ class StorageEngine:
 
     _PARENTS_TABLE = "parent_chunks"
     _SUMMARIES_TABLE = "source_summaries"
+    _MAX_IN_CLAUSE_VALUES = 256
 
     def __init__(self, config: StorageConfig) -> None:
         self._config = config
+        if config.fts_rebuild_policy not in {"immediate", "deferred", "batch"}:
+            raise ValueError("fts_rebuild_policy must be one of: immediate, deferred, batch")
+        if config.fts_rebuild_batch_size < 0:
+            raise ValueError("fts_rebuild_batch_size must be >= 0")
         config.lance_dir.mkdir(parents=True, exist_ok=True)
 
         self._db = lancedb.connect(str(config.lance_dir))
@@ -42,6 +48,8 @@ class StorageEngine:
                 "LanceDB table '%s' not found; will create on first ingest",
                 self._table_name,
             )
+        self._fts_dirty = False
+        self._pending_fts_rows = 0
 
         # --- parent chunks (no vectors) ---
         self._parents: Optional[lancedb.table.Table] = None
@@ -59,6 +67,66 @@ class StorageEngine:
 
     def close(self) -> None:
         pass  # LanceDB connections do not require explicit close
+
+    @staticmethod
+    def _escape_sql_literal(value: str) -> str:
+        return value.replace("'", "''")
+
+    @classmethod
+    def _where_eq(cls, column: str, value: str) -> str:
+        return f"{column} = '{cls._escape_sql_literal(value)}'"
+
+    @classmethod
+    def _where_in(cls, column: str, values: list[str]) -> str:
+        if not values:
+            return "1 = 0"
+        escaped = ", ".join(f"'{cls._escape_sql_literal(v)}'" for v in values)
+        return f"{column} IN ({escaped})"
+
+    @staticmethod
+    def _chunk(values: list[str], size: int) -> Iterable[list[str]]:
+        for start in range(0, len(values), size):
+            yield values[start:start + size]
+
+    def _mark_fts_dirty(self, added_rows: int) -> None:
+        self._fts_dirty = True
+        self._pending_fts_rows += max(0, added_rows)
+
+    def _ensure_fts_index(self, *, force_rebuild: bool = False) -> None:
+        if self._table is None:
+            return
+        if force_rebuild or self._fts_dirty:
+            self._table.create_fts_index("text", replace=True)
+            self._fts_dirty = False
+            self._pending_fts_rows = 0
+
+    def _maybe_rebuild_fts_after_write(self) -> None:
+        policy = self._config.fts_rebuild_policy
+        if policy == "immediate":
+            self._ensure_fts_index(force_rebuild=True)
+            logger.info("Rebuilt FTS index immediately after write")
+            return
+
+        if policy == "batch":
+            batch_size = self._config.fts_rebuild_batch_size
+            if batch_size > 0 and self._pending_fts_rows >= batch_size:
+                self._ensure_fts_index(force_rebuild=True)
+                logger.info(
+                    "Rebuilt FTS index after batch threshold (%d rows)",
+                    batch_size,
+                )
+                return
+
+        logger.debug(
+            "Deferred FTS rebuild (policy=%s, pending_rows=%d)",
+            self._config.fts_rebuild_policy,
+            self._pending_fts_rows,
+        )
+
+    def _refresh_fts_if_dirty_for_query(self) -> None:
+        if self._fts_dirty:
+            self._ensure_fts_index(force_rebuild=True)
+            logger.info("Refreshed dirty FTS index before hybrid search")
 
     def add_parents(self, parents: Iterable[ParentChunk]) -> None:
         records = [
@@ -86,9 +154,8 @@ class StorageEngine:
         else:
             # Upsert: remove existing parent_ids then re-add
             ids = [r["parent_id"] for r in records]
-            id_list = ", ".join(f"'{pid}'" for pid in ids)
             try:
-                self._parents.delete(f"parent_id IN ({id_list})")
+                self._parents.delete(self._where_in("parent_id", ids))
             except Exception:
                 pass
             self._parents.add(records)
@@ -125,53 +192,148 @@ class StorageEngine:
         if self._table is None:
             self._table = self._db.create_table(self._table_name, records)
             # Create FTS index on the text column for hybrid search
-            self._table.create_fts_index("text", replace=True)
+            self._ensure_fts_index(force_rebuild=True)
             logger.info(
                 "Created LanceDB table '%s' with %d rows + FTS index",
                 self._table_name, len(records),
             )
         else:
             self._table.add(records)
-            # Rebuild FTS index to include new data
-            self._table.create_fts_index("text", replace=True)
-            logger.info("Added %d rows to LanceDB table '%s' + rebuilt FTS index", len(records), self._table_name)
+            self._mark_fts_dirty(len(records))
+            self._maybe_rebuild_fts_after_write()
+            logger.info(
+                "Added %d rows to LanceDB table '%s' (FTS pending=%s)",
+                len(records),
+                self._table_name,
+                self._fts_dirty,
+            )
 
     def get_parent_text(self, parent_id: str) -> Optional[str]:
         if self._parents is None:
             return None
-        for row in self._parents.to_arrow().to_pylist():
-            if row["parent_id"] == parent_id:
-                return row["text"]
-        return None
+        rows = (
+            self._parents
+            .search()
+            .where(self._where_eq("parent_id", parent_id), prefilter=True)
+            .select(["text"])
+            .limit(1)
+            .to_list()
+        )
+        if not rows:
+            return None
+        text = rows[0].get("text")
+        return text if isinstance(text, str) else None
+
+    def get_parent_texts(self, parent_ids: Iterable[str]) -> dict[str, str]:
+        if self._parents is None:
+            return {}
+        unique_ids = list(dict.fromkeys(pid for pid in parent_ids if isinstance(pid, str) and pid))
+        if not unique_ids:
+            return {}
+
+        result: dict[str, str] = {}
+        for id_batch in self._chunk(unique_ids, self._MAX_IN_CLAUSE_VALUES):
+            rows = (
+                self._parents
+                .search()
+                .where(self._where_in("parent_id", id_batch), prefilter=True)
+                .select(["parent_id", "text"])
+                .to_list()
+            )
+            for row in rows:
+                row_parent_id = row.get("parent_id")
+                row_text = row.get("text")
+                if isinstance(row_parent_id, str) and isinstance(row_text, str):
+                    result[row_parent_id] = row_text
+        return result
 
     def get_children_by_ids(self, ids: list[str]) -> dict[str, dict[str, object]]:
         """Fetch child chunks by their IDs from LanceDB."""
         if not ids or self._table is None:
             return {}
-        id_set = set(ids)
         _NON_VECTOR_COLS = [
             "id", "text", "source_id", "page_number",
             "page_label", "display_page", "header_path", "parent_id",
         ]
+
+        unique_ids = list(dict.fromkeys(child_id for child_id in ids if child_id))
+        result: dict[str, dict[str, object]] = {}
         try:
-            rows = self._table.to_arrow().select(_NON_VECTOR_COLS).to_pylist()
+            for id_batch in self._chunk(unique_ids, self._MAX_IN_CLAUSE_VALUES):
+                rows = (
+                    self._table
+                    .search()
+                    .where(self._where_in("id", id_batch), prefilter=True)
+                    .select(_NON_VECTOR_COLS)
+                    .to_list()
+                )
+                for row in rows:
+                    child_id = row.get("id")
+                    if not isinstance(child_id, str):
+                        continue
+                    meta = {
+                        "source_id": row.get("source_id", ""),
+                        "page_number": row.get("page_number"),
+                        "page_label": row.get("page_label"),
+                        "display_page": row.get("display_page"),
+                        "header_path": row.get("header_path", ""),
+                        "parent_id": row.get("parent_id", ""),
+                    }
+                    meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+                    result[child_id] = {"text": row.get("text", ""), "metadata": meta}
         except Exception:
             return {}
-        result: dict[str, dict[str, object]] = {}
-        for row in rows:
-            child_id = row.get("id")
-            if child_id in id_set:
-                meta = {
-                    "source_id": row.get("source_id", ""),
-                    "page_number": row.get("page_number"),
-                    "page_label": row.get("page_label"),
-                    "display_page": row.get("display_page"),
-                    "header_path": row.get("header_path", ""),
-                    "parent_id": row.get("parent_id", ""),
-                }
-                meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
-                result[child_id] = {"text": row.get("text", ""), "metadata": meta}
         return result
+
+    def _execute_hybrid_search(
+        self,
+        *,
+        query_text: str,
+        query_vector: list[float],
+        top_k: int,
+        source_id: Optional[str],
+    ) -> list[dict[str, Any]]:
+        if self._table is None:
+            return []
+
+        builder = (
+            self._table
+            .search(query_type="hybrid")
+            .vector(query_vector)
+            .text(query_text)
+            .limit(top_k)
+        )
+        if source_id:
+            builder = builder.where(self._where_eq("source_id", source_id), prefilter=True)
+        return builder.to_list()
+
+    def _run_hybrid_search_with_index_retry(
+        self,
+        *,
+        query_text: str,
+        query_vector: list[float],
+        top_k: int,
+        source_id: Optional[str],
+    ) -> list[dict[str, Any]]:
+        try:
+            return self._execute_hybrid_search(
+                query_text=query_text,
+                query_vector=query_vector,
+                top_k=top_k,
+                source_id=source_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hybrid search failed once; rebuilding FTS index before retry. Error: %s",
+                exc,
+            )
+            self._ensure_fts_index(force_rebuild=True)
+            return self._execute_hybrid_search(
+                query_text=query_text,
+                query_vector=query_vector,
+                top_k=top_k,
+                source_id=source_id,
+            )
 
     def hybrid_search(
         self,
@@ -185,17 +347,13 @@ class StorageEngine:
         if self._table is None:
             raise RuntimeError("LanceDB table is not initialized. Run ingest first.")
 
-        builder = (
-            self._table
-            .search(query_type="hybrid")
-            .vector(query_vector)
-            .text(query_text)
-            .limit(top_k)
+        self._refresh_fts_if_dirty_for_query()
+        rows = self._run_hybrid_search_with_index_retry(
+            query_text=query_text,
+            query_vector=query_vector,
+            top_k=top_k,
+            source_id=source_id,
         )
-        if source_id:
-            builder = builder.where(f"source_id = '{source_id}'", prefilter=True)
-
-        rows = builder.to_list()
 
         results: list[dict[str, Any]] = []
         for rank, row in enumerate(rows, start=1):
@@ -235,7 +393,7 @@ class StorageEngine:
             logger.info("Created LanceDB table '%s'", self._SUMMARIES_TABLE)
         else:
             try:
-                self._summaries.delete(f"source_id = '{sid}'")
+                self._summaries.delete(self._where_eq("source_id", sid))
             except Exception:
                 pass
             self._summaries.add([record])
@@ -253,9 +411,12 @@ class StorageEngine:
     def get_parent_texts_by_source(self, *, source_id: str) -> list[str]:
         if self._parents is None:
             return []
-        rows = [
-            r for r in self._parents.to_arrow().to_pylist()
-            if r.get("source_id") == source_id
-        ]
+        rows = (
+            self._parents
+            .search()
+            .where(self._where_eq("source_id", source_id), prefilter=True)
+            .select(["text", "page_number"])
+            .to_list()
+        )
         rows.sort(key=lambda r: r.get("page_number", 0))
         return [r["text"] for r in rows if r.get("text")]
