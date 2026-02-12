@@ -229,9 +229,8 @@ def run() -> None:
     ingest_parser.add_argument("--source-id", required=True, help="Source identifier")
     ingest_parser.add_argument("--page-number", type=int, default=None, help="Page number")
     ingest_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
-    ingest_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
-    ingest_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
-    ingest_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    ingest_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
+    ingest_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
     ingest_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -263,9 +262,8 @@ def run() -> None:
     query_parser = subparsers.add_parser("query", help="Query the RAG system")
     query_parser.add_argument("query", help="User query")
     query_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
-    query_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
-    query_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
-    query_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    query_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
+    query_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
     query_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -325,14 +323,14 @@ def run() -> None:
 
     args = parser.parse_args()
 
-    if args.cite and args.no_cite:
+    if getattr(args, "cite", None) and getattr(args, "no_cite", None):
         parser.error("Conflicting flags: use only one of --cite or --no-cite.")
 
     # ---- logging verbosity ----
     verbose = getattr(args, "verbose", False)
     if not verbose:
         # Suppress noisy third-party loggers in normal mode
-        for noisy in ("httpx", "huggingface_hub", "chromadb", "urllib3",
+        for noisy in ("httpx", "huggingface_hub", "lancedb", "urllib3",
                        "sentence_transformers", "filelock", "fsspec"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -355,12 +353,10 @@ def run() -> None:
     storage = StorageEngine(
         StorageConfig(
             sqlite_path=Path(args.sqlite),
-            chroma_dir=Path(args.chroma),
-            chroma_collection=args.collection,
+            lance_dir=Path(args.lance),
+            lance_table=args.collection,
         )
     )
-
-    bm25_path = Path(args.bm25)
 
     if args.command == "ingest":
         do_summarize = args.summarize
@@ -374,7 +370,6 @@ def run() -> None:
             page_number=args.page_number,
             storage=storage,
             embedding_model=embedding_model,
-            bm25_path=bm25_path,
             summarize=do_summarize,
             summary_generator=generator,
         )
@@ -393,12 +388,6 @@ def run() -> None:
                 print(f"- {source}")
         return
 
-    if not bm25_path.exists():
-        raise FileNotFoundError(
-            "BM25 index missing. Run 'ingest' to build indexes before querying."
-        )
-
-    storage.load_bm25(bm25_path)
     reranker = JinaRerankerMLX(model_id=config.reranker_model)
 
     retrieval = RetrievalEngine(

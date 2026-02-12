@@ -94,7 +94,7 @@ class RetrievalResult:
 
 
 class RetrievalEngine:
-    """Hybrid retrieval engine with dense, sparse, and reranking stages."""
+    """Hybrid retrieval engine using LanceDB native hybrid search + reranking."""
 
     def __init__(
         self,
@@ -109,13 +109,14 @@ class RetrievalEngine:
         self._reranker = reranker
         self._config = config
 
-    def _dense_search(
+    def _hybrid_search(
         self,
         query: str,
         top_k: int,
         *,
         source_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
+        """Single-call hybrid search via LanceDB (vector ANN + FTS BM25 + RRF)."""
         if not query.strip():
             raise ValueError("query must be a non-empty string.")
         try:
@@ -123,114 +124,16 @@ class RetrievalEngine:
                 [query],
                 normalize_embeddings=True,
             )
+            query_vector = embeddings[0].tolist() if hasattr(embeddings[0], "tolist") else list(embeddings[0])
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("Embedding model encode failed.") from exc
 
-        where = {"source_id": source_id} if source_id else None
-        response = self._storage.query_children(
-            embeddings=embeddings,
+        return self._storage.hybrid_search(
+            query_text=query,
+            query_vector=query_vector,
             top_k=top_k,
-            where=where,
+            source_id=source_id,
         )
-
-        results: list[dict[str, Any]] = []
-        ids = response.get("ids", [[]])[0]
-        docs = response.get("documents", [[]])[0]
-        metas = response.get("metadatas", [[]])[0]
-        distances = response.get("distances", [[]])[0]
-
-        for rank, (cid, doc, meta, dist) in enumerate(
-            zip(ids, docs, metas, distances),
-            start=1,
-        ):
-            results.append(
-                {
-                    "id": cid,
-                    "text": doc,
-                    "metadata": meta or {},
-                    "rank": rank,
-                    "distance": dist,
-                }
-            )
-
-        return results
-
-    def _sparse_search(
-        self,
-        query: str,
-        top_k: int,
-        *,
-        source_id: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
-        bm25 = self._storage.bm25
-        if bm25 is None:
-            raise RuntimeError("BM25 index is not initialized.")
-
-        tokenized = query.split()
-        if not tokenized:
-            raise ValueError("query must contain tokens for BM25 search.")
-
-        scores = bm25.get_scores(tokenized)
-        ranked = sorted(
-            enumerate(scores),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-
-        source_ids = self._storage.bm25_source_ids
-        source_filter = bool(source_id)
-        bm25_id_list = self._storage.bm25_ids  # cache once to avoid list copy per iteration
-        if source_filter and (not source_ids or len(source_ids) != len(bm25_id_list)):
-            raise RuntimeError(
-                "BM25 index source_ids are missing or misaligned; "
-                "rebuild the BM25 index to use source_id filtering."
-            )
-
-        results: list[dict[str, Any]] = []
-        rank = 1
-        for idx, score in ranked:
-            child_id = bm25_id_list[idx]
-            if source_filter:
-                if source_ids[idx] != source_id:
-                    continue
-            results.append(
-                {
-                    "id": child_id,
-                    "score": float(score),
-                    "rank": rank,
-                }
-            )
-            rank += 1
-            if len(results) >= top_k:
-                break
-        return results
-
-    @staticmethod
-    def _rrf_fuse(
-        dense: Iterable[dict[str, Any]],
-        sparse: Iterable[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        scores: dict[str, float] = {}
-        payloads: dict[str, dict[str, Any]] = {}
-
-        for item in dense:
-            rank = item["rank"]
-            score = 1.0 / (60 + rank)
-            scores[item["id"]] = scores.get(item["id"], 0.0) + score
-            payloads[item["id"]] = item
-
-        for item in sparse:
-            rank = item["rank"]
-            score = 1.0 / (60 + rank)
-            scores[item["id"]] = scores.get(item["id"], 0.0) + score
-            payloads.setdefault(item["id"], item)
-
-        fused = [
-            {**payloads.get(cid, {}), "id": cid, "score": score}
-            for cid, score in scores.items()
-        ]
-        fused.sort(key=lambda item: item["score"], reverse=True)
-        return fused
 
     @staticmethod
     def _deduplicate_by_parent(
@@ -260,9 +163,6 @@ class RetrievalEngine:
         deduplicated = deduplicated[:top_k]
 
         after_count = len(deduplicated)
-        parents_removed = before_count - after_count - len(no_parent_items) + len([
-            i for i in deduplicated if not (i.get("metadata") or {}).get("parent_id")
-        ])
 
         metrics = DeduplicationMetrics(
             children_before_dedup=before_count,
@@ -309,18 +209,21 @@ class RetrievalEngine:
         self,
         query: str,
         *,
-        top_k_dense: Optional[int] = None,
-        top_k_sparse: Optional[int] = None,
         top_k_fused: Optional[int] = None,
         top_k_rerank: Optional[int] = None,
         top_k_final: Optional[int] = None,
         source_id: Optional[str] = None,
         collect_metrics: bool = True,
     ) -> list[RetrievalResult]:
-        """Execute hybrid search with timing and metrics collection."""
+        """Execute hybrid search with timing and metrics collection.
+
+        The retrieval pipeline is now:
+        1. LanceDB hybrid search (vector ANN + FTS BM25 w/ RRF) → top_k_fused
+        2. Deduplicate by parent
+        3. Enrich with parent text for reranking
+        4. Rerank (Jina v3) → threshold filter → top_k_final
+        """
         cfg = self._config
-        k_dense = top_k_dense or (cfg.top_k_dense if cfg else 100)
-        k_sparse = top_k_sparse or (cfg.top_k_sparse if cfg else 100)
         k_fused = top_k_fused or (cfg.top_k_fused if cfg else 50)
         k_rerank = top_k_rerank or (cfg.top_k_rerank if cfg else 20)
         k_final = top_k_final or (cfg.top_k_final if cfg else 5)
@@ -328,43 +231,22 @@ class RetrievalEngine:
         timing = TimingMetrics()
         total_start = time.perf_counter()
 
+        # Stage 1: LanceDB native hybrid search (replaces dense + sparse + RRF)
         t0 = time.perf_counter()
-        dense = self._dense_search(query, k_dense, source_id=source_id)
+        fused = self._hybrid_search(query, k_fused, source_id=source_id)
         timing.dense_search_ms = (time.perf_counter() - t0) * 1000
+        # sparse_search_ms and rrf_fusion_ms are zero — LanceDB does it all in one call
+        timing.sparse_search_ms = 0.0
+        timing.rrf_fusion_ms = 0.0
+        logger.info("LanceDB hybrid search returned %d hits in %.1fms", len(fused), timing.dense_search_ms)
 
-        t0 = time.perf_counter()
-        sparse = self._sparse_search(query, k_sparse, source_id=source_id)
-        timing.sparse_search_ms = (time.perf_counter() - t0) * 1000
-        logger.info("Sparse search returned %s hits", len(sparse))
-
-        t0 = time.perf_counter()
-        fused = self._rrf_fuse(dense, sparse)
-        timing.rrf_fusion_ms = (time.perf_counter() - t0) * 1000
-
-        missing_ids = [item["id"] for item in fused if "text" not in item or "metadata" not in item]
-        if missing_ids:
-            fetched = self._storage.get_children_by_ids(missing_ids)
-            for item in fused:
-                if item["id"] in fetched:
-                    item.setdefault("text", fetched[item["id"]].get("text"))
-                    item.setdefault("metadata", fetched[item["id"]].get("metadata"))
-
-        for item in fused:
-            if "text" not in item or "metadata" not in item:
-                lookup = next(
-                    (d for d in dense if d["id"] == item["id"]),
-                    None,
-                )
-                if lookup:
-                    item.setdefault("text", lookup.get("text"))
-                    item.setdefault("metadata", lookup.get("metadata"))
-
-
+        # Stage 2: Deduplicate by parent
         t0 = time.perf_counter()
         deduped, dedup_metrics = self._deduplicate_by_parent(fused, k_fused)
         timing.dedup_ms = (time.perf_counter() - t0) * 1000
         logger.debug(f"Early dedup: {dedup_metrics.children_before_dedup} -> {dedup_metrics.children_after_dedup} ({dedup_metrics.reduction_pct:.1f}% reduction)")
 
+        # Stage 3: Enrich with parent text for reranking
         parent_cache: dict[str, str] = {}
         for item in deduped:
             metadata = item.get("metadata") or {}
@@ -377,11 +259,13 @@ class RetrievalEngine:
                 if parent_id in parent_cache:
                     item["rerank_text"] = parent_cache[parent_id]
 
+        # Stage 4: Rerank
         t0 = time.perf_counter()
         to_rerank = deduped[:k_rerank]
         reranked, raw_scores = self._rerank(query, to_rerank)
         timing.rerank_ms = (time.perf_counter() - t0) * 1000
 
+        # Stage 5: Threshold filtering
         threshold_metrics = ThresholdMetrics()
         if cfg and reranked:
             threshold = cfg.reranker_threshold
@@ -416,6 +300,7 @@ class RetrievalEngine:
 
         reranker_metrics = compute_reranker_stats(raw_scores)
 
+        # Stage 6: Final dedup + boilerplate filter
         final: list[dict[str, Any]] = []
         seen_parents: set[str] = set()
         seen_children: set[str] = set()

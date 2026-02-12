@@ -29,13 +29,22 @@ DEFAULT_STOP_TOKENS = [
 
 
 class MlxGenerator:
-    """MLX-LM based text generator with configurable sampling."""
+    """MLX-LM based text generator with KVCache for context warming."""
 
     def __init__(self, model_path: str) -> None:
         self._model_id = model_path
+        self._prompt_cache = None
         try:
             from mlx_lm import load
             self._model, self._tokenizer = load(model_path)
+            # Create a reusable prompt cache for KV context warming
+            try:
+                from mlx_lm.utils import make_prompt_cache
+                self._prompt_cache = make_prompt_cache(self._model)
+                logger.info("KVCache initialized for model %s", model_path)
+            except (ImportError, AttributeError, Exception) as cache_exc:
+                logger.debug("KVCache not available (mlx-lm version may not support it): %s", cache_exc)
+                self._prompt_cache = None
         except Exception as exc:
             raise RuntimeError(f"Failed to load mlx-lm model at {model_path}") from exc
 
@@ -153,14 +162,26 @@ class MlxGenerator:
                 )
             
             start_time = time.perf_counter()
-            output = generate(
-                self._model,
-                self._tokenizer,
-                prompt,
+
+            # Use KVCache if available for context warming
+            generate_kwargs = dict(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                prompt=prompt,
                 max_tokens=final_max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors or None,
             )
+            if self._prompt_cache is not None:
+                try:
+                    from mlx_lm.utils import make_prompt_cache
+                    # Fresh cache per generation to avoid stale KV state
+                    cache = make_prompt_cache(self._model)
+                    generate_kwargs["prompt_cache"] = cache
+                except (ImportError, AttributeError, TypeError):
+                    pass  # Graceful fallback if API doesn't support prompt_cache kwarg
+
+            output = generate(**generate_kwargs)
             elapsed_s = time.perf_counter() - start_time
             
             # Apply stop token truncation (mlx-lm may not support all stop tokens natively)

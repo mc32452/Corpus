@@ -381,7 +381,6 @@ def ingest_file_to_storage(
     page_number: Optional[int],
     storage: StorageEngine,
     embedding_model: object,
-    bm25_path: Optional[Path] = None,
     summarize: bool = False,
     summary_generator: Optional[MlxGenerator] = None,
 ) -> tuple[int, int]:
@@ -406,9 +405,6 @@ def ingest_file_to_storage(
 
     storage.add_parents(parents)
     storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
-
-    if bm25_path is not None:
-        storage.persist_bm25(bm25_path)
 
     if summarize:
         generator = summary_generator

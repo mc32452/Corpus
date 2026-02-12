@@ -1,30 +1,33 @@
 from __future__ import annotations
 
-import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
-import chromadb
-from chromadb.config import Settings
-from rank_bm25 import BM25Okapi
+import lancedb
+import pyarrow as pa
 
 from .models import ChildChunk, ParentChunk
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class StorageConfig:
     sqlite_path: Path
-    chroma_dir: Path
-    chroma_collection: str = "child_chunks"
+    lance_dir: Path
+    lance_table: str = "child_chunks"
 
 
 class StorageEngine:
+    """Storage engine backed by LanceDB (vectors + FTS) and SQLite (parents + summaries)."""
+
     def __init__(self, config: StorageConfig) -> None:
         self._config = config
         config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        config.chroma_dir.mkdir(parents=True, exist_ok=True)
+        config.lance_dir.mkdir(parents=True, exist_ok=True)
 
         self._conn = sqlite3.connect(str(config.sqlite_path))
         self._conn.execute(
@@ -50,17 +53,15 @@ class StorageEngine:
         )
         self._conn.commit()
 
-        settings = Settings(anonymized_telemetry=False, is_persistent=True)
-        self._chroma = chromadb.PersistentClient(path=str(config.chroma_dir), settings=settings)
-        self._collection = self._chroma.get_or_create_collection(
-            config.chroma_collection,
-            metadata={"hnsw:space": "cosine"},
-        )
-
-        self._bm25: Optional[BM25Okapi] = None
-        self._bm25_corpus: list[list[str]] = []
-        self._bm25_ids: list[str] = []
-        self._bm25_source_ids: list[str] = []
+        # LanceDB for child chunk vectors + full-text search
+        self._db = lancedb.connect(str(config.lance_dir))
+        self._table_name = config.lance_table
+        self._table: Optional[lancedb.table.Table] = None
+        try:
+            self._table = self._db.open_table(self._table_name)
+            logger.info("Opened existing LanceDB table '%s'", self._table_name)
+        except Exception:
+            logger.info("LanceDB table '%s' does not exist yet; will be created on first ingest", self._table_name)
 
     def close(self) -> None:
         self._conn.close()
@@ -100,40 +101,38 @@ class StorageEngine:
         if not child_list:
             return
 
-        ids = [child.id for child in child_list]
-        documents = [child.text for child in child_list]
-        metadatas = []
-        for child in child_list:
-            meta = {
-                "source_id": child.metadata.source_id,
-                "page_number": child.metadata.page_number,
-                "page_label": child.metadata.page_label,
-                "display_page": child.metadata.display_page,
-                "header_path": child.metadata.header_path,
-                "parent_id": child.metadata.parent_id,
-            }
-            # Chroma doesn't accept None values, so filter them out
-            meta = {k: v for k, v in meta.items() if v is not None}
-            metadatas.append(meta)
-
         if embeddings is not None and len(embeddings) != len(child_list):
             raise ValueError("Embeddings length must match children length.")
 
-        self._collection.add(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
+        records: list[dict[str, Any]] = []
+        for i, child in enumerate(child_list):
+            record: dict[str, Any] = {
+                "id": child.id,
+                "text": child.text,
+                "source_id": child.metadata.source_id,
+                "page_number": child.metadata.page_number or 0,
+                "page_label": child.metadata.page_label or "",
+                "display_page": child.metadata.display_page or "",
+                "header_path": child.metadata.header_path,
+                "parent_id": child.metadata.parent_id or "",
+            }
+            if embeddings is not None:
+                record["vector"] = embeddings[i]
+            records.append(record)
 
-        tokenized = [doc.split() for doc in documents]
-        self._bm25_corpus.extend(tokenized)
-        self._bm25_ids.extend(ids)
-        self._bm25_source_ids.extend(
-            [child.metadata.source_id for child in child_list]
-        )
-        # Mark BM25 dirty; rebuilt lazily on next property access
-        self._bm25 = None
+        if self._table is None:
+            self._table = self._db.create_table(self._table_name, records)
+            # Create FTS index on the text column for hybrid search
+            self._table.create_fts_index("text", replace=True)
+            logger.info(
+                "Created LanceDB table '%s' with %d rows + FTS index",
+                self._table_name, len(records),
+            )
+        else:
+            self._table.add(records)
+            # Rebuild FTS index to include new data
+            self._table.create_fts_index("text", replace=True)
+            logger.info("Added %d rows to LanceDB table '%s' + rebuilt FTS index", len(records), self._table_name)
 
     def get_parent_text(self, parent_id: str) -> Optional[str]:
         cursor = self._conn.execute(
@@ -144,65 +143,75 @@ class StorageEngine:
         return row[0] if row else None
 
     def get_children_by_ids(self, ids: list[str]) -> dict[str, dict[str, object]]:
-        if not ids:
+        """Fetch child chunks by their IDs from LanceDB."""
+        if not ids or self._table is None:
             return {}
-        response = self._collection.get(
-            ids=ids,
-            include=["documents", "metadatas"],
-        )
-        response_ids = response.get("ids", [])
-        documents = response.get("documents", [])
-        metadatas = response.get("metadatas", [])
-        return {
-            child_id: {
-                "text": doc,
-                "metadata": meta or {},
-            }
-            for child_id, doc, meta in zip(response_ids, documents, metadatas)
-        }
+        # Use SQL filter to fetch by ID list
+        id_list = ", ".join(f"'{cid}'" for cid in ids)
+        try:
+            rows = self._table.search().where(f"id IN ({id_list})").limit(len(ids)).to_list()
+        except Exception:
+            return {}
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            child_id = row.get("id")
+            if child_id:
+                meta = {
+                    "source_id": row.get("source_id", ""),
+                    "page_number": row.get("page_number"),
+                    "page_label": row.get("page_label"),
+                    "display_page": row.get("display_page"),
+                    "header_path": row.get("header_path", ""),
+                    "parent_id": row.get("parent_id", ""),
+                }
+                # Clean up empty/zero values to match Chroma-era behavior
+                meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+                result[child_id] = {"text": row.get("text", ""), "metadata": meta}
+        return result
 
-    def query_children(
+    def hybrid_search(
         self,
         *,
-        embeddings: list[list[float]],
+        query_text: str,
+        query_vector: list[float],
         top_k: int,
-        where: Optional[dict[str, object]] = None,
-    ) -> dict[str, list]:
-        return self._collection.query(
-            query_embeddings=embeddings,
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-            where=where,
+        source_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """LanceDB native hybrid search (vector ANN + full-text BM25 with RRF fusion)."""
+        if self._table is None:
+            raise RuntimeError("LanceDB table is not initialized. Run ingest first.")
+
+        builder = (
+            self._table
+            .search(query_type="hybrid")
+            .vector(query_vector)
+            .text(query_text)
+            .limit(top_k)
         )
+        if source_id:
+            builder = builder.where(f"source_id = '{source_id}'", prefilter=True)
 
-    def persist_bm25(self, path: Path) -> None:
-        payload = {
-            "ids": self._bm25_ids,
-            "corpus": self._bm25_corpus,
-            "source_ids": self._bm25_source_ids,
-        }
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        rows = builder.to_list()
 
-    def load_bm25(self, path: Path) -> None:
-        if not path.exists():
-            raise FileNotFoundError(f"BM25 index file not found: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        ids = list(payload.get("ids", []))
-        corpus = list(payload.get("corpus", []))
-        source_ids = list(payload.get("source_ids", []))
-        if not (len(ids) == len(corpus) == len(source_ids)):
-            raise ValueError(
-                "Inconsistent BM25 index data in "
-                f"{path}: 'ids', 'corpus', and 'source_ids' must have the same "
-                "length. Delete this file and rebuild the BM25 index."
-            )
-        self._bm25_ids = ids
-        self._bm25_corpus = corpus
-        self._bm25_source_ids = source_ids
-        if self._bm25_corpus:
-            self._bm25 = BM25Okapi(self._bm25_corpus)
-        else:
-            self._bm25 = None
+        results: list[dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            meta = {
+                "source_id": row.get("source_id", ""),
+                "page_number": row.get("page_number"),
+                "page_label": row.get("page_label"),
+                "display_page": row.get("display_page"),
+                "header_path": row.get("header_path", ""),
+                "parent_id": row.get("parent_id", ""),
+            }
+            meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+            results.append({
+                "id": row.get("id", ""),
+                "text": row.get("text", ""),
+                "metadata": meta,
+                "score": float(row.get("_relevance_score", 0.0)),
+                "rank": rank,
+            })
+        return results
 
     def list_source_ids(self) -> list[str]:
         cursor = self._conn.execute(
@@ -243,17 +252,3 @@ class StorageEngine:
         )
         rows = cursor.fetchall()
         return [row[0] for row in rows if row and row[0]]
-
-    @property
-    def bm25(self) -> Optional[BM25Okapi]:
-        if self._bm25 is None and self._bm25_corpus:
-            self._bm25 = BM25Okapi(self._bm25_corpus)
-        return self._bm25
-
-    @property
-    def bm25_ids(self) -> list[str]:
-        return list(self._bm25_ids)
-
-    @property
-    def bm25_source_ids(self) -> list[str]:
-        return list(self._bm25_source_ids)
