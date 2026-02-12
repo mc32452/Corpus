@@ -570,8 +570,17 @@ def run() -> None:
                 confidence_threshold=args.intent_confidence_threshold,
                 llm_model_id=llm_model_id,
                 llm_fallback_threshold=llm_fallback_threshold,
+                eager_load_llm=False,  # Lazy-load only if heuristic is uncertain
             )
             intent_result = classifier.classify(args.query)
+            # Immediately release intent classifier to free ~4-5GB before LLM generation
+            del classifier
+            gc.collect()
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
         logger.info(f"Classified intent: {intent_result.intent.value} (confidence={intent_result.confidence:.2f}, method={intent_result.method})")
 
     search_query = args.query
@@ -613,6 +622,11 @@ def run() -> None:
             print("No documents found in the database.")
             del reranker, embedding_model, retrieval
             gc.collect()
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
             return
 
         summaries = storage.get_source_summaries()
@@ -624,6 +638,11 @@ def run() -> None:
                     print(f"- {source}")
                 del reranker, embedding_model, retrieval
                 gc.collect()
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    pass
                 return
 
             if generator is None:
@@ -730,6 +749,12 @@ def run() -> None:
     with profiler.span("Memory cleanup (gc)"):
         del reranker, embedding_model, retrieval
         gc.collect()
+        # Force MLX to release cached Metal buffers back to the system
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            pass
     logger.debug("Released reranker and embedding model to free memory for LLM generation")
 
     budget_metrics: Optional[BudgetMetrics] = None
@@ -858,6 +883,13 @@ def run() -> None:
         )
 
     if generator is None:
+        # Set conservative cache limit before loading the large LLM to ensure
+        # headroom for KV cache growth during generation (~2-3GB for 16K context)
+        try:
+            import mlx.core as mx
+            mx.set_cache_limit(0)  # Disable caching to maximize available memory
+        except Exception:
+            pass
         with profiler.span("Load LLM model"):
             generator = MlxGenerator(model_id)
 
