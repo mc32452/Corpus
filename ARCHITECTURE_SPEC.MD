@@ -252,7 +252,27 @@ python -m src.cli query "Search for key terms" --no-generate
 
 ---
 
-## 10. Dependencies
+## 10. Intent Classification
+
+The system implements **intent-based generation** with a two-stage classification pipeline to apply task-specific prompt engineering for improved response quality.
+
+### Heuristic Classification
+
+Primary classification uses regex-based pattern matching to identify query intents:
+
+- **Explain**: Explanatory queries (e.g., "What is...", "Explain...", "How does...")
+- **Compare**: Comparative analysis (e.g., "Compare A and B", "Differences between...")
+- **Summarize**: Summarization requests (e.g., "Summarize the main points")
+- **List**: Enumeration queries (e.g., "List the documents", "What are the key concepts")
+- **Overview**: General queries that may require fallback classification
+
+Each pattern returns a confidence score (0.0-1.0) based on match strength.
+
+### LLM Fallback
+
+For queries with heuristic confidence below the threshold (default 0.7), the system automatically falls back to an LLM classifier using `mlx-community/LFM2-8B-A1B-4bit` for more accurate intent determination. The LLM uses a structured prompt to output JSON-formatted classifications.
+
+## 11. Dependencies
 
 ### Required
 - `lancedb` - Unified vector and metadata store with native hybrid search
