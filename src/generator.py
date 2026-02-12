@@ -29,13 +29,25 @@ DEFAULT_STOP_TOKENS = [
 
 
 class MlxGenerator:
-    """MLX-LM based text generator with configurable sampling."""
+    """MLX-LM based text generator with KVCache for context warming."""
 
     def __init__(self, model_path: str) -> None:
         self._model_id = model_path
+        self._make_prompt_cache = None
         try:
             from mlx_lm import load
             self._model, self._tokenizer = load(model_path)
+            # Attempt to verify KVCache support for this model
+            try:
+                from mlx_lm.utils import make_prompt_cache
+                self._make_prompt_cache = make_prompt_cache
+                # Verify cache creation works before committing to the path
+                _test_cache = make_prompt_cache(self._model)
+                del _test_cache
+                logger.info("KVCache support verified for model %s", model_path)
+            except (ImportError, AttributeError, Exception) as cache_exc:
+                logger.debug("KVCache not available (mlx-lm version may not support it): %s", cache_exc)
+                self._make_prompt_cache = None
         except Exception as exc:
             raise RuntimeError(f"Failed to load mlx-lm model at {model_path}") from exc
 
@@ -108,7 +120,7 @@ class MlxGenerator:
                 temperature = temperature or 0.05
                 top_p = top_p or 0.7
             elif model_size >= 70:
-                repetition_penalty = repetition_penalty or 1.05
+                repetition_penalty = repetition_penalty or 1.15
                 temperature = temperature or 0.2
                 top_p = top_p or 0.9
             else:
@@ -153,14 +165,26 @@ class MlxGenerator:
                 )
             
             start_time = time.perf_counter()
-            output = generate(
-                self._model,
-                self._tokenizer,
-                prompt,
+
+            # Use KVCache if available for context warming
+            generate_kwargs = dict(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                prompt=prompt,
                 max_tokens=final_max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors or None,
             )
+            if self._make_prompt_cache is not None:
+                try:
+                    # Fresh cache per call — KV state is prompt-specific so
+                    # reusing a stale cache would corrupt generation.
+                    cache = self._make_prompt_cache(self._model)
+                    generate_kwargs["prompt_cache"] = cache
+                except (ImportError, AttributeError, TypeError):
+                    pass  # Graceful fallback if API doesn't support prompt_cache kwarg
+
+            output = generate(**generate_kwargs)
             elapsed_s = time.perf_counter() - start_time
             
             # Apply stop token truncation (mlx-lm may not support all stop tokens natively)
@@ -195,6 +219,66 @@ class MlxGenerator:
         prompt = self._apply_chat_template(messages)
         output = self.generate(prompt, config=config)
         return self._strip_thinking_blocks(output)
+
+    def score_intent_labels(
+        self,
+        prompt: str,
+        labels: list[str],
+    ) -> dict[str, dict[str, float]]:
+        """Score candidate continuation labels from raw next-token logits.
+
+        Returns per-label metrics (pre-normalization and log-probability based)
+        to support calibrated intent classification.
+        """
+        if not prompt.strip() or not labels:
+            return {}
+
+        try:
+            import mlx.core as mx
+        except Exception:
+            return {}
+
+        base_ids = self._tokenizer.encode(prompt, add_special_tokens=False)
+        if not base_ids:
+            return {}
+
+        scores: dict[str, dict[str, float]] = {}
+        for label in labels:
+            label_text = label.strip()
+            if not label_text:
+                continue
+
+            label_ids = self._tokenizer.encode(label_text, add_special_tokens=False)
+            if not label_ids:
+                label_ids = self._tokenizer.encode(f" {label_text}", add_special_tokens=False)
+            if not label_ids:
+                continue
+
+            full_ids = base_ids + label_ids
+            logits = self._model(mx.array(full_ids)[None, :])[0]
+
+            raw_logit_sum = 0.0
+            logprob_sum = 0.0
+            for offset, token_id in enumerate(label_ids):
+                pos = len(base_ids) + offset - 1
+                step_logits = logits[pos]
+
+                token_logit = float(step_logits[int(token_id)].item())
+                lse = float(mx.logsumexp(step_logits).item())
+
+                raw_logit_sum += token_logit
+                logprob_sum += token_logit - lse
+
+            token_count = max(len(label_ids), 1)
+            scores[label_text] = {
+                "raw_logit_sum": raw_logit_sum,
+                "avg_logit": raw_logit_sum / token_count,
+                "logprob_sum": logprob_sum,
+                "avg_logprob": logprob_sum / token_count,
+                "token_count": float(token_count),
+            }
+
+        return scores
 
     def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
         if hasattr(self._tokenizer, "apply_chat_template"):

@@ -11,6 +11,7 @@ from src.intent import (
     IntentResult,
     _classify_heuristic,
     _parse_llm_response,
+    is_low_information_query,
 )
 from src.retrieval import (
     build_source_legend,
@@ -189,15 +190,23 @@ class TestIntentClassification:
             ("What does the author say about behaviorism?", Intent.FACTUAL),
             ("What specific method did they use?", Intent.FACTUAL),
             ("Name the key theorists", Intent.FACTUAL),
+            ("Extract all publication years and cited authors", Intent.FACTUAL),
+            ("Format the results as a table", Intent.FACTUAL),
             # COLLECTION intent tests
             ("What documents do we have?", Intent.COLLECTION),
             ("What are we looking at?", Intent.COLLECTION),
             ("List all the documents", Intent.COLLECTION),
             ("What are the docs in here?", Intent.COLLECTION),
+            ("What docs are in here?", Intent.COLLECTION),
             ("Summarize all documents", Intent.COLLECTION),
             ("Show me all the sources", Intent.COLLECTION),
             ("What topics do the documents cover?", Intent.COLLECTION),
             ("Give me an overview of everything", Intent.COLLECTION),
+            # Structural comparative / analysis
+            ("Differences between Skinner and Chomsky", Intent.COMPARE),
+            ("Critique of Skinner in light of modern LLMs", Intent.COMPARE),
+            ("Trace the chain Skinner -> Chomsky -> modern LLM criticism", Intent.ANALYZE),
+            ("What is chomskys critique of skinner", Intent.ANALYZE),
         ],
     )
     def test_heuristic_classification(self, query: str, expected: Intent):
@@ -208,10 +217,43 @@ class TestIntentClassification:
         )
 
     def test_empty_query_fallback(self):
-        classifier = IntentClassifier(generator=None, use_llm=False)
+        classifier = IntentClassifier()
         result = classifier.classify("")
         assert result.intent == Intent.OVERVIEW
         assert result.confidence == 1.0
+
+    def test_llm_fallback_used_when_low_confidence(self):
+        """When heuristic confidence is low and LLM model is configured,
+        the LLM fallback should be attempted."""
+        classifier = IntentClassifier(
+            llm_model_id="fake-model",
+            llm_fallback_threshold=0.90,  # Force fallback on everything
+            confidence_threshold=0.6,
+            eager_load_llm=False,
+        )
+        # Monkey-patch _classify_with_llm to return a known result
+        classifier._classify_with_llm = lambda q: IntentResult(
+            intent=Intent.COMPARE, confidence=0.85, method="llm-fallback",
+        )
+        result = classifier.classify("Compare Skinner and Chomsky")
+        assert result.intent == Intent.COMPARE
+        assert result.method == "llm-fallback"
+
+    def test_llm_fallback_skipped_when_confident(self):
+        """When heuristic confidence is high, LLM fallback should be skipped."""
+        classifier = IntentClassifier(
+            llm_model_id="fake-model",
+            llm_fallback_threshold=0.70,
+            confidence_threshold=0.6,
+            eager_load_llm=False,
+        )
+        # If the LLM were called, it would crash — but it shouldn't be called
+        classifier._classify_with_llm = lambda q: (_ for _ in ()).throw(
+            RuntimeError("LLM should not be called")
+        )
+        result = classifier.classify("Compare Skinner and Chomsky")
+        assert result.intent == Intent.COMPARE
+        assert result.method == "heuristic"
 
     def test_ambiguous_query_fallback(self):
         """Ambiguous queries with low confidence should fallback to OVERVIEW."""
@@ -522,6 +564,7 @@ class TestCollectionIntent:
             "What documents do we have?",
             "What are we looking at?",
             "What are the docs in here?",
+            "What docs are in here?",
             "List all the documents",
             "Show me all the sources",
             "Summarize all documents",
@@ -663,3 +706,20 @@ class TestIntentBoundaries:
     def test_what_model_is_factual(self):
         result = _classify_heuristic("What LLM is being used?")
         assert result.intent == Intent.FACTUAL
+
+
+class TestLowInformationQueryDetection:
+    @pytest.mark.parametrize(
+        "query,expected",
+        [
+            ("wa wa wa", True),
+            ("googly moogly", True),
+            ("", True),
+            ("What is this paper about?", False),
+            ("Summarize the key points", False),
+            ("What docs are in here", False),
+            ("ELI5", False),
+        ],
+    )
+    def test_low_information_detector(self, query: str, expected: bool):
+        assert is_low_information_query(query) is expected

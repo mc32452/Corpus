@@ -17,13 +17,45 @@ from .config import CITATIONS_ENABLED_DEFAULT, ModelConfig, select_mode_config
 from .generation import build_messages
 from .generator import GenerationConfig, MlxGenerator, count_tokens, enforce_token_budget
 from .ingest import ingest_file_to_storage
-from .intent import Intent, IntentClassifier, IntentResult
+from .intent import Intent, IntentClassifier, IntentResult, is_low_information_query
+from .latency import LatencyProfiler
 from .metrics import BudgetMetrics, RetrievalMetrics, ThresholdMetrics, format_metrics_summary, log_metrics
 from .retrieval import RetrievalEngine, build_source_legend, format_context_with_citations
 from .storage import StorageConfig, StorageEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+_VALID_FTS_POLICIES = ("immediate", "deferred", "batch")
+
+
+def _get_fts_policy_default() -> str:
+    raw = os.getenv("RAG_FTS_REBUILD_POLICY", "deferred").strip().lower()
+    if raw in _VALID_FTS_POLICIES:
+        return raw
+    if raw:
+        logger.warning(
+            "Invalid RAG_FTS_REBUILD_POLICY='%s'; falling back to 'deferred'",
+            raw,
+        )
+    return "deferred"
+
+
+def _get_fts_batch_size_default() -> int:
+    raw = os.getenv("RAG_FTS_REBUILD_BATCH_SIZE", "0").strip()
+    if not raw:
+        return 0
+    try:
+        parsed = int(raw)
+        if parsed < 0:
+            raise ValueError
+        return parsed
+    except ValueError:
+        logger.warning(
+            "Invalid RAG_FTS_REBUILD_BATCH_SIZE='%s'; falling back to 0",
+            raw,
+        )
+        return 0
 
 
 def _dedupe_context(texts: Iterable[str]) -> str:
@@ -217,6 +249,8 @@ def run() -> None:
     logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
     parser = argparse.ArgumentParser(description="Offline RAG CLI")
+    fts_policy_default = _get_fts_policy_default()
+    fts_batch_size_default = _get_fts_batch_size_default()
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
@@ -228,10 +262,27 @@ def run() -> None:
     ingest_parser.add_argument("file", help="Markdown file path")
     ingest_parser.add_argument("--source-id", required=True, help="Source identifier")
     ingest_parser.add_argument("--page-number", type=int, default=None, help="Page number")
-    ingest_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
-    ingest_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
-    ingest_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
-    ingest_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    ingest_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
+    ingest_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
+    ingest_parser.add_argument(
+        "--fts-rebuild-policy",
+        choices=list(_VALID_FTS_POLICIES),
+        default=fts_policy_default,
+        help=(
+            "FTS index rebuild policy after ingest writes: immediate, deferred, or batch "
+            "(default: %(default)s). Deferred rebuilds on the next query and may add a one-time "
+            "search latency spike while the index is refreshed."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=fts_batch_size_default,
+        help=(
+            "Row threshold for --fts-rebuild-policy=batch (default: %(default)s). "
+            "Ignored for other policies."
+        ),
+    )
     ingest_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -262,10 +313,27 @@ def run() -> None:
 
     query_parser = subparsers.add_parser("query", help="Query the RAG system")
     query_parser.add_argument("query", help="User query")
-    query_parser.add_argument("--sqlite", default="data/context.sqlite", help="SQLite DB path")
-    query_parser.add_argument("--chroma", default="data/chroma", help="Chroma persistence dir")
-    query_parser.add_argument("--bm25", default="data/bm25.json", help="BM25 JSON path")
-    query_parser.add_argument("--collection", default="child_chunks", help="Chroma collection name")
+    query_parser.add_argument("--lance", default="data/lance", help="LanceDB directory")
+    query_parser.add_argument("--collection", default="child_chunks", help="LanceDB table name")
+    query_parser.add_argument(
+        "--fts-rebuild-policy",
+        choices=list(_VALID_FTS_POLICIES),
+        default=fts_policy_default,
+        help=(
+            "FTS index rebuild policy after ingest writes: immediate, deferred, or batch "
+            "(default: %(default)s). Deferred rebuilds on the next query and may add a one-time "
+            "search latency spike while the index is refreshed."
+        ),
+    )
+    query_parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=fts_batch_size_default,
+        help=(
+            "Row threshold for --fts-rebuild-policy=batch (default: %(default)s). "
+            "Ignored for other policies."
+        ),
+    )
     query_parser.add_argument(
         "--mode",
         choices=["regular", "power-deep-research"],
@@ -305,8 +373,21 @@ def run() -> None:
         help="Minimum confidence for intent classification (default: 0.6)",
     )
     query_parser.add_argument(
-        "--no-llm-intent", action="store_true",
-        help="Use heuristic-only intent classification (faster, no extra LLM call)",
+        "--llm-fallback", action="store_true",
+        help="Deprecated compatibility flag. LLM intent fallback is now enabled by default.",
+    )
+    query_parser.add_argument(
+        "--no-llm-fallback", action="store_true",
+        help="Disable LLM intent fallback and use heuristic-only intent classification.",
+    )
+    query_parser.add_argument(
+        "--llm-fallback-threshold", type=float, default=0.70,
+        help="Heuristic confidence below this triggers LLM fallback (default: 0.70).",
+    )
+    query_parser.add_argument(
+        "--intent-model",
+        default="mlx-community/LFM2-8B-A1B-4bit",
+        help="Model ID for LLM intent fallback (default: mlx-community/LFM2-8B-A1B-4bit).",
     )
     query_parser.add_argument(
         "--enable-query-expansion", action="store_true",
@@ -322,22 +403,46 @@ def run() -> None:
         default=None,
         help="Disable inline citations (overrides CITATIONS_ENABLED default).",
     )
+    query_parser.add_argument(
+        "--latency",
+        action="store_true",
+        help="Enable detailed latency profiling for every pipeline stage.",
+    )
 
     args = parser.parse_args()
 
-    if args.cite and args.no_cite:
+    if getattr(args, "cite", None) and getattr(args, "no_cite", None):
         parser.error("Conflicting flags: use only one of --cite or --no-cite.")
+    if getattr(args, "fts_rebuild_batch_size", 0) < 0:
+        parser.error("--fts-rebuild-batch-size must be >= 0.")
 
     # ---- logging verbosity ----
     verbose = getattr(args, "verbose", False)
     if not verbose:
         # Suppress noisy third-party loggers in normal mode
-        for noisy in ("httpx", "huggingface_hub", "chromadb", "urllib3",
+        for noisy in ("httpx", "huggingface_hub", "lancedb", "urllib3",
                        "sentence_transformers", "filelock", "fsspec"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    config = select_mode_config(manual_mode=getattr(args, 'mode', None))
-    _enable_offline_if_cached(config)
+    # ---- latency profiler ----
+    latency_enabled = getattr(args, "latency", False) and args.command == "query"
+    profiler = LatencyProfiler(enabled=latency_enabled)
+    profiler.start_wall()
+
+    def _print_latency_report(metrics: Optional[RetrievalMetrics]) -> None:
+        profiler.end_wall()
+        if profiler.enabled:
+            if metrics:
+                t = metrics.timing
+                profiler.record("    └ Hybrid search (LanceDB)", t.hybrid_search_ms)
+                profiler.record("    └ Deduplication", t.dedup_ms)
+                profiler.record("    └ Reranking", t.rerank_ms)
+            print(profiler.format_report())
+
+    with profiler.span("Config / mode selection"):
+        config = select_mode_config(manual_mode=getattr(args, 'mode', None))
+        _enable_offline_if_cached(config)
+
     mode_source = "CLI" if getattr(args, 'mode', None) else "env" if os.getenv("RAG_MODE") else "auto"
     print(f"\n[Hardware: {config.system_ram_gb:.0f}GB | Mode: {config.mode} ({mode_source})]")
     print(f"[LLM: {config.llm_model} | Quant: {config.quantization}]")
@@ -350,17 +455,49 @@ def run() -> None:
 
     from .reranker import JinaRerankerMLX
 
-    embedding_model = SentenceTransformer(config.embedding_model, device=config.embedding_device)
+    # ---- parallel model loading (embedding + reranker overlap) ----
+    import concurrent.futures
+    import time as _time
 
-    storage = StorageEngine(
-        StorageConfig(
-            sqlite_path=Path(args.sqlite),
-            chroma_dir=Path(args.chroma),
-            chroma_collection=args.collection,
+    _embed_result: list = [None]
+    _reranker_result: list = [None]
+    _embed_time_ms: list = [0.0]
+    _reranker_time_ms: list = [0.0]
+
+    def _load_embedding():
+        t0 = _time.perf_counter()
+        _embed_result[0] = SentenceTransformer(config.embedding_model, device=config.embedding_device)
+        _embed_time_ms[0] = (_time.perf_counter() - t0) * 1000
+
+    def _load_reranker():
+        t0 = _time.perf_counter()
+        _reranker_result[0] = JinaRerankerMLX(model_id=config.reranker_model)
+        _reranker_time_ms[0] = (_time.perf_counter() - t0) * 1000
+
+    # Only parallelize for query (not ingest); ingest doesn't need reranker.
+    if args.command == "query" and not getattr(args, "list_sources", False):
+        with profiler.span("Load models (parallel: embedding + reranker)"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                pool.submit(_load_embedding)
+                pool.submit(_load_reranker)
+                pool.shutdown(wait=True)
+        embedding_model = _embed_result[0]
+        if profiler.enabled:
+            profiler.record("  \u2514 Embedding model", _embed_time_ms[0], config.embedding_model.split("/")[-1])
+            profiler.record("  \u2514 Reranker model", _reranker_time_ms[0], config.reranker_model.split("/")[-1])
+    else:
+        with profiler.span("Load embedding model"):
+            embedding_model = SentenceTransformer(config.embedding_model, device=config.embedding_device)
+
+    with profiler.span("Open storage / LanceDB"):
+        storage = StorageEngine(
+            StorageConfig(
+                lance_dir=Path(args.lance),
+                lance_table=args.collection,
+                fts_rebuild_policy=args.fts_rebuild_policy,
+                fts_rebuild_batch_size=args.fts_rebuild_batch_size,
+            )
         )
-    )
-
-    bm25_path = Path(args.bm25)
 
     if args.command == "ingest":
         do_summarize = args.summarize
@@ -374,7 +511,6 @@ def run() -> None:
             page_number=args.page_number,
             storage=storage,
             embedding_model=embedding_model,
-            bm25_path=bm25_path,
             summarize=do_summarize,
             summary_generator=generator,
         )
@@ -393,13 +529,8 @@ def run() -> None:
                 print(f"- {source}")
         return
 
-    if not bm25_path.exists():
-        raise FileNotFoundError(
-            "BM25 index missing. Run 'ingest' to build indexes before querying."
-        )
-
-    storage.load_bm25(bm25_path)
-    reranker = JinaRerankerMLX(model_id=config.reranker_model)
+    # Reranker was already loaded in parallel above
+    reranker = _reranker_result[0] if _reranker_result[0] is not None else JinaRerankerMLX(model_id=config.reranker_model)
 
     retrieval = RetrievalEngine(
         storage=storage,
@@ -430,15 +561,17 @@ def run() -> None:
         intent_result = IntentResult(intent=intent_map[args.intent], confidence=1.0, method="manual")
         logger.info(f"Using manual intent override: {intent_result.intent.value}")
     else:
-        use_llm_intent = not args.no_llm_intent and not args.no_generate
-        if use_llm_intent:
-            generator = MlxGenerator(model_id)
-        classifier = IntentClassifier(
-            generator=generator,
-            confidence_threshold=args.intent_confidence_threshold,
-            use_llm=use_llm_intent,
-        )
-        intent_result = classifier.classify(args.query)
+        with profiler.span("Intent classification"):
+            llm_fallback_enabled = not args.no_generate and not getattr(args, "no_llm_fallback", False)
+            llm_model_id = args.intent_model if llm_fallback_enabled else None
+            llm_fallback_threshold = getattr(args, "llm_fallback_threshold", 0.70)
+
+            classifier = IntentClassifier(
+                confidence_threshold=args.intent_confidence_threshold,
+                llm_model_id=llm_model_id,
+                llm_fallback_threshold=llm_fallback_threshold,
+            )
+            intent_result = classifier.classify(args.query)
         logger.info(f"Classified intent: {intent_result.intent.value} (confidence={intent_result.confidence:.2f}, method={intent_result.method})")
 
     search_query = args.query
@@ -449,9 +582,32 @@ def run() -> None:
     _log_query(args.query, search_query if args.enable_query_expansion else None, intent_result, args.enable_query_expansion)
 
     extra_instructions: Optional[str] = None
+    query_looks_unclear = is_low_information_query(args.query)
+    bypass_retrieval_unclear_query = (
+        query_looks_unclear
+        and not args.no_generate
+    )
+
+    if bypass_retrieval_unclear_query:
+        logger.info(
+            "Skipping retrieval for low-information query; delegating directly to generation model"
+        )
+        context = ""
+        results = []
+        source_ids = []
+        parent_texts = []
+        if citations_enabled:
+            logger.info("Auto-disabling citations: no retrieval context for unclear query")
+            citations_enabled = False
+        extra_instructions = (
+            "The user query is unclear or nonsensical. Ask a concise clarifying question first, "
+            "and optionally suggest 2-3 concrete ways they can rephrase it."
+        )
 
     # --- COLLECTION intent: always use document summaries ---
-    if intent_result.intent == Intent.COLLECTION:
+    if bypass_retrieval_unclear_query:
+        pass
+    elif intent_result.intent == Intent.COLLECTION:
         sources = storage.list_source_ids()
         if not sources:
             print("No documents found in the database.")
@@ -556,11 +712,13 @@ def run() -> None:
                 logger.info("Auto-disabling citations: context is built from document summaries (no chunk markers)")
                 citations_enabled = False
         else:
-            results = retrieval.search(search_query, source_id=args.source_id)
+            with profiler.span("Retrieval (hybrid search + rerank)"):
+                results = retrieval.search(search_query, source_id=args.source_id)
             source_ids = sorted({r.metadata.get("source_id") for r in results if r.metadata.get("source_id")})
             parent_texts = [r.parent_text for r in results if r.parent_text]
     else:
-        results = retrieval.search(search_query, source_id=args.source_id)
+        with profiler.span("Retrieval (hybrid search + rerank)"):
+            results = retrieval.search(search_query, source_id=args.source_id)
         source_ids = sorted({r.metadata.get("source_id") for r in results if r.metadata.get("source_id")})
         parent_texts = [r.parent_text for r in results if r.parent_text]
 
@@ -569,8 +727,9 @@ def run() -> None:
     # Release retrieval-only models to free memory before LLM generation.
     # On 32GB Apple Silicon, the reranker (~1.2GB) and embedding model (~2GB)
     # competing with the MLX LLM for unified memory can cause swap thrashing.
-    del reranker, embedding_model, retrieval
-    gc.collect()
+    with profiler.span("Memory cleanup (gc)"):
+        del reranker, embedding_model, retrieval
+        gc.collect()
     logger.debug("Released reranker and embedding model to free memory for LLM generation")
 
     budget_metrics: Optional[BudgetMetrics] = None
@@ -586,17 +745,17 @@ def run() -> None:
             generator = MlxGenerator(model_id)
 
         import time
-        pack_start = time.perf_counter()
-        pack_result = enforce_token_budget(
-            docs=parent_texts,
-            max_tokens=config.retrieval_budget,
-            tokenizer=generator.tokenizer,
-            consecutive_fail_threshold=3,
-            allow_truncation=True,
-            log=logger,
-        )
-        
-        pack_time_ms = (time.perf_counter() - pack_start) * 1000
+        with profiler.span("Budget packing"):
+            pack_start = time.perf_counter()
+            pack_result = enforce_token_budget(
+                docs=parent_texts,
+                max_tokens=config.retrieval_budget,
+                tokenizer=generator.tokenizer,
+                consecutive_fail_threshold=3,
+                allow_truncation=True,
+                log=logger,
+            )
+            pack_time_ms = (time.perf_counter() - pack_start) * 1000
 
         packed_metadatas = [result_metadatas[i] for i in pack_result.packed_indices if i < len(result_metadatas)]
         
@@ -684,20 +843,23 @@ def run() -> None:
             print(context)
         else:
             print("No context retrieved.")
+        _print_latency_report(retrieval_metrics)
         return
 
-    messages = build_messages(
-        context,
-        args.query,
-        intent=intent_result.intent,
-        extra_instructions=extra_instructions,
-        citations_enabled=citations_enabled,
-        source_legend=source_legend,
-        mode=config.mode,
-    )
+    with profiler.span("Build prompt / messages"):
+        messages = build_messages(
+            context,
+            args.query,
+            intent=intent_result.intent,
+            extra_instructions=extra_instructions,
+            citations_enabled=citations_enabled,
+            source_legend=source_legend,
+            mode=config.mode,
+        )
 
     if generator is None:
-        generator = MlxGenerator(model_id)
+        with profiler.span("Load LLM model"):
+            generator = MlxGenerator(model_id)
 
     # Academic mode (citations): 600 tokens for concise, cited answers
     # Casual mode: 1200 tokens for comprehensive, long-form responses
@@ -705,7 +867,10 @@ def run() -> None:
         max_tokens=600 if citations_enabled else 1200,
         context_window=config.context_window,
     )
-    answer = _sanitize_output(generator.generate_chat(messages, config=gen_config))
+    with profiler.span("LLM generation"):
+        raw_answer = generator.generate_chat(messages, config=gen_config)
+    with profiler.span("Output sanitisation"):
+        answer = _sanitize_output(raw_answer)
     
     # Print intent info and answer
     cite_mode = "Academic" if citations_enabled else "Casual"
@@ -715,6 +880,9 @@ def run() -> None:
     else:
         print()
     print(answer)
+
+    # ---- latency report ----
+    _print_latency_report(retrieval_metrics)
 
 
 if __name__ == "__main__":
