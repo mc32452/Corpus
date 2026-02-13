@@ -1,0 +1,445 @@
+"""Tests for source management API endpoints: list, ingest, delete, content.
+
+Uses a mock engine with real StorageEngine (tmpdir-based LanceDB) and
+real source_cache for full integration testing of the endpoints.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Optional
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from src.api import app
+from src.source_cache import save_snapshot
+from src.storage import StorageConfig, StorageEngine
+
+
+# ---------------------------------------------------------------------------
+# Mock engine with real storage
+# ---------------------------------------------------------------------------
+
+
+class MockEngineWithStorage:
+    """Mock engine that wraps a real StorageEngine for endpoint testing.
+
+    Does NOT load ML models — ingest is simulated by directly adding
+    data to storage.
+    """
+
+    def __init__(self, storage: StorageEngine):
+        self._storage = storage
+
+    @property
+    def storage(self) -> StorageEngine:
+        return self._storage
+
+    def ingest(self, file_path, *, source_id, summarize=True, page_number=None):
+        """Simulate ingest by storing parent chunks and a summary."""
+        from src.models import Metadata, ParentChunk
+
+        # Read the file content
+        text = Path(file_path).read_text(encoding="utf-8")
+
+        # Create a parent chunk
+        parent = ParentChunk(
+            text=text,
+            metadata=Metadata(
+                source_id=source_id,
+                page_number=1,
+                header_path="Document",
+            ),
+        )
+        self._storage.add_parents([parent])
+
+        # Create a summary
+        if summarize:
+            self._storage.upsert_source_summary(
+                source_id=source_id,
+                summary=f"Summary of {source_id}",
+                source_path=str(Path(file_path).resolve()),
+            )
+
+        class _Result:
+            def __init__(self):
+                self.source_id = source_id
+                self.parents_count = 1
+                self.children_count = 0
+                self.summarized = summarize
+
+        return _Result()
+
+    def query_events(self, *args, **kwargs):
+        yield from []
+
+    def close(self):
+        self._storage.close()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_storage(tmp_path: Path) -> StorageEngine:
+    config = StorageConfig(
+        lance_dir=tmp_path / "lance",
+        lance_table="test_chunks",
+    )
+    engine = StorageEngine(config)
+    yield engine
+    engine.close()
+
+
+@pytest.fixture
+def mock_engine(tmp_storage: StorageEngine) -> MockEngineWithStorage:
+    return MockEngineWithStorage(tmp_storage)
+
+
+@pytest.fixture
+def sample_file(tmp_path: Path) -> Path:
+    """Create a sample markdown file for testing."""
+    f = tmp_path / "sample.md"
+    f.write_text("# Test Document\n\nThis is a sample document for testing.", encoding="utf-8")
+    return f
+
+
+# ---------------------------------------------------------------------------
+# GET /api/sources — list
+# ---------------------------------------------------------------------------
+
+
+class TestListSources:
+    @pytest.mark.anyio
+    async def test_empty_list(self, mock_engine) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sources"] == []
+
+    @pytest.mark.anyio
+    async def test_list_after_ingest(self, mock_engine, sample_file) -> None:
+        # Simulate ingest
+        mock_engine.ingest(str(sample_file), source_id="test_doc")
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources")
+
+        assert resp.status_code == 200
+        sources = resp.json()["sources"]
+        assert len(sources) >= 1
+        assert any(s["source_id"] == "test_doc" for s in sources)
+
+    @pytest.mark.anyio
+    async def test_list_includes_summary(self, mock_engine, sample_file) -> None:
+        mock_engine.ingest(str(sample_file), source_id="doc_a")
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources")
+
+        sources = resp.json()["sources"]
+        doc = next(s for s in sources if s["source_id"] == "doc_a")
+        assert doc["summary"] is not None
+        assert "Summary of doc_a" in doc["summary"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/sources/ingest
+# ---------------------------------------------------------------------------
+
+
+class TestIngestEndpoint:
+    @pytest.mark.anyio
+    async def test_ingest_success(self, mock_engine, sample_file) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/sources/ingest",
+                    json={
+                        "file_path": str(sample_file),
+                        "source_id": "new_doc",
+                    },
+                )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source_id"] == "new_doc"
+        assert data["parents_count"] >= 1
+        assert data["summarized"] is True
+
+    @pytest.mark.anyio
+    async def test_ingest_file_not_found(self, mock_engine) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/sources/ingest",
+                    json={
+                        "file_path": "/nonexistent/file.pdf",
+                        "source_id": "missing",
+                    },
+                )
+
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["error"]["code"] == "SOURCE_NOT_FOUND"
+
+    @pytest.mark.anyio
+    async def test_ingest_no_summarize(self, mock_engine, sample_file) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.post(
+                    "/api/sources/ingest",
+                    json={
+                        "file_path": str(sample_file),
+                        "source_id": "no_summary",
+                        "summarize": False,
+                    },
+                )
+
+        assert resp.status_code == 200
+        assert resp.json()["summarized"] is False
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/sources/{source_id}
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteEndpoint:
+    @pytest.mark.anyio
+    async def test_delete_existing(self, mock_engine, sample_file) -> None:
+        mock_engine.ingest(str(sample_file), source_id="to_delete")
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.delete("/api/sources/to_delete")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source_id"] == "to_delete"
+        assert data["deleted"] is True
+
+    @pytest.mark.anyio
+    async def test_delete_nonexistent(self, mock_engine) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.delete("/api/sources/nonexistent")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] is False
+
+    @pytest.mark.anyio
+    async def test_list_empty_after_delete(self, mock_engine, sample_file) -> None:
+        """After deleting the only source, list should be empty."""
+        mock_engine.ingest(str(sample_file), source_id="only_doc")
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                await client.delete("/api/sources/only_doc")
+                resp = await client.get("/api/sources")
+
+        sources = resp.json()["sources"]
+        assert not any(s["source_id"] == "only_doc" for s in sources)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/sources/{source_id}/content
+# ---------------------------------------------------------------------------
+
+
+class TestContentEndpoint:
+    @pytest.mark.anyio
+    async def test_content_not_found(self, mock_engine) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/nonexistent/content")
+
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["error"]["code"] == "SOURCE_NOT_FOUND"
+
+    @pytest.mark.anyio
+    async def test_content_from_original(self, mock_engine, sample_file) -> None:
+        """Content resolved from original file when it still exists."""
+        mock_engine.ingest(str(sample_file), source_id="content_test")
+        # Update with source_path pointing to the still-existing file
+        mock_engine.storage.upsert_source_summary(
+            source_id="content_test",
+            summary="Summary",
+            source_path=str(sample_file),
+        )
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/content_test/content")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_source"] == "original"
+        assert "Test Document" in data["content"]
+
+    @pytest.mark.anyio
+    async def test_content_snapshot_fallback(self, mock_engine, sample_file, tmp_path) -> None:
+        """When original is gone, content falls back to snapshot."""
+        mock_engine.ingest(str(sample_file), source_id="snap_test")
+
+        # Create snapshot
+        snapshot_path = save_snapshot(
+            "snap_test",
+            "Cached snapshot content",
+            cache_dir=tmp_path / "cache",
+        )
+
+        # Update summary with snapshot path and non-existent source path
+        mock_engine.storage.upsert_source_summary(
+            source_id="snap_test",
+            summary="Summary",
+            source_path="/gone/file.txt",
+            snapshot_path=snapshot_path,
+        )
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/snap_test/content")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_source"] == "snapshot"
+        assert data["content"] == "Cached snapshot content"
+
+    @pytest.mark.anyio
+    async def test_content_parent_text_fallback(self, mock_engine, sample_file) -> None:
+        """When both original and snapshot are gone, parent texts serve as fallback."""
+        mock_engine.ingest(str(sample_file), source_id="parent_test")
+        # Update with non-existent paths
+        mock_engine.storage.upsert_source_summary(
+            source_id="parent_test",
+            summary="Summary",
+            source_path="/gone/file.txt",
+            snapshot_path="/gone/snapshot.txt",
+        )
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/parent_test/content")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_source"] == "summary"
+        assert "Test Document" in data["content"]
+
+    @pytest.mark.anyio
+    async def test_content_404_after_delete(self, mock_engine, sample_file) -> None:
+        """After deleting a source, /content returns 404."""
+        mock_engine.ingest(str(sample_file), source_id="delete_content_test")
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                # Delete the source
+                await client.delete("/api/sources/delete_content_test")
+                # Try to get content
+                resp = await client.get("/api/sources/delete_content_test/content")
+
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Negative path: ingest → move original → snapshot fallback → delete → 404
+# ---------------------------------------------------------------------------
+
+
+class TestNegativePath:
+    @pytest.mark.anyio
+    async def test_full_negative_path(self, mock_engine, tmp_path) -> None:
+        """
+        Full negative-path test as specified in the plan:
+        1. Ingest source
+        2. Move original file
+        3. Confirm snapshot fallback
+        4. Delete source
+        5. Confirm /content returns 404
+        """
+        # Step 1: Create and ingest a file
+        original = tmp_path / "paper.md"
+        original.write_text("Original paper content for negative path test.", encoding="utf-8")
+        mock_engine.ingest(str(original), source_id="neg_test")
+
+        # Create snapshot
+        snapshot_path = save_snapshot(
+            "neg_test",
+            "Original paper content for negative path test.",
+            cache_dir=tmp_path / "cache",
+        )
+        mock_engine.storage.upsert_source_summary(
+            source_id="neg_test",
+            summary="Summary of neg_test",
+            source_path=str(original),
+            snapshot_path=snapshot_path,
+        )
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                # Step 2: Verify original file serves content
+                resp = await client.get("/api/sources/neg_test/content")
+                assert resp.status_code == 200
+                assert resp.json()["content_source"] == "original"
+
+                # Step 3: Move (delete) original file
+                original.unlink()
+
+                # Step 4: Confirm snapshot fallback
+                resp = await client.get("/api/sources/neg_test/content")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["content_source"] == "snapshot"
+                assert "negative path test" in data["content"]
+
+                # Step 5: Delete source
+                resp = await client.delete("/api/sources/neg_test")
+                assert resp.status_code == 200
+                assert resp.json()["deleted"] is True
+
+                # Step 6: Confirm /content returns 404
+                resp = await client.get("/api/sources/neg_test/content")
+                assert resp.status_code == 404
+                assert resp.json()["error"]["code"] == "SOURCE_NOT_FOUND"

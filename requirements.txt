@@ -12,3 +12,8 @@ pdf2image
 
 # Optional: RAM detection and bench_memory script
 psutil
+
+# API layer
+fastapi
+uvicorn
+httpx
