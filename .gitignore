@@ -2,6 +2,7 @@
 
 *.jsonl
 *.json
+!data/lance/schema_version.json
 
 # Python cache
 __pycache__/
@@ -33,6 +34,6 @@ chroma/
 !models/.gitkeep
 
 *.md
-# Allow specific markdown files in tests/
+# Allow specific markdown files
 !tests/README.md
 !tests/TEST_REPORT.md
