@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { queryStreaming } from "@/lib/api-client";
 import { useAppDispatch, useAppState } from "@/context/app-context";
 import type { CitationEntry, CitationPayload } from "@/lib/api-client";
+import { ChatMarkdown } from "@/components/chat-markdown";
 
 /** Last status line before the assistant message; everything before this is status. */
 const MESSAGE_START_STATUS = "Generating answer...";
@@ -18,98 +19,6 @@ type ChatMessage = {
   /** Structured citation list parsed from the CITATIONS: stream line */
   citations?: CitationEntry[];
 };
-
-/** Render text with citation numbers as superscript.
- *  Uses the original [N] number as the display label (not a sequential counter)
- *  so buttons match the Sources header.  Unresolved [N] (N > citations.length)
- *  is rendered as plain text.  Duplicate [N] occurrences get the same label. */
-function renderTextWithCitations(
-  text: string,
-  citations: CitationEntry[] | undefined,
-  onCitationClick: (payload: CitationPayload) => void
-): React.ReactNode[] {
-  const parts: React.ReactNode[] = [];
-  const regex = /\[([^\]]+)\]/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = regex.exec(text)) !== null) {
-    // Text before citation
-    if (match.index > lastIndex) {
-      parts.push(
-        <span key={`text-${lastIndex}`}>
-          {text.slice(lastIndex, match.index)}
-        </span>
-      );
-    }
-
-    const raw = match[1].trim();
-    let payload: CitationPayload | null = null;
-    let displayLabel = raw;
-
-    // Resolve numbered [N]
-    const numMatch = raw.match(/^(\d+)$/);
-    if (numMatch && citations) {
-      const idx = parseInt(numMatch[1], 10) - 1;
-      if (idx >= 0 && idx < citations.length) {
-        const c = citations[idx];
-        displayLabel = numMatch[1];
-        payload = {
-          source_id: c.source_id,
-          chunk_id: c.chunk_id,
-          page_number: c.page_number,
-          display_page: c.display_page,
-          header_path: c.header_path,
-          chunk_text: c.chunk_text,
-        };
-      }
-    } else {
-      // Try [SourceID, p. X]
-      const pageMatch = raw.match(/^(.+?),\s*p\.\s*(\d+)$/);
-      const sourceId = pageMatch ? pageMatch[1].trim() : raw;
-      const entry = citations?.find((c) => c.source_id === sourceId);
-      if (entry) {
-        payload = {
-          source_id: entry.source_id,
-          chunk_id: entry.chunk_id,
-          page_number: entry.page_number,
-          display_page: entry.display_page,
-          header_path: entry.header_path,
-          chunk_text: entry.chunk_text,
-        };
-      }
-    }
-
-    if (payload) {
-      parts.push(
-        <button
-          key={`cite-${match.index}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onCitationClick(payload);
-          }}
-          className="inline-flex items-center justify-center w-4 h-4 text-[10px] font-bold text-blue-400 hover:text-blue-300 bg-blue-500/20 hover:bg-blue-500/30 rounded-full align-super ml-0.5 mr-0.5 cursor-pointer transition-colors"
-          title={`View source: ${payload.source_id}`}
-        >
-          {displayLabel}
-        </button>
-      );
-    } else {
-      // Unresolved citation — render as plain text (no clickable button)
-      parts.push(
-        <span key={`text-${match.index}`}>{match[0]}</span>
-      );
-    }
-    lastIndex = match.index + match[0].length;
-  }
-
-  // Remaining text
-  if (lastIndex < text.length) {
-    parts.push(<span key={`text-${lastIndex}`}>{text.slice(lastIndex)}</span>);
-  }
-
-  return parts.length > 0 ? parts : [<span key="full">{text}</span>];
-}
 
 function getMessageText(message: ChatMessage): string {
   return message.parts
@@ -520,15 +429,18 @@ export function ChatPanel({
                   )}
 
                   {/* Message text */}
-                  <div className="whitespace-pre-wrap text-sm leading-relaxed min-h-[1.5em]">
+                  <div>
                     {isAssistantPlaceholder ? (
                       <span className="text-gray-500 animate-pulse">
                         {statusMessage || MESSAGE_START_STATUS}
                       </span>
-                    ) : isUser ? (
-                      text
                     ) : (
-                      renderTextWithCitations(text, message.citations, onCitationClick)
+                      <ChatMarkdown
+                        content={text}
+                        citations={isUser ? undefined : message.citations}
+                        onCitationClick={isUser ? undefined : onCitationClick}
+                        className={isUser ? "text-white" : "text-gray-100"}
+                      />
                     )}
                   </div>
                 </div>
