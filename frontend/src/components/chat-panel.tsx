@@ -154,6 +154,7 @@ export function ChatPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const [inputValue, setInputValue] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const messagesRef = useRef<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -171,6 +172,10 @@ export function ChatPanel({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
   }, [messages]);
 
   useEffect(() => {
@@ -211,6 +216,23 @@ export function ChatPanel({
         timestamp: Date.now(),
       };
 
+      const historyMessages = [
+        ...messagesRef.current,
+        userMessage,
+      ]
+        .map((message) => {
+          const content = getMessageText(message).trim();
+          if (!content) return null;
+          return {
+            role: message.role,
+            content,
+          };
+        })
+        .filter(
+          (item): item is { role: "user" | "assistant"; content: string } =>
+            item !== null
+        );
+
       pendingCitationsRef.current = null;
       streamingTextRef.current = "";
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
@@ -243,6 +265,7 @@ export function ChatPanel({
         for await (const event of queryStreaming(text, {
           sourceIds: selectedSourceIds.length > 0 ? selectedSourceIds : undefined,
           citationsEnabled: true,
+          messages: historyMessages,
           signal: controller.signal,
         })) {
           switch (event.event) {
@@ -626,15 +649,6 @@ export function ChatPanel({
             </div>
           );
         })}
-
-        {isActive && (
-          <div className="flex justify-start">
-            <div className="flex items-center gap-2 px-4 py-2 text-sm text-gray-400">
-              <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
-              {statusMessage || "Thinking..."}
-            </div>
-          </div>
-        )}
 
         {errorMessage && (
           <div className="flex justify-center">
