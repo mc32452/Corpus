@@ -65,41 +65,58 @@ class MlxGenerator:
         return float(match.group(1)) if match else None
 
     @staticmethod
-    def _build_repetition_penalty_processor(penalty: float):
+    def _build_repetition_penalty_processor(penalty: float, context_size: int = 20):
+        """Build a repetition penalty logits processor.
+
+        Uses mlx-lm's native implementation which operates entirely in the MLX
+        compute graph (pure mx.array ops, no GPU→CPU syncs).  Falls back to a
+        minimal pure-MLX implementation if the native helper is unavailable.
+        """
         if penalty <= 1.0:
             return None
 
-        def _processor(tokens, logits):
-            try:
-                import mlx.core as mx
-            except Exception:
-                return logits
-
-            token_ids = tokens.tolist()
-            if token_ids and isinstance(token_ids[0], list):
-                token_ids = token_ids[0]
-            if not token_ids:
-                return logits
-
-            logits_np = mx.array(logits)
-            token_ids = sorted(set(int(t) for t in token_ids))
-            cols = mx.take(logits_np, mx.array(token_ids), axis=-1)
-            adjusted = mx.where(
-                cols > 0,
-                cols / penalty,
-                cols * penalty,
+        # Prefer mlx-lm's native, GPU-resident implementation
+        try:
+            from mlx_lm.sample_utils import make_logits_processors
+            processors = make_logits_processors(
+                repetition_penalty=penalty,
+                repetition_context_size=context_size,
             )
-            try:
-                import numpy as np
+            if processors:
+                logger.debug(
+                    "Using native mlx-lm repetition_penalty=%.2f context_size=%d",
+                    penalty, context_size,
+                )
+                return processors[0]
+        except (ImportError, AttributeError):
+            pass
 
-                logits_np_np = logits_np.astype("float32").tolist()
-                adjusted_np = adjusted.astype("float32").tolist()
-                for col_idx, token_id in enumerate(token_ids):
-                    logits_np_np[0][token_id] = adjusted_np[0][col_idx]
-                return mx.array(logits_np_np)
-            except Exception:
-                return logits_np
+        # Fallback: pure MLX ops — no .tolist() or Python loops
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return None
 
+        def _processor(tokens, logits):
+            if len(tokens) == 0:
+                return logits
+            recent = tokens[-context_size:]
+            selected = logits[:, recent]
+            selected = mx.where(
+                selected < 0,
+                selected * penalty,
+                selected / penalty,
+            )
+            # Avoid fancy-index assignment (logits[:, recent] = ...), which is
+            # not supported on some MLX versions in fallback environments.
+            recent_idx = mx.array(recent, dtype=mx.int32)[None, :]
+            recent_idx = mx.broadcast_to(recent_idx, selected.shape)
+            return mx.put_along_axis(logits, recent_idx, selected, axis=-1)
+
+        logger.debug(
+            "Using fallback pure-MLX repetition_penalty=%.2f context_size=%d",
+            penalty, context_size,
+        )
         return _processor
 
     def generate(self, prompt: str, *, config: Optional[GenerationConfig] = None) -> str:
@@ -131,14 +148,130 @@ class MlxGenerator:
         else:
             temperature = temperature or 0.2
             top_p = top_p or 0.9
-        try:
-            from mlx_lm import generate
-            from mlx_lm.generate import make_sampler
-        except Exception as exc:  # pragma: no cover - dependency runtime
-            raise RuntimeError("mlx-lm generate is not available.") from exc
 
         # Collect stop tokens
         stop_tokens = cfg.stop_tokens if cfg.stop_tokens is not None else DEFAULT_STOP_TOKENS
+
+        # IMPORTANT: Always pass explicit max_tokens to override mlx-lm's hidden 256 default
+        # Use 1200 tokens (~900 words) for long-form academic answers when not specified
+        final_max_tokens = max_tokens if max_tokens is not None else 1200
+        prompt_tokens = count_tokens(prompt, self._tokenizer)
+
+        # Warn if approaching the active mode's context window limit
+        ctx_limit = cfg.context_window
+        if ctx_limit and prompt_tokens > int(ctx_limit * 0.8):
+            logger.warning(
+                "High prompt token count: %d tokens (%.0f%% of %dk context window). "
+                "Consider reducing context.",
+                prompt_tokens,
+                100 * prompt_tokens / ctx_limit,
+                ctx_limit // 1000,
+            )
+
+        # Use stream_generate for separated prefill/decode metrics and peak memory.
+        # Falls back to the legacy generate() path if stream_generate is unavailable.
+        try:
+            from mlx_lm.generate import stream_generate, make_sampler
+            return self._generate_streaming(
+                prompt, final_max_tokens, temperature, top_p,
+                repetition_penalty, stop_tokens, prompt_tokens,
+            )
+        except ImportError:
+            pass
+
+        # Legacy fallback for older mlx-lm versions
+        return self._generate_legacy(
+            prompt, final_max_tokens, temperature, top_p,
+            repetition_penalty, stop_tokens, prompt_tokens,
+        )
+
+    def _generate_streaming(
+        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
+        repetition_penalty: Optional[float], stop_tokens: list[str],
+        prompt_tokens: int,
+    ) -> str:
+        """Primary generation path using stream_generate for accurate metrics.
+
+        stream_generate provides:
+        - Separated prefill_tps vs generation_tps (no more conflated timing)
+        - peak_memory tracking via mx.get_peak_memory()
+        - Proper EOS handling
+        """
+        from mlx_lm.generate import stream_generate, make_sampler
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        logits_processors = []
+        if repetition_penalty is not None:
+            processor = self._build_repetition_penalty_processor(repetition_penalty)
+            if processor is not None:
+                logits_processors.append(processor)
+
+        generate_kwargs: dict = dict(
+            sampler=sampler,
+            logits_processors=logits_processors or None,
+        )
+        if self._make_prompt_cache is not None:
+            try:
+                cache = self._make_prompt_cache(self._model)
+                generate_kwargs["prompt_cache"] = cache
+            except (ImportError, AttributeError, TypeError):
+                pass
+
+        start_time = time.perf_counter()
+        text_parts: list[str] = []
+        response = None
+
+        for response in stream_generate(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            **generate_kwargs,
+        ):
+            text_parts.append(response.text)
+
+        elapsed_s = time.perf_counter() - start_time
+        output = "".join(text_parts)
+
+        # Apply stop token truncation
+        output = self._apply_stop_tokens(output, stop_tokens)
+        output_tokens = count_tokens(output, self._tokenizer)
+        total_tokens = prompt_tokens + output_tokens
+
+        # Log with separated prefill/decode metrics
+        if response is not None:
+            logger.info(
+                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
+                "time_s=%.2f prefill_tps=%.1f decode_tps=%.1f peak_memory_gb=%.2f",
+                self._model_id,
+                response.prompt_tokens,
+                output_tokens,
+                total_tokens,
+                elapsed_s,
+                response.prompt_tps,
+                response.generation_tps,
+                response.peak_memory,
+            )
+        else:
+            logger.info(
+                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d "
+                "time_s=%.2f (no stream response)",
+                self._model_id, prompt_tokens, output_tokens, elapsed_s,
+            )
+
+        return output
+
+    def _generate_legacy(
+        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
+        repetition_penalty: Optional[float], stop_tokens: list[str],
+        prompt_tokens: int,
+    ) -> str:
+        """Fallback generation for older mlx-lm without stream_generate."""
+        try:
+            from mlx_lm import generate
+            from mlx_lm.generate import make_sampler
+        except Exception as exc:
+            raise RuntimeError("mlx-lm generate is not available.") from exc
 
         try:
             sampler = make_sampler(temp=temperature, top_p=top_p)
@@ -148,46 +281,25 @@ class MlxGenerator:
                 if processor is not None:
                     logits_processors.append(processor)
 
-            # IMPORTANT: Always pass explicit max_tokens to override mlx-lm's hidden 256 default
-            # Use 1200 tokens (~900 words) for long-form academic answers when not specified
-            final_max_tokens = max_tokens if max_tokens is not None else 1200
-            prompt_tokens = count_tokens(prompt, self._tokenizer)
-            
-            # Warn if approaching the active mode's context window limit
-            ctx_limit = cfg.context_window
-            if ctx_limit and prompt_tokens > int(ctx_limit * 0.8):
-                logger.warning(
-                    "High prompt token count: %d tokens (%.0f%% of %dk context window). "
-                    "Consider reducing context.",
-                    prompt_tokens,
-                    100 * prompt_tokens / ctx_limit,
-                    ctx_limit // 1000,
-                )
-            
-            start_time = time.perf_counter()
-
-            # Use KVCache if available for context warming
             generate_kwargs = dict(
                 model=self._model,
                 tokenizer=self._tokenizer,
                 prompt=prompt,
-                max_tokens=final_max_tokens,
+                max_tokens=max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors or None,
             )
             if self._make_prompt_cache is not None:
                 try:
-                    # Fresh cache per call — KV state is prompt-specific so
-                    # reusing a stale cache would corrupt generation.
                     cache = self._make_prompt_cache(self._model)
                     generate_kwargs["prompt_cache"] = cache
                 except (ImportError, AttributeError, TypeError):
-                    pass  # Graceful fallback if API doesn't support prompt_cache kwarg
+                    pass
 
+            start_time = time.perf_counter()
             output = generate(**generate_kwargs)
             elapsed_s = time.perf_counter() - start_time
-            
-            # Apply stop token truncation (mlx-lm may not support all stop tokens natively)
+
             output = self._apply_stop_tokens(output, stop_tokens)
             output_tokens = count_tokens(output, self._tokenizer)
             total_tokens = prompt_tokens + output_tokens
@@ -196,15 +308,11 @@ class MlxGenerator:
             logger.info(
                 "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
                 "time_s=%.2f tokens_per_s=%.2f",
-                self._model_id,
-                prompt_tokens,
-                output_tokens,
-                total_tokens,
-                elapsed_s,
-                tokens_per_sec,
+                self._model_id, prompt_tokens, output_tokens, total_tokens,
+                elapsed_s, tokens_per_sec,
             )
             return output
-        except Exception as exc:  # pragma: no cover - dependency runtime
+        except Exception as exc:
             raise RuntimeError("mlx-lm generation failed.") from exc
 
     def generate_chat(
