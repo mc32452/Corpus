@@ -189,6 +189,8 @@ class TestIntentClassification:
             ("How many core counts does the chip have?", Intent.FACTUAL),
             ("What does the author say about behaviorism?", Intent.FACTUAL),
             ("What specific method did they use?", Intent.FACTUAL),
+            ("What is community?", Intent.FACTUAL),
+            ("What is epistemology?", Intent.FACTUAL),
             ("Name the key theorists", Intent.FACTUAL),
             ("Extract all publication years and cited authors", Intent.FACTUAL),
             ("Format the results as a table", Intent.FACTUAL),
@@ -681,6 +683,10 @@ class TestIntentBoundaries:
     def test_what_is_paper_overview_not_factual(self):
         result = _classify_heuristic("What is this paper about?")
         assert result.intent == Intent.OVERVIEW
+
+    def test_what_is_term_is_factual(self):
+        result = _classify_heuristic("What is community?")
+        assert result.intent == Intent.FACTUAL
 
     def test_summarize_all_is_collection(self):
         """'Summarize all documents' should be COLLECTION, not SUMMARIZE."""

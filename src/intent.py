@@ -186,6 +186,17 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
 
 _HEURISTIC_CONFIDENCE = {"strong_match": 0.85, "single_match": 0.70, "weak_match": 0.50}
 _TECHNICAL_TERM_HINTS = {"stimulus", "reinforcement", "skinner"}
+_OVERVIEW_SUBJECT_WORDS = {
+    "this", "that", "it", "paper", "document", "article", "text",
+    "docs", "doc", "source", "sources", "collection", "corpus",
+}
+_NON_DEFINITION_QUERY_WORDS = {
+    "main", "key", "point", "points", "overview", "summary", "gist",
+    "argument", "arguments", "difference", "differences", "similarity",
+    "similarities", "role", "effect", "effects",
+    "we", "i", "you", "here", "there", "in", "at", "looking",
+    "available",
+}
 _LOW_INFO_COMMON_WORDS = {
     "what", "why", "how", "who", "when", "where", "which", "explain", "summarize",
     "compare", "analyze", "critique", "document", "docs", "paper", "text", "about",
@@ -262,6 +273,9 @@ def _apply_structural_intent_signals(query: str, scores: dict[Intent, int]) -> N
     if any(pattern.search(normalized) for pattern in _SUMMARIZATION_STRUCTURES):
         scores[Intent.SUMMARIZE] += 2
 
+    if _is_definition_style_query(normalized):
+        scores[Intent.FACTUAL] += 2
+
     if corpus_scope or overview_everything_scope:
         scores[Intent.COLLECTION] += 4
 
@@ -288,6 +302,25 @@ def _is_technical_how_why(query: str) -> bool:
     if re.match(r"^\s*how\s+many\b", query, re.IGNORECASE):
         return False
     return bool(re.match(r"^\s*(how|why)\b", query, re.IGNORECASE)) and _has_technical_terms(query)
+
+
+def _is_definition_style_query(query: str) -> bool:
+    """Detect short definitional prompts like 'What is community?'"""
+    match = re.match(
+        r"^\s*what\s+(?:is|are)\s+(?:an?\s+)?([a-z][a-z0-9'\-]*(?:\s+[a-z][a-z0-9'\-]*){0,2})\s*\??\s*$",
+        query,
+        re.IGNORECASE,
+    )
+    if not match:
+        return False
+
+    subject_tokens = set(match.group(1).lower().split())
+    if subject_tokens & _OVERVIEW_SUBJECT_WORDS:
+        return False
+    if subject_tokens & _NON_DEFINITION_QUERY_WORDS:
+        return False
+
+    return True
 
 
 def _classify_heuristic(query: str) -> IntentResult:

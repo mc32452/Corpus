@@ -1,6 +1,7 @@
 "use client";
 
 import ReactMarkdown from "react-markdown";
+import { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { CitationEntry, CitationPayload } from "@/lib/api-client";
 
@@ -23,6 +24,26 @@ function addCitationLinks(content: string, citations?: CitationEntry[]): string 
   });
 }
 
+function extractCitationIndex(href?: string): number | null {
+  if (!href) return null;
+
+  const decodedHref = (() => {
+    try {
+      return decodeURIComponent(href);
+    } catch {
+      return href;
+    }
+  })();
+
+  const citationMatch =
+    decodedHref.match(/(?:^|\/)citation:(\d+)(?:$|[/?#])/i) ??
+    decodedHref.match(/citation:(\d+)/i);
+  if (!citationMatch) return null;
+
+  const index = Number.parseInt(citationMatch[1], 10) - 1;
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
 export function ChatMarkdown({
   content,
   className = "",
@@ -35,6 +56,10 @@ export function ChatMarkdown({
     <div className={`text-sm leading-relaxed min-h-[1.5em] break-words ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={(url) => {
+          if (url.toLowerCase().startsWith("citation:")) return url;
+          return defaultUrlTransform(url);
+        }}
         components={{
           p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
           ul: ({ children }) => <ul className="list-disc pl-5 mb-2 space-y-1">{children}</ul>,
@@ -50,33 +75,38 @@ export function ChatMarkdown({
             <code className="font-mono text-[0.9em] bg-black/20 px-1 py-0.5 rounded">{children}</code>
           ),
           a: ({ href, children }) => {
-            if (href?.startsWith("citation:") && onCitationClick && citations) {
-              const index = Number.parseInt(href.replace("citation:", ""), 10) - 1;
-              const citation = Number.isInteger(index) ? citations[index] : undefined;
+            const index = extractCitationIndex(href);
+            if (index !== null) {
+              const citation =
+                citations && Number.isInteger(index) && index >= 0 && index < citations.length
+                  ? citations[index]
+                  : undefined;
+              const payload: CitationPayload | undefined = citation
+                ? {
+                    source_id: citation.source_id,
+                    chunk_id: citation.chunk_id,
+                    page_number: citation.page_number,
+                    display_page: citation.display_page,
+                    header_path: citation.header_path,
+                    chunk_text: citation.chunk_text,
+                  }
+                : undefined;
 
-              if (citation) {
-                const payload: CitationPayload = {
-                  source_id: citation.source_id,
-                  chunk_id: citation.chunk_id,
-                  page_number: citation.page_number,
-                  display_page: citation.display_page,
-                  header_path: citation.header_path,
-                  chunk_text: citation.chunk_text,
-                };
-
-                return (
-                  <button
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onCitationClick(payload);
-                    }}
-                    className="inline-flex items-center justify-center w-4 h-4 text-[10px] font-bold text-blue-400 hover:text-blue-300 bg-blue-500/20 hover:bg-blue-500/30 rounded-full align-super ml-0.5 mr-0.5 cursor-pointer transition-colors"
-                    title={`View source: ${payload.source_id}`}
-                  >
-                    {children}
-                  </button>
-                );
-              }
+              return (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (payload && onCitationClick) onCitationClick(payload);
+                  }}
+                  className="inline-flex items-center justify-center w-4 h-4 text-[10px] font-bold text-blue-400 hover:text-blue-300 bg-blue-500/20 hover:bg-blue-500/30 rounded-full align-super ml-0.5 mr-0.5 cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={payload ? `View source: ${payload.source_id}` : "Source"}
+                  disabled={!payload || !onCitationClick}
+                >
+                  {children}
+                </button>
+              );
             }
 
             return (
