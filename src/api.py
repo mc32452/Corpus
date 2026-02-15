@@ -54,6 +54,7 @@ from .query_events import (
 )
 from .stream_protocol import (
     annotation_error,
+    annotation_error_with_metadata,
     annotation_intent,
     annotation_sources,
     annotation_status,
@@ -223,6 +224,11 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
     elif isinstance(event, TextTokenEvent):
         return encode_text(event.token)
     elif isinstance(event, ErrorEvent):
+        if event.metadata:
+            return (
+                annotation_error_with_metadata(event.code, event.message, event.metadata)
+                + encode_error(event.message)
+            )
         return annotation_error(event.code, event.message) + encode_error(event.message)
     elif isinstance(event, FinishEvent):
         return (
@@ -474,9 +480,12 @@ async def _query_sse_event_generator(
                     "data": json.dumps({"text": event.token}),
                 }
             elif isinstance(event, ErrorEvent):
+                payload = {"code": event.code, "error": event.message}
+                if event.metadata:
+                    payload["metadata"] = event.metadata
                 yield {
                     "event": "error",
-                    "data": json.dumps({"code": event.code, "error": event.message}),
+                    "data": json.dumps(payload),
                 }
             elif isinstance(event, FinishEvent):
                 yield {

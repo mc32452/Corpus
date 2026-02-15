@@ -47,6 +47,7 @@ class ErrorEvent:
 
     code: str  # e.g. "INTERNAL", "STREAM_CANCELLED"
     message: str
+    metadata: Optional[dict[str, object]] = None
 
 
 @dataclass(frozen=True)

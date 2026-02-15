@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import gc
-import json
 import logging
 import os
 import re
-import textwrap
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,27 +139,68 @@ _INCOMPLETE_ENDING = re.compile(
 )
 
 _EXPANSION_TERMS: dict[Intent, list[str]] = {
-    Intent.OVERVIEW: [],
-    Intent.SUMMARIZE: ["main argument", "thesis", "conclusion", "key points"],
-    Intent.EXPLAIN: [],
-    Intent.ANALYZE: [
-        "criticism",
-        "critique",
-        "debate",
-        "objection",
-        "response",
-        "controversy",
+    Intent.OVERVIEW: [
+        "overview",
+        "introduction",
+        "background",
+        "context",
     ],
-    Intent.COMPARE: ["compare", "contrast", "difference", "similarity"],
+    Intent.SUMMARIZE: [
+        "summary",
+        "conclusion",
+        "findings",
+        "results",
+        "main points",
+    ],
+    Intent.EXPLAIN: [
+        "definition",
+        "how",
+        "why",
+        "mechanism",
+        "process",
+        "works",
+        "example",
+    ],
+    Intent.ANALYZE: [
+        "argument",
+        "reasoning",
+        "assumptions",
+        "evidence",
+        "implications",
+        "logic",
+        "support",
+    ],
+    Intent.COMPARE: [
+        "compare",
+        "contrast",
+        "difference",
+        "similarity",
+        "versus",
+        "unlike",
+        "whereas",
+        "than",
+    ],
     Intent.CRITIQUE: [
         "criticism",
         "critique",
-        "debate",
-        "objection",
         "weakness",
         "strength",
+        "limitation",
+        "flaw",
+        "problem",
+        "objection",
+        "advantage",
     ],
-    Intent.FACTUAL: [],
+    Intent.FACTUAL: [
+        "who",
+        "what",
+        "when",
+        "where",
+        "fact",
+        "data",
+        "claim",
+        "evidence",
+    ],
     Intent.COLLECTION: [],
 }
 
@@ -228,10 +267,12 @@ def sanitize_output(text: str) -> str:
     return result.strip()
 
 
-def _expand_query(query: str, intent: Intent) -> str:
+def _expand_query(query: str, intent: Intent) -> tuple[str, list[str]]:
     """Append intent-specific expansion terms to query (feature-flagged)."""
     terms = _EXPANSION_TERMS.get(intent, [])
-    return f"{query} {' '.join(terms)}" if terms else query
+    if not terms:
+        return query, []
+    return f"{query} {' '.join(terms)}", list(terms)
 
 
 def _dedupe_context(texts: Iterable[str]) -> str:
@@ -312,7 +353,7 @@ class RagEngineConfig:
     fts_rebuild_policy: str = "deferred"
     fts_rebuild_batch_size: int = 0
     citations_enabled: Optional[bool] = None
-    enable_query_expansion: bool = False
+    enable_query_expansion: bool = True
     intent_confidence_threshold: float = 0.6
     llm_fallback: bool = True
     llm_fallback_threshold: float = 0.70
@@ -476,6 +517,71 @@ class RagEngine:
             "Released reranker and embedding model to free memory for LLM generation"
         )
 
+    def _classify_intent(
+        self,
+        *,
+        query_text: str,
+        intent_override: Optional[str],
+        no_generate: bool,
+    ) -> IntentResult:
+        if intent_override:
+            intent_map = {
+                "overview": Intent.OVERVIEW,
+                "summarize": Intent.SUMMARIZE,
+                "explain": Intent.EXPLAIN,
+                "analyze": Intent.ANALYZE,
+                "compare": Intent.COMPARE,
+                "critique": Intent.CRITIQUE,
+                "factual": Intent.FACTUAL,
+                "collection": Intent.COLLECTION,
+            }
+            return IntentResult(
+                intent=intent_map[intent_override], confidence=1.0, method="manual"
+            )
+
+        def _run() -> IntentResult:
+            llm_fallback_enabled = not no_generate and self._cfg.llm_fallback
+            llm_model_id = self._cfg.intent_model if llm_fallback_enabled else None
+            classifier = IntentClassifier(
+                confidence_threshold=self._cfg.intent_confidence_threshold,
+                llm_model_id=llm_model_id,
+                llm_fallback_threshold=self._cfg.llm_fallback_threshold,
+                eager_load_llm=False,
+            )
+            result = classifier.classify(query_text)
+            del classifier
+            gc.collect()
+            _release_mlx_cache()
+            return result
+
+        return _run()
+
+    def _apply_collection_guard(
+        self,
+        *,
+        query_text: str,
+        source_id: Optional[str],
+        intent_override: Optional[str],
+        intent_result: IntentResult,
+    ) -> tuple[IntentResult, bool]:
+        force_collection = (
+            source_id is None
+            and not intent_override
+            and len(self._storage.list_source_ids()) > 1
+            and is_source_selection_query(query_text)
+        )
+        if force_collection and intent_result.intent != Intent.COLLECTION:
+            logger.info(
+                "Forcing COLLECTION summary routing for source-selection query: %s",
+                query_text,
+            )
+            intent_result = IntentResult(
+                intent=Intent.COLLECTION,
+                confidence=max(intent_result.confidence, 0.85),
+                method=f"{intent_result.method}+collection_guard",
+            )
+        return intent_result, force_collection
+
     # -- public API --------------------------------------------------------
 
     def list_sources(self) -> list[str]:
@@ -582,35 +688,12 @@ class RagEngine:
 
         # -- intent classification -----------------------------------------
         self._on_status("Classifying intent...")
-        intent_result: Optional[IntentResult] = None
-        if intent_override:
-            intent_map = {
-                "overview": Intent.OVERVIEW,
-                "summarize": Intent.SUMMARIZE,
-                "explain": Intent.EXPLAIN,
-                "analyze": Intent.ANALYZE,
-                "compare": Intent.COMPARE,
-                "critique": Intent.CRITIQUE,
-                "factual": Intent.FACTUAL,
-                "collection": Intent.COLLECTION,
-            }
-            intent_result = IntentResult(
-                intent=intent_map[intent_override], confidence=1.0, method="manual"
+        with profiler.span("Intent classification"):
+            intent_result = self._classify_intent(
+                query_text=query_text,
+                intent_override=intent_override,
+                no_generate=no_generate,
             )
-        else:
-            with profiler.span("Intent classification"):
-                llm_fallback_enabled = not no_generate and self._cfg.llm_fallback
-                llm_model_id = self._cfg.intent_model if llm_fallback_enabled else None
-                classifier = IntentClassifier(
-                    confidence_threshold=self._cfg.intent_confidence_threshold,
-                    llm_model_id=llm_model_id,
-                    llm_fallback_threshold=self._cfg.llm_fallback_threshold,
-                    eager_load_llm=False,
-                )
-                intent_result = classifier.classify(query_text)
-                del classifier
-                gc.collect()
-                _release_mlx_cache()
 
         logger.info(
             "Classified intent: %s (confidence=%.2f, method=%s)",
@@ -619,30 +702,34 @@ class RagEngine:
             intent_result.method,
         )
 
-        force_collection = (
-            source_id is None
-            and not intent_override
-            and len(self._storage.list_source_ids()) > 1
-            and is_source_selection_query(query_text)
+        intent_result, force_collection = self._apply_collection_guard(
+            query_text=query_text,
+            source_id=source_id,
+            intent_override=intent_override,
+            intent_result=intent_result,
         )
-        if force_collection and intent_result.intent != Intent.COLLECTION:
-            logger.info(
-                "Forcing COLLECTION summary routing for source-selection query: %s",
-                query_text,
-            )
-            intent_result = IntentResult(
-                intent=Intent.COLLECTION,
-                confidence=max(intent_result.confidence, 0.85),
-                method=f"{intent_result.method}+collection_guard",
-            )
 
         # -- query expansion -----------------------------------------------
         search_query = query_text
         if expansion:
-            search_query = _expand_query(query_text, intent_result.intent)
+            search_query, expansion_terms = _expand_query(
+                query_text,
+                intent_result.intent,
+            )
+            logger.info(
+                "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
+                intent_result.intent.value,
+                intent_result.confidence,
+                expansion_terms,
+            )
+            if expansion_terms:
+                self._on_status(
+                    "Applying heuristic query expansion: "
+                    + ", ".join(expansion_terms[:4])
+                )
 
         extra_instructions: Optional[str] = None
-        bypass_retrieval = is_low_information_query(query_text) and not no_generate
+        bypass_retrieval = is_low_information_query(query_text)
 
         # -- retrieval paths -----------------------------------------------
         context = ""
@@ -911,7 +998,14 @@ class RagEngine:
             )
         except Exception as exc:
             logger.exception("query_events error: %s", exc)
-            yield ErrorEvent(code="INTERNAL", message=f"{type(exc).__name__}: {exc}")
+            yield ErrorEvent(
+                code="INTERNAL",
+                message=str(exc),
+                metadata={
+                    "exception_type": type(exc).__name__,
+                    "query": query_text[:100],
+                },
+            )
             yield FinishEvent(finish_reason="error")
 
     def _query_events_impl(
@@ -965,34 +1059,11 @@ class RagEngine:
 
         # -- intent classification -----------------------------------------
         yield StatusEvent(status="Classifying intent...")
-        intent_result: Optional[IntentResult] = None
-        if intent_override:
-            intent_map = {
-                "overview": Intent.OVERVIEW,
-                "summarize": Intent.SUMMARIZE,
-                "explain": Intent.EXPLAIN,
-                "analyze": Intent.ANALYZE,
-                "compare": Intent.COMPARE,
-                "critique": Intent.CRITIQUE,
-                "factual": Intent.FACTUAL,
-                "collection": Intent.COLLECTION,
-            }
-            intent_result = IntentResult(
-                intent=intent_map[intent_override], confidence=1.0, method="manual"
-            )
-        else:
-            llm_fallback_enabled = self._cfg.llm_fallback
-            llm_model_id = self._cfg.intent_model if llm_fallback_enabled else None
-            classifier = IntentClassifier(
-                confidence_threshold=self._cfg.intent_confidence_threshold,
-                llm_model_id=llm_model_id,
-                llm_fallback_threshold=self._cfg.llm_fallback_threshold,
-                eager_load_llm=False,
-            )
-            intent_result = classifier.classify(query_text)
-            del classifier
-            gc.collect()
-            _release_mlx_cache()
+        intent_result = self._classify_intent(
+            query_text=query_text,
+            intent_override=intent_override,
+            no_generate=False,
+        )
 
         yield IntentEvent(
             intent=intent_result.intent.value,
@@ -1000,21 +1071,21 @@ class RagEngine:
             method=intent_result.method,
         )
 
-        force_collection = (
-            source_id is None
-            and not intent_override
-            and len(self._storage.list_source_ids()) > 1
-            and is_source_selection_query(query_text)
+        before_guard = intent_result
+        intent_result, force_collection = self._apply_collection_guard(
+            query_text=query_text,
+            source_id=source_id,
+            intent_override=intent_override,
+            intent_result=intent_result,
         )
-        if force_collection and intent_result.intent != Intent.COLLECTION:
-            logger.info(
-                "query_events_impl: forcing COLLECTION summary routing for source-selection query"
+        if (
+            force_collection
+            and (
+                intent_result.intent != before_guard.intent
+                or intent_result.method != before_guard.method
+                or intent_result.confidence != before_guard.confidence
             )
-            intent_result = IntentResult(
-                intent=Intent.COLLECTION,
-                confidence=max(intent_result.confidence, 0.85),
-                method=f"{intent_result.method}+collection_guard",
-            )
+        ):
             yield IntentEvent(
                 intent=intent_result.intent.value,
                 confidence=intent_result.confidence,
@@ -1029,7 +1100,28 @@ class RagEngine:
         # -- query expansion -----------------------------------------------
         search_query = query_text
         if expansion:
-            search_query = _expand_query(query_text, intent_result.intent)
+            search_query, expansion_terms = _expand_query(
+                query_text,
+                intent_result.intent,
+            )
+            logger.info(
+                "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
+                intent_result.intent.value,
+                intent_result.confidence,
+                expansion_terms,
+            )
+            if expansion_terms:
+                yield StatusEvent(
+                    status=(
+                        "Applying heuristic query expansion: "
+                        + ", ".join(expansion_terms[:4])
+                    )
+                )
+
+        if should_stop():
+            yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled after query expansion")
+            yield FinishEvent(finish_reason="error")
+            return
 
         extra_instructions: Optional[str] = None
         bypass_retrieval = is_low_information_query(query_text)
@@ -1067,6 +1159,10 @@ class RagEngine:
                 yield TextTokenEvent(token="No documents found in the database.")
                 yield FinishEvent(finish_reason="stop")
                 return
+            if should_stop():
+                yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during collection summary retrieval")
+                yield FinishEvent(finish_reason="error")
+                return
 
         elif intent_result.intent == Intent.SUMMARIZE and not source_id:
             yield StatusEvent(status="Checking multi-document summarise path...")
@@ -1087,6 +1183,10 @@ class RagEngine:
             parent_texts = multi_result["parent_texts"]
             cite = multi_result["citations_enabled"]
             extra_instructions = multi_result.get("extra_instructions")
+            if should_stop():
+                yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during multi-document summarize retrieval")
+                yield FinishEvent(finish_reason="error")
+                return
 
         else:
             yield StatusEvent(status="Searching knowledge base...")
@@ -1099,6 +1199,10 @@ class RagEngine:
                 }
             )
             parent_texts = [r.parent_text for r in results if r.parent_text]
+            if should_stop():
+                yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled after retrieval")
+                yield FinishEvent(finish_reason="error")
+                return
 
         # Emit sources
         if source_ids:
@@ -1111,6 +1215,10 @@ class RagEngine:
 
         # -- release retrieval models for LLM headroom ---------------------
         self._release_retrieval_models()
+        if should_stop():
+            yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled after model cleanup")
+            yield FinishEvent(finish_reason="error")
+            return
 
         # -- token budget packing ------------------------------------------
         source_legend: Optional[str] = None
@@ -1173,6 +1281,10 @@ class RagEngine:
             pass
 
         # -- build prompt ---------------------------------------------------
+        if should_stop():
+            yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled before prompt build")
+            yield FinishEvent(finish_reason="error")
+            return
         yield StatusEvent(status="Building prompt...")
         messages = build_messages(
             context,
@@ -1196,7 +1308,6 @@ class RagEngine:
         yield StatusEvent(status="Generating answer...")
 
         token_count = 0
-        accumulated_answer = []
 
         for token in generator.generate_chat_stream(
             messages, config=gen_config, should_stop=should_stop
@@ -1206,7 +1317,6 @@ class RagEngine:
                 yield FinishEvent(finish_reason="error")
                 return
             token_count += 1
-            accumulated_answer.append(token)
             yield TextTokenEvent(token=token)
 
         # -- finish ---------------------------------------------------------

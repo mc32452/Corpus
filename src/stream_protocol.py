@@ -24,7 +24,7 @@ References
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Response headers required by the protocol
@@ -182,6 +182,20 @@ def annotation_error(code: str, message: str) -> str:
         "type": "error",
         "error": {"code": code, "message": message},
     }])
+
+
+def annotation_error_with_metadata(
+    code: str,
+    message: str,
+    metadata: Optional[dict[str, Any]] = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "type": "error",
+        "error": {"code": code, "message": message},
+    }
+    if metadata:
+        payload["error"]["metadata"] = metadata
+    return encode_annotation([payload])
 
 
 # ---------------------------------------------------------------------------
