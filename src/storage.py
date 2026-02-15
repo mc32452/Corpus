@@ -125,9 +125,15 @@ class StorageEngine:
         if self._table is None:
             return
         if force_rebuild or self._fts_dirty:
-            self._table.create_fts_index("text", replace=True)
-            self._fts_dirty = False
-            self._pending_fts_rows = 0
+            try:
+                self._table.create_fts_index("text", replace=True)
+            except Exception:
+                # Keep dirty state so future writes/queries can retry rebuild.
+                self._fts_dirty = True
+                raise
+            else:
+                self._fts_dirty = False
+                self._pending_fts_rows = 0
 
     def _maybe_rebuild_fts_after_write(self) -> None:
         policy = self._config.fts_rebuild_policy
@@ -181,21 +187,54 @@ class StorageEngine:
                 len(records),
             )
         else:
-            # Upsert: remove existing parent_ids then re-add
+            # Safe upsert: backup existing rows for target IDs, delete, add,
+            # and restore backup on add failure.
             ids = list(dict.fromkeys(r["parent_id"] for r in records))
+            existing_rows: list[dict[str, Any]] = []
             try:
                 for id_batch in self._chunk(ids, self._MAX_IN_CLAUSE_VALUES):
+                    existing_rows.extend(
+                        self._parents
+                        .search()
+                        .where(self._where_in("parent_id", id_batch), prefilter=True)
+                        .to_list()
+                    )
+                for id_batch in self._chunk(ids, self._MAX_IN_CLAUSE_VALUES):
                     self._parents.delete(self._where_in("parent_id", id_batch))
+                self._parents.add(records)
             except Exception as exc:
                 logger.critical(
-                    "Upsert delete failed for parents table; aborting to prevent duplicates. "
+                    "Safe upsert failed for parents table; attempting rollback. "
                     "table=%s ids_count=%d error=%s",
                     self._PARENTS_TABLE,
                     len(ids),
                     exc,
                 )
+                try:
+                    if existing_rows:
+                        self._parents.add(existing_rows)
+                        logger.info(
+                            "Rollback restored %d existing parent rows for table '%s'",
+                            len(existing_rows),
+                            self._PARENTS_TABLE,
+                        )
+                except Exception as rollback_exc:
+                    logger.critical(
+                        "Rollback failed for parents table after safe upsert error. "
+                        "table=%s ids_count=%d rollback_error=%s",
+                        self._PARENTS_TABLE,
+                        len(ids),
+                        rollback_exc,
+                    )
                 raise
-            self._parents.add(records)
+
+    @staticmethod
+    def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in metadata.items()
+            if value is not None and not (isinstance(value, str) and value == "")
+        }
 
     def add_children(
         self,
@@ -316,7 +355,7 @@ class StorageEngine:
                         "header_path": row.get("header_path", ""),
                         "parent_id": row.get("parent_id", ""),
                     }
-                    meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+                    meta = self._clean_metadata(meta)
                     result[child_id] = {"text": row.get("text", ""), "metadata": meta}
         except Exception:
             return {}
@@ -402,7 +441,7 @@ class StorageEngine:
                 "header_path": row.get("header_path", ""),
                 "parent_id": row.get("parent_id", ""),
             }
-            meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+            meta = self._clean_metadata(meta)
             results.append({
                 "id": row.get("id", ""),
                 "text": row.get("text", ""),
@@ -530,56 +569,28 @@ class StorageEngine:
         # Delete child chunks
         if self._table is not None:
             try:
-                # Check if any children exist first
-                rows = (
-                    self._table
-                    .search()
-                    .where(self._where_eq("source_id", sid), prefilter=True)
-                    .select(["id"])
-                    .limit(1)
-                    .to_list()
-                )
-                if rows:
-                    self._table.delete(self._where_eq("source_id", sid))
-                    self._mark_fts_dirty(0)
-                    deleted_any = True
-                    logger.info("Deleted children for source '%s'", sid)
+                self._table.delete(self._where_eq("source_id", sid))
+                self._mark_fts_dirty(0)
+                deleted_any = True
+                logger.info("Deleted children for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete children for source '%s': %s", sid, exc)
 
         # Delete parent chunks
         if self._parents is not None:
             try:
-                rows = (
-                    self._parents
-                    .search()
-                    .where(self._where_eq("source_id", sid), prefilter=True)
-                    .select(["parent_id"])
-                    .limit(1)
-                    .to_list()
-                )
-                if rows:
-                    self._parents.delete(self._where_eq("source_id", sid))
-                    deleted_any = True
-                    logger.info("Deleted parents for source '%s'", sid)
+                self._parents.delete(self._where_eq("source_id", sid))
+                deleted_any = True
+                logger.info("Deleted parents for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete parents for source '%s': %s", sid, exc)
 
         # Delete summary
         if self._summaries is not None:
             try:
-                rows = (
-                    self._summaries
-                    .search()
-                    .where(self._where_eq("source_id", sid), prefilter=True)
-                    .select(["source_id"])
-                    .limit(1)
-                    .to_list()
-                )
-                if rows:
-                    self._summaries.delete(self._where_eq("source_id", sid))
-                    deleted_any = True
-                    logger.info("Deleted summary for source '%s'", sid)
+                self._summaries.delete(self._where_eq("source_id", sid))
+                deleted_any = True
+                logger.info("Deleted summary for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete summary for source '%s': %s", sid, exc)
 
