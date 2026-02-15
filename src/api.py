@@ -86,8 +86,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _engine: Optional[object] = None  # Will be RagEngine once loaded
-_chat_lock: asyncio.Lock = asyncio.Lock()
-_ingest_lock: asyncio.Lock = asyncio.Lock()
+_engine_init_lock = threading.Lock()
 _engine_loaded: bool = False
 
 
@@ -99,12 +98,21 @@ def _get_engine():
 
     from .rag_engine import RagEngine, RagEngineConfig
 
-    logger.info("Initializing RagEngine...")
-    config = RagEngineConfig()
-    _engine = RagEngine(config)
-    _engine_loaded = True
-    logger.info("RagEngine initialized successfully")
-    return _engine
+    with _engine_init_lock:
+        if _engine is not None:
+            return _engine
+        try:
+            logger.info("Initializing RagEngine...")
+            config = RagEngineConfig()
+            _engine = RagEngine(config)
+            _engine_loaded = True
+            logger.info("RagEngine initialized successfully")
+            return _engine
+        except Exception:
+            _engine = None
+            _engine_loaded = False
+            logger.exception("RagEngine initialization failed")
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +309,7 @@ async def _chat_stream_generator(
                 query_text,
                 source_id=source_id,
                 citations_enabled=citations_enabled,
-                should_stop=stop_event.is_set,
+                should_stop=lambda: stop_event.is_set(),
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
@@ -358,43 +366,26 @@ async def _chat_stream_generator(
 async def chat(request: Request, chat_request: ChatRequest):
     """Stream a chat response using the AI SDK Data Stream Protocol.
 
-    Enforces single-user concurrency via ``chat_lock``. Returns 429 if
-    another query is already in progress.
+    Streams responses without server-side chat request locking.
     """
     logger.info("Chat: request received")
-    if _chat_lock.locked():
-        return JSONResponse(
-            status_code=429,
-            content=http_error_body(
-                "LOCK_BUSY", "Another query is already in progress"
-            ),
-        )
 
     stop_event = threading.Event()
 
     async def guarded_stream() -> AsyncGenerator[bytes, None]:
-        """Stream with lock acquisition, disconnect detection, and cleanup."""
-        async with _acquire_chat_lock():
-            gen = _chat_stream_generator(request, chat_request, stop_event)
-            try:
-                async for line in gen:
-                    # Periodically check for client disconnect
-                    if await request.is_disconnected():
-                        stop_event.set()
-                        return
-                    yield line.encode("utf-8")
-            except asyncio.CancelledError:
-                stop_event.set()
-            finally:
-                stop_event.set()
-
-    @asynccontextmanager
-    async def _acquire_chat_lock():
-        await _chat_lock.acquire()
+        """Stream with disconnect detection and cleanup."""
+        gen = _chat_stream_generator(request, chat_request, stop_event)
         try:
-            yield
+            async for line in gen:
+                # Periodically check for client disconnect
+                if await request.is_disconnected():
+                    stop_event.set()
+                    return
+                yield line.encode("utf-8")
+        except asyncio.CancelledError:
+            stop_event.set()
         finally:
-            _chat_lock.release()
+            stop_event.set()
 
     return StreamingResponse(
         guarded_stream(),
@@ -422,7 +413,7 @@ async def _query_sse_event_generator(
                 query_request.query,
                 source_id=source_id,
                 citations_enabled=query_request.citations_enabled,
-                should_stop=stop_event.is_set,
+                should_stop=lambda: stop_event.is_set(),
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
@@ -513,44 +504,34 @@ async def query_endpoint(request: Request, query_request: QueryRequest):
     When ``stream=true``, returns text/event-stream events for status + tokens.
     Otherwise returns a single JSON payload.
     """
-    if _chat_lock.locked():
-        return JSONResponse(
-            status_code=429,
-            content=http_error_body(
-                "LOCK_BUSY", "Another query is already in progress"
-            ),
-        )
-
     source_id = None
     if query_request.source_ids and len(query_request.source_ids) == 1:
         source_id = query_request.source_ids[0]
 
     if not query_request.stream:
-        async with _chat_lock:
-            result = await asyncio.to_thread(
-                _get_engine().query,
-                query_request.query,
-                source_id=source_id,
-                citations_enabled=query_request.citations_enabled,
-            )
-            return QueryResponse(
-                answer=result.answer,
-                citations=[],
-                source_ids=result.source_ids,
-                metrics={
-                    "completion_tokens": 0,
-                    "finish_reason": "stop",
-                },
-            )
+        result = await asyncio.to_thread(
+            _get_engine().query,
+            query_request.query,
+            source_id=source_id,
+            citations_enabled=query_request.citations_enabled,
+        )
+        return QueryResponse(
+            answer=result.answer,
+            citations=[],
+            source_ids=result.source_ids,
+            metrics={
+                "completion_tokens": 0,
+                "finish_reason": "stop",
+            },
+        )
 
     stop_event = threading.Event()
 
     async def guarded_event_stream() -> AsyncGenerator[dict[str, str], None]:
-        async with _chat_lock:
-            async for event in _query_sse_event_generator(
-                request, query_request, stop_event
-            ):
-                yield event
+        async for event in _query_sse_event_generator(
+            request, query_request, stop_event
+        ):
+            yield event
 
     return EventSourceResponse(
         guarded_event_stream(),
@@ -626,45 +607,44 @@ async def ingest_source(request: IngestRequest):
         )
 
     try:
-        async with _ingest_lock:
-            engine = await asyncio.to_thread(_get_engine)
+        engine = await asyncio.to_thread(_get_engine)
 
-            # Run ingest in thread (blocking operation)
-            result = await asyncio.to_thread(
-                engine.ingest,  # type: ignore[union-attr]
-                file_path,
-                source_id=source_id,
-                summarize=request.summarize,
-            )
+        # Run ingest in thread (blocking operation)
+        result = await asyncio.to_thread(
+            engine.ingest,  # type: ignore[union-attr]
+            file_path,
+            source_id=source_id,
+            summarize=request.summarize,
+        )
 
-            # Create text snapshot for /content endpoint
-            snapshot_path = ""
-            try:
-                # Collect parent texts for the snapshot
-                storage = engine.storage  # type: ignore[union-attr]
-                parent_texts = storage.get_parent_texts_by_source(source_id=source_id)
-                if parent_texts:
-                    full_text = "\n\n".join(parent_texts)
-                    snapshot_path = await asyncio.to_thread(
-                        save_snapshot, source_id, full_text
-                    )
-            except Exception as snap_exc:
-                logger.warning("Failed to create snapshot for %s: %s", source_id, snap_exc)
+        # Create text snapshot for /content endpoint
+        snapshot_path = ""
+        try:
+            # Collect parent texts for the snapshot
+            storage = engine.storage  # type: ignore[union-attr]
+            parent_texts = storage.get_parent_texts_by_source(source_id=source_id)
+            if parent_texts:
+                full_text = "\n\n".join(parent_texts)
+                snapshot_path = await asyncio.to_thread(
+                    save_snapshot, source_id, full_text
+                )
+        except Exception as snap_exc:
+            logger.warning("Failed to create snapshot for %s: %s", source_id, snap_exc)
 
-            # Update the summary record with file paths (schema v2)
-            try:
-                storage = engine.storage  # type: ignore[union-attr]
-                summaries = storage.get_source_summaries()
-                summary_text = summaries.get(source_id, "")
-                if summary_text:
-                    storage.upsert_source_summary(
-                        source_id=source_id,
-                        summary=summary_text,
-                        source_path=str(Path(file_path).resolve()),
-                        snapshot_path=snapshot_path,
-                    )
-            except Exception as path_exc:
-                logger.warning("Failed to update source paths for %s: %s", source_id, path_exc)
+        # Update the summary record with file paths (schema v2)
+        try:
+            storage = engine.storage  # type: ignore[union-attr]
+            summaries = storage.get_source_summaries()
+            summary_text = summaries.get(source_id, "")
+            if summary_text:
+                storage.upsert_source_summary(
+                    source_id=source_id,
+                    summary=summary_text,
+                    source_path=str(Path(file_path).resolve()),
+                    snapshot_path=snapshot_path,
+                )
+        except Exception as path_exc:
+            logger.warning("Failed to update source paths for %s: %s", source_id, path_exc)
 
         return IngestResponse(
             source_id=result.source_id,
@@ -756,44 +736,43 @@ async def upload_source(
     logger.info("Saved upload to %s (%d bytes)", dest, len(contents))
 
     try:
-        async with _ingest_lock:
-            engine = await asyncio.to_thread(_get_engine)
+        engine = await asyncio.to_thread(_get_engine)
 
-            # Run ingest in thread (blocking operation)
-            result = await asyncio.to_thread(
-                engine.ingest,  # type: ignore[union-attr]
-                str(dest),
-                source_id=sid,
-                summarize=summarize,
-            )
+        # Run ingest in thread (blocking operation)
+        result = await asyncio.to_thread(
+            engine.ingest,  # type: ignore[union-attr]
+            str(dest),
+            source_id=sid,
+            summarize=summarize,
+        )
 
-            # Create text snapshot for /content endpoint
-            snapshot_path = ""
-            try:
-                storage = engine.storage  # type: ignore[union-attr]
-                parent_texts = storage.get_parent_texts_by_source(source_id=sid)
-                if parent_texts:
-                    full_text = "\n\n".join(parent_texts)
-                    snapshot_path = await asyncio.to_thread(
-                        save_snapshot, sid, full_text
-                    )
-            except Exception as snap_exc:
-                logger.warning("Failed to create snapshot for %s: %s", sid, snap_exc)
+        # Create text snapshot for /content endpoint
+        snapshot_path = ""
+        try:
+            storage = engine.storage  # type: ignore[union-attr]
+            parent_texts = storage.get_parent_texts_by_source(source_id=sid)
+            if parent_texts:
+                full_text = "\n\n".join(parent_texts)
+                snapshot_path = await asyncio.to_thread(
+                    save_snapshot, sid, full_text
+                )
+        except Exception as snap_exc:
+            logger.warning("Failed to create snapshot for %s: %s", sid, snap_exc)
 
-            # Update the summary record with file paths (schema v2)
-            try:
-                storage = engine.storage  # type: ignore[union-attr]
-                summaries = storage.get_source_summaries()
-                summary_text = summaries.get(sid, "")
-                if summary_text:
-                    storage.upsert_source_summary(
-                        source_id=sid,
-                        summary=summary_text,
-                        source_path=str(dest.resolve()),
-                        snapshot_path=snapshot_path,
-                    )
-            except Exception as path_exc:
-                logger.warning("Failed to update source paths for %s: %s", sid, path_exc)
+        # Update the summary record with file paths (schema v2)
+        try:
+            storage = engine.storage  # type: ignore[union-attr]
+            summaries = storage.get_source_summaries()
+            summary_text = summaries.get(sid, "")
+            if summary_text:
+                storage.upsert_source_summary(
+                    source_id=sid,
+                    summary=summary_text,
+                    source_path=str(dest.resolve()),
+                    snapshot_path=snapshot_path,
+                )
+        except Exception as path_exc:
+            logger.warning("Failed to update source paths for %s: %s", sid, path_exc)
 
         return IngestResponse(
             source_id=result.source_id,

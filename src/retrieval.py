@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import heapq
 import logging
+import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import Any, Optional
 
 from .config import ModelConfig
@@ -24,6 +28,14 @@ _BOILERPLATE_PATTERNS = (
     "i do not have moral beliefs",
     "i cannot be considered",
 )
+_BOILERPLATE_REGEX = re.compile(
+    "|".join(re.escape(pattern) for pattern in _BOILERPLATE_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+def _is_boilerplate(text: str) -> bool:
+    return bool(_BOILERPLATE_REGEX.search(text))
 
 
 def format_chunk_for_citation(
@@ -109,6 +121,30 @@ class RetrievalEngine:
         self._embedding_model = embedding_model
         self._reranker = reranker
         self._config = config
+        self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_cache_max_size = 100
+
+    def _get_query_embedding(self, query: str) -> list[float]:
+        cached = self._query_cache.get(query)
+        if cached is not None:
+            self._query_cache.move_to_end(query)
+            return cached
+
+        try:
+            embeddings = self._embedding_model.encode(
+                [query],
+                normalize_embeddings=True,
+            )
+            embedding = embeddings[0].tolist() if hasattr(embeddings[0], "tolist") else list(embeddings[0])
+            embedding = [float(value) for value in embedding]
+        except Exception as exc:  # pragma: no cover - dependency runtime
+            raise RuntimeError("Embedding model encode failed.") from exc
+
+        self._query_cache[query] = embedding
+        self._query_cache.move_to_end(query)
+        if len(self._query_cache) > self._query_cache_max_size:
+            self._query_cache.popitem(last=False)
+        return embedding
 
     def _hybrid_search(
         self,
@@ -120,14 +156,7 @@ class RetrievalEngine:
         """Single-call hybrid search via LanceDB (vector ANN + FTS BM25 + RRF)."""
         if not query.strip():
             raise ValueError("query must be a non-empty string.")
-        try:
-            embeddings = self._embedding_model.encode(
-                [query],
-                normalize_embeddings=True,
-            )
-            query_vector = embeddings[0].tolist() if hasattr(embeddings[0], "tolist") else list(embeddings[0])
-        except Exception as exc:  # pragma: no cover - dependency runtime
-            raise RuntimeError("Embedding model encode failed.") from exc
+        query_vector = self._get_query_embedding(query)
 
         return self._storage.hybrid_search(
             query_text=query,
@@ -147,7 +176,9 @@ class RetrievalEngine:
         no_parent_items: list[dict[str, Any]] = []
 
         for item in items:
-            metadata = item.get("metadata") or {}
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             parent_id = metadata.get("parent_id")
 
             if not isinstance(parent_id, str):
@@ -160,10 +191,9 @@ class RetrievalEngine:
                 seen_parents[parent_id] = item
 
         deduplicated = list(seen_parents.values()) + no_parent_items
-        deduplicated.sort(key=lambda x: x.get("score", 0), reverse=True)
         deduplicated_count = len(deduplicated)
         dedup_removed_count = max(0, before_count - deduplicated_count)
-        top_k_limited = deduplicated[:top_k]
+        top_k_limited = heapq.nlargest(top_k, deduplicated, key=itemgetter("score"))
 
         metrics = DeduplicationMetrics(
             children_before_dedup=before_count,
@@ -203,7 +233,7 @@ class RetrievalEngine:
             {**item, "rerank_score": float(score)}
             for item, score in zip(items, scores)
         ]
-        reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
+        reranked.sort(key=itemgetter("rerank_score"), reverse=True)
         return reranked, raw_scores
 
     def search(
@@ -250,15 +280,21 @@ class RetrievalEngine:
         # Stage 3: Enrich with parent text for reranking
         parent_ids = {
             metadata.get("parent_id")
-            for metadata in (item.get("metadata") or {} for item in deduped)
+            for metadata in (
+                item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                for item in deduped
+            )
             if isinstance(metadata.get("parent_id"), str) and metadata.get("parent_id")
         }
         parent_cache = self._storage.get_parent_texts(parent_ids)
         for item in deduped:
-            metadata = item.get("metadata") or {}
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             parent_id = metadata.get("parent_id")
             if isinstance(parent_id, str) and parent_id in parent_cache:
                 item["rerank_text"] = parent_cache[parent_id]
+                item["parent_text"] = parent_cache[parent_id]
 
         # Stage 4: Rerank
         t0 = time.perf_counter()
@@ -320,15 +356,17 @@ class RetrievalEngine:
         seen_parents: set[str] = set()
         seen_children: set[str] = set()
         for item in reranked:
-            text_for_filter = (item.get("rerank_text") or item.get("text") or "").lower()
-            if any(pat in text_for_filter for pat in _BOILERPLATE_PATTERNS):
+            text_for_filter = item.get("rerank_text") or item.get("text") or ""
+            if _is_boilerplate(text_for_filter):
                 continue
             child_id = item.get("id")
             if isinstance(child_id, str):
                 if child_id in seen_children:
                     continue
                 seen_children.add(child_id)
-            metadata = item.get("metadata") or {}
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             parent_id = metadata.get("parent_id")
             if isinstance(parent_id, str):
                 if parent_id in seen_parents:
@@ -338,20 +376,15 @@ class RetrievalEngine:
             if len(final) >= k_final:
                 break
 
-        final_parent_ids = {
-            metadata.get("parent_id")
-            for metadata in (item.get("metadata") or {} for item in final)
-            if isinstance(metadata.get("parent_id"), str) and metadata.get("parent_id")
-        }
-        missing_parent_ids = [pid for pid in final_parent_ids if pid not in parent_cache]
-        if missing_parent_ids:
-            parent_cache.update(self._storage.get_parent_texts(missing_parent_ids))
-
         results: list[RetrievalResult] = []
         for item in final:
-            metadata = item.get("metadata") or {}
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
             parent_id = metadata.get("parent_id")
-            parent_text = parent_cache.get(parent_id) if isinstance(parent_id, str) else None
+            parent_text = item.get("parent_text")
+            if parent_text is None and isinstance(parent_id, str):
+                parent_text = parent_cache.get(parent_id)
             results.append(RetrievalResult(
                 child_id=item["id"], text=item.get("text", ""), metadata=metadata,
                 score=float(item.get("rerank_score", item.get("score", 0.0))), parent_text=parent_text,
