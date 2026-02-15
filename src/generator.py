@@ -27,6 +27,10 @@ DEFAULT_STOP_TOKENS = [
     "This response reflects", "This response was",
 ]
 
+STREAM_BUFFER_LIMIT_CHARS = 500
+STREAM_TAIL_GUARD_CHARS = 128
+SENTENCE_BOUNDARY_REGEX = re.compile(r"[.!?][\s\n]+")
+
 
 class MlxGenerator:
     """MLX-LM based text generator with KVCache for context warming."""
@@ -34,6 +38,11 @@ class MlxGenerator:
     def __init__(self, model_path: str) -> None:
         self._model_id = model_path
         self._make_prompt_cache = None
+        self._thinking_open_tag = "<think>"
+        self._thinking_close_tag = "</think>"
+        self._thinking_block_pattern = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+        self._stop_token_pattern_cache: dict[tuple[str, ...], re.Pattern[str]] = {}
+        self._default_stop_pattern = self._compile_stop_tokens_pattern(DEFAULT_STOP_TOKENS)
         try:
             from mlx_lm import load
             self._model, self._tokenizer = load(model_path)
@@ -50,6 +59,187 @@ class MlxGenerator:
                 self._make_prompt_cache = None
         except Exception as exc:
             raise RuntimeError(f"Failed to load mlx-lm model at {model_path}") from exc
+
+    @staticmethod
+    def _compile_stop_tokens_pattern(stop_tokens: list[str]) -> Optional[re.Pattern[str]]:
+        if not stop_tokens:
+            return None
+        escaped = [re.escape(token) for token in stop_tokens if token]
+        if not escaped:
+            return None
+        return re.compile("|".join(escaped))
+
+    def _get_stop_tokens_pattern(self, stop_tokens: list[str]) -> Optional[re.Pattern[str]]:
+        stop_tuple = tuple(stop_tokens)
+        if stop_tuple == tuple(DEFAULT_STOP_TOKENS):
+            return self._default_stop_pattern
+        pattern = self._stop_token_pattern_cache.get(stop_tuple)
+        if pattern is None:
+            pattern = self._compile_stop_tokens_pattern(stop_tokens)
+            if pattern is not None:
+                self._stop_token_pattern_cache[stop_tuple] = pattern
+        return pattern
+
+    def _resolve_generation_inputs(
+        self,
+        prompt: str,
+        config: Optional[GenerationConfig],
+    ) -> tuple[int, float, float, Optional[float], list[str], int]:
+        cfg = config or GenerationConfig()
+        model_size = self._infer_model_size_b(self._model_id)
+        max_tokens = cfg.max_tokens
+        repetition_penalty = cfg.repetition_penalty
+        temperature = cfg.temperature
+        top_p = cfg.top_p
+
+        if model_size is not None:
+            if model_size < 30:
+                repetition_penalty = repetition_penalty or 1.25
+                temperature = temperature or 0.05
+                top_p = top_p or 0.7
+            elif model_size >= 70:
+                repetition_penalty = repetition_penalty or 1.15
+                temperature = temperature or 0.2
+                top_p = top_p or 0.9
+            else:
+                repetition_penalty = repetition_penalty or 1.15
+                temperature = temperature or 0.15
+                top_p = top_p or 0.9
+        else:
+            temperature = temperature or 0.2
+            top_p = top_p or 0.9
+
+        stop_tokens = cfg.stop_tokens if cfg.stop_tokens is not None else DEFAULT_STOP_TOKENS
+        final_max_tokens = max_tokens if max_tokens is not None else 1200
+        prompt_tokens = count_tokens(prompt, self._tokenizer)
+
+        ctx_limit = cfg.context_window
+        if ctx_limit and prompt_tokens > int(ctx_limit * 0.8):
+            logger.warning(
+                "High prompt token count: %d tokens (%.0f%% of %dk context window). "
+                "Consider reducing context.",
+                prompt_tokens,
+                100 * prompt_tokens / ctx_limit,
+                ctx_limit // 1000,
+            )
+
+        return final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens
+
+    def _build_generation_kwargs(
+        self,
+        *,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: Optional[float],
+    ) -> dict[str, Any]:
+        from mlx_lm.generate import make_sampler
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        logits_processors = []
+        if repetition_penalty is not None:
+            processor = self._build_repetition_penalty_processor(repetition_penalty)
+            if processor is not None:
+                logits_processors.append(processor)
+
+        generate_kwargs: dict[str, Any] = dict(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors or None,
+        )
+        if self._make_prompt_cache is not None:
+            try:
+                cache = self._make_prompt_cache(self._model)
+                generate_kwargs["prompt_cache"] = cache
+            except (ImportError, AttributeError, TypeError):
+                pass
+        return generate_kwargs
+
+    def _generate_full_text(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: Optional[float],
+        stop_tokens: list[str],
+        prompt_tokens: int,
+    ) -> str:
+        generate_kwargs = self._build_generation_kwargs(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        try:
+            from mlx_lm.generate import stream_generate
+
+            start_time = time.perf_counter()
+            text_parts: list[str] = []
+            response = None
+
+            for response in stream_generate(**generate_kwargs):
+                text_parts.append(response.text)
+
+            elapsed_s = time.perf_counter() - start_time
+            output = "".join(text_parts)
+            output = self._apply_stop_tokens(output, stop_tokens)
+            output_tokens = count_tokens(output, self._tokenizer)
+            total_tokens = prompt_tokens + output_tokens
+
+            if response is not None:
+                logger.info(
+                    "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
+                    "time_s=%.2f prefill_tps=%.1f decode_tps=%.1f peak_memory_gb=%.2f",
+                    self._model_id,
+                    response.prompt_tokens,
+                    output_tokens,
+                    total_tokens,
+                    elapsed_s,
+                    response.prompt_tps,
+                    response.generation_tps,
+                    response.peak_memory,
+                )
+            else:
+                logger.info(
+                    "LLM generation | model=%s prompt_tokens=%d output_tokens=%d "
+                    "time_s=%.2f (no stream response)",
+                    self._model_id, prompt_tokens, output_tokens, elapsed_s,
+                )
+            return output
+        except ImportError:
+            pass
+
+        try:
+            from mlx_lm import generate
+        except Exception as exc:
+            raise RuntimeError("mlx-lm generate is not available.") from exc
+
+        try:
+            start_time = time.perf_counter()
+            output = generate(**generate_kwargs)
+            elapsed_s = time.perf_counter() - start_time
+
+            output = self._apply_stop_tokens(output, stop_tokens)
+            output_tokens = count_tokens(output, self._tokenizer)
+            total_tokens = prompt_tokens + output_tokens
+            elapsed_safe = max(elapsed_s, 1e-6)
+            tokens_per_sec = output_tokens / elapsed_safe
+            logger.info(
+                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
+                "time_s=%.2f tokens_per_s=%.2f",
+                self._model_id, prompt_tokens, output_tokens, total_tokens,
+                elapsed_s, tokens_per_sec,
+            )
+            return output
+        except Exception as exc:
+            raise RuntimeError("mlx-lm generation failed.") from exc
 
     @property
     def tokenizer(self) -> Any:
@@ -123,197 +313,18 @@ class MlxGenerator:
         if not prompt.strip():
             raise ValueError("prompt must be a non-empty string.")
 
-        cfg = config or GenerationConfig()
-        model_size = self._infer_model_size_b(self._model_id)
-        max_tokens = cfg.max_tokens
-        repetition_penalty = cfg.repetition_penalty
-        temperature = cfg.temperature
-        top_p = cfg.top_p
-
-        if model_size is not None:
-            if model_size < 30:
-                max_tokens = max_tokens or 140
-                repetition_penalty = repetition_penalty or 1.25
-                temperature = temperature or 0.05
-                top_p = top_p or 0.7
-            elif model_size >= 70:
-                repetition_penalty = repetition_penalty or 1.15
-                temperature = temperature or 0.2
-                top_p = top_p or 0.9
-            else:
-                max_tokens = max_tokens or 400
-                repetition_penalty = repetition_penalty or 1.15
-                temperature = temperature or 0.15
-                top_p = top_p or 0.9
-        else:
-            temperature = temperature or 0.2
-            top_p = top_p or 0.9
-
-        # Collect stop tokens
-        stop_tokens = cfg.stop_tokens if cfg.stop_tokens is not None else DEFAULT_STOP_TOKENS
-
-        # IMPORTANT: Always pass explicit max_tokens to override mlx-lm's hidden 256 default
-        # Use 1200 tokens (~900 words) for long-form academic answers when not specified
-        final_max_tokens = max_tokens if max_tokens is not None else 1200
-        prompt_tokens = count_tokens(prompt, self._tokenizer)
-
-        # Warn if approaching the active mode's context window limit
-        ctx_limit = cfg.context_window
-        if ctx_limit and prompt_tokens > int(ctx_limit * 0.8):
-            logger.warning(
-                "High prompt token count: %d tokens (%.0f%% of %dk context window). "
-                "Consider reducing context.",
-                prompt_tokens,
-                100 * prompt_tokens / ctx_limit,
-                ctx_limit // 1000,
-            )
-
-        # Use stream_generate for separated prefill/decode metrics and peak memory.
-        # Falls back to the legacy generate() path if stream_generate is unavailable.
-        try:
-            from mlx_lm.generate import stream_generate, make_sampler
-            return self._generate_streaming(
-                prompt, final_max_tokens, temperature, top_p,
-                repetition_penalty, stop_tokens, prompt_tokens,
-            )
-        except ImportError:
-            pass
-
-        # Legacy fallback for older mlx-lm versions
-        return self._generate_legacy(
-            prompt, final_max_tokens, temperature, top_p,
-            repetition_penalty, stop_tokens, prompt_tokens,
+        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+            self._resolve_generation_inputs(prompt, config)
         )
-
-    def _generate_streaming(
-        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
-        repetition_penalty: Optional[float], stop_tokens: list[str],
-        prompt_tokens: int,
-    ) -> str:
-        """Primary generation path using stream_generate for accurate metrics.
-
-        stream_generate provides:
-        - Separated prefill_tps vs generation_tps (no more conflated timing)
-        - peak_memory tracking via mx.get_peak_memory()
-        - Proper EOS handling
-        """
-        from mlx_lm.generate import stream_generate, make_sampler
-
-        sampler = make_sampler(temp=temperature, top_p=top_p)
-        logits_processors = []
-        if repetition_penalty is not None:
-            processor = self._build_repetition_penalty_processor(repetition_penalty)
-            if processor is not None:
-                logits_processors.append(processor)
-
-        generate_kwargs: dict = dict(
-            sampler=sampler,
-            logits_processors=logits_processors or None,
+        return self._generate_full_text(
+            prompt,
+            final_max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            stop_tokens,
+            prompt_tokens,
         )
-        if self._make_prompt_cache is not None:
-            try:
-                cache = self._make_prompt_cache(self._model)
-                generate_kwargs["prompt_cache"] = cache
-            except (ImportError, AttributeError, TypeError):
-                pass
-
-        start_time = time.perf_counter()
-        text_parts: list[str] = []
-        response = None
-
-        for response in stream_generate(
-            model=self._model,
-            tokenizer=self._tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            **generate_kwargs,
-        ):
-            text_parts.append(response.text)
-
-        elapsed_s = time.perf_counter() - start_time
-        output = "".join(text_parts)
-
-        # Apply stop token truncation
-        output = self._apply_stop_tokens(output, stop_tokens)
-        output_tokens = count_tokens(output, self._tokenizer)
-        total_tokens = prompt_tokens + output_tokens
-
-        # Log with separated prefill/decode metrics
-        if response is not None:
-            logger.info(
-                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
-                "time_s=%.2f prefill_tps=%.1f decode_tps=%.1f peak_memory_gb=%.2f",
-                self._model_id,
-                response.prompt_tokens,
-                output_tokens,
-                total_tokens,
-                elapsed_s,
-                response.prompt_tps,
-                response.generation_tps,
-                response.peak_memory,
-            )
-        else:
-            logger.info(
-                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d "
-                "time_s=%.2f (no stream response)",
-                self._model_id, prompt_tokens, output_tokens, elapsed_s,
-            )
-
-        return output
-
-    def _generate_legacy(
-        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
-        repetition_penalty: Optional[float], stop_tokens: list[str],
-        prompt_tokens: int,
-    ) -> str:
-        """Fallback generation for older mlx-lm without stream_generate."""
-        try:
-            from mlx_lm import generate
-            from mlx_lm.generate import make_sampler
-        except Exception as exc:
-            raise RuntimeError("mlx-lm generate is not available.") from exc
-
-        try:
-            sampler = make_sampler(temp=temperature, top_p=top_p)
-            logits_processors = []
-            if repetition_penalty is not None:
-                processor = self._build_repetition_penalty_processor(repetition_penalty)
-                if processor is not None:
-                    logits_processors.append(processor)
-
-            generate_kwargs = dict(
-                model=self._model,
-                tokenizer=self._tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                logits_processors=logits_processors or None,
-            )
-            if self._make_prompt_cache is not None:
-                try:
-                    cache = self._make_prompt_cache(self._model)
-                    generate_kwargs["prompt_cache"] = cache
-                except (ImportError, AttributeError, TypeError):
-                    pass
-
-            start_time = time.perf_counter()
-            output = generate(**generate_kwargs)
-            elapsed_s = time.perf_counter() - start_time
-
-            output = self._apply_stop_tokens(output, stop_tokens)
-            output_tokens = count_tokens(output, self._tokenizer)
-            total_tokens = prompt_tokens + output_tokens
-            elapsed_safe = max(elapsed_s, 1e-6)
-            tokens_per_sec = output_tokens / elapsed_safe
-            logger.info(
-                "LLM generation | model=%s prompt_tokens=%d output_tokens=%d total_tokens=%d "
-                "time_s=%.2f tokens_per_s=%.2f",
-                self._model_id, prompt_tokens, output_tokens, total_tokens,
-                elapsed_s, tokens_per_sec,
-            )
-            return output
-        except Exception as exc:
-            raise RuntimeError("mlx-lm generation failed.") from exc
 
     def generate_chat(
         self,
@@ -325,7 +336,18 @@ class MlxGenerator:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
         prompt = self._apply_chat_template(messages)
-        output = self.generate(prompt, config=config)
+        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+            self._resolve_generation_inputs(prompt, config)
+        )
+        output = self._generate_full_text(
+            prompt,
+            final_max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
+            stop_tokens,
+            prompt_tokens,
+        )
         return self._strip_thinking_blocks(output)
 
     def generate_chat_stream(
@@ -361,49 +383,12 @@ class MlxGenerator:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
         prompt = self._apply_chat_template(messages)
-
-        cfg = config or GenerationConfig()
-        model_size = self._infer_model_size_b(self._model_id)
-        max_tokens = cfg.max_tokens
-        repetition_penalty = cfg.repetition_penalty
-        temperature = cfg.temperature
-        top_p = cfg.top_p
-
-        if model_size is not None:
-            if model_size < 30:
-                max_tokens = max_tokens or 140
-                repetition_penalty = repetition_penalty or 1.25
-                temperature = temperature or 0.05
-                top_p = top_p or 0.7
-            elif model_size >= 70:
-                repetition_penalty = repetition_penalty or 1.15
-                temperature = temperature or 0.2
-                top_p = top_p or 0.9
-            else:
-                max_tokens = max_tokens or 400
-                repetition_penalty = repetition_penalty or 1.15
-                temperature = temperature or 0.15
-                top_p = top_p or 0.9
-        else:
-            temperature = temperature or 0.2
-            top_p = top_p or 0.9
-
-        stop_tokens = cfg.stop_tokens if cfg.stop_tokens is not None else DEFAULT_STOP_TOKENS
-        final_max_tokens = max_tokens if max_tokens is not None else 1200
-        prompt_tokens = count_tokens(prompt, self._tokenizer)
-
-        ctx_limit = cfg.context_window
-        if ctx_limit and prompt_tokens > int(ctx_limit * 0.8):
-            logger.warning(
-                "High prompt token count: %d tokens (%.0f%% of %dk context window). "
-                "Consider reducing context.",
-                prompt_tokens,
-                100 * prompt_tokens / ctx_limit,
-                ctx_limit // 1000,
-            )
+        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+            self._resolve_generation_inputs(prompt, config)
+        )
 
         try:
-            from mlx_lm.generate import stream_generate, make_sampler
+            from mlx_lm.generate import stream_generate
 
             yield from self._stream_tokens(
                 prompt, final_max_tokens, temperature, top_p,
@@ -412,7 +397,7 @@ class MlxGenerator:
             )
         except ImportError:
             # Fallback: generate full output, yield as single token
-            output = self._generate_legacy(
+            output = self._generate_full_text(
                 prompt, final_max_tokens, temperature, top_p,
                 repetition_penalty, stop_tokens, prompt_tokens,
             )
@@ -431,38 +416,33 @@ class MlxGenerator:
 
         Handles stop-token detection and thinking-block removal on the fly.
         """
-        from mlx_lm.generate import stream_generate, make_sampler
+        from mlx_lm.generate import stream_generate
 
-        sampler = make_sampler(temp=temperature, top_p=top_p)
-        logits_processors = []
-        if repetition_penalty is not None:
-            processor = self._build_repetition_penalty_processor(repetition_penalty)
-            if processor is not None:
-                logits_processors.append(processor)
-
-        generate_kwargs: dict = dict(
-            sampler=sampler,
-            logits_processors=logits_processors or None,
+        generate_kwargs = self._build_generation_kwargs(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
         )
-        if self._make_prompt_cache is not None:
-            try:
-                cache = self._make_prompt_cache(self._model)
-                generate_kwargs["prompt_cache"] = cache
-            except (ImportError, AttributeError, TypeError):
-                pass
+
+        stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
+        max_stop_len = max((len(token) for token in stop_tokens), default=0)
+        boundary_guard = max(
+            max_stop_len - 1,
+            len(self._thinking_open_tag) - 1,
+            len(self._thinking_close_tag) - 1,
+            0,
+        )
+        hidden_tail_guard = max(STREAM_TAIL_GUARD_CHARS, boundary_guard + 2)
 
         start_time = time.perf_counter()
         accumulated = ""
         in_thinking_block = False
         token_count = 0
+        stopped_on_stop_token = False
 
-        for response in stream_generate(
-            model=self._model,
-            tokenizer=self._tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            **generate_kwargs,
-        ):
+        for response in stream_generate(**generate_kwargs):
             # Check cooperative cancellation
             if should_stop is not None and should_stop():
                 logger.info("Generation stopped by should_stop callback")
@@ -472,47 +452,66 @@ class MlxGenerator:
             accumulated += token
             token_count += 1
 
-            # Handle <think>...</think> blocks — suppress tokens inside
-            if "<think>" in accumulated and not in_thinking_block:
-                in_thinking_block = True
-                # Don't yield anything inside thinking blocks
-                continue
             if in_thinking_block:
-                if "</think>" in accumulated:
-                    # Remove the entire thinking block from accumulated
-                    import re
-                    accumulated = re.sub(r"<think>.*?</think>", "", accumulated, flags=re.DOTALL).strip()
+                close_pos = accumulated.find(self._thinking_close_tag)
+                if close_pos == -1:
+                    if len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
+                        accumulated = accumulated[-hidden_tail_guard:]
+                    continue
+
+                accumulated = accumulated[close_pos + len(self._thinking_close_tag):]
+                in_thinking_block = False
+
+            open_pos = accumulated.find(self._thinking_open_tag)
+            if open_pos != -1:
+                visible_prefix = accumulated[:open_pos]
+                if visible_prefix:
+                    yield visible_prefix
+
+                accumulated = accumulated[open_pos + len(self._thinking_open_tag):]
+                in_thinking_block = True
+
+                close_pos = accumulated.find(self._thinking_close_tag)
+                if close_pos != -1:
+                    accumulated = accumulated[close_pos + len(self._thinking_close_tag):]
                     in_thinking_block = False
-                    # If there's remaining text after removing the block, yield it
-                    if accumulated:
-                        yield accumulated
-                        accumulated = ""
-                continue
+                else:
+                    continue
 
-            # Check for stop tokens in accumulated text
-            hit_stop = False
-            for stop in stop_tokens:
-                pos = accumulated.find(stop)
-                if pos != -1:
-                    # Yield text up to stop token, then abort
-                    before_stop = accumulated[:pos]
-                    if before_stop:
-                        yield token  # yield just this token's portion
-                    hit_stop = True
-                    break
-
-            if hit_stop:
+            stop_match = stop_pattern.search(accumulated) if stop_pattern is not None else None
+            if stop_match is not None:
+                full_content = accumulated[:stop_match.start()]
+                if full_content:
+                    yield full_content
+                stopped_on_stop_token = True
                 break
 
-            # Yield the token
-            if token:
-                yield token
+            if not in_thinking_block:
+                safe_emit_len = len(accumulated) - boundary_guard
+                if safe_emit_len > 0:
+                    emit_text = accumulated[:safe_emit_len]
+                    if emit_text:
+                        yield emit_text
+                    accumulated = accumulated[safe_emit_len:]
+                elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
+                    emit_text = accumulated[:-boundary_guard] if boundary_guard > 0 else accumulated
+                    if emit_text:
+                        yield emit_text
+                    accumulated = accumulated[-boundary_guard:] if boundary_guard > 0 else ""
+
+        if not in_thinking_block and accumulated:
+            final_content = accumulated
+            stop_match = stop_pattern.search(final_content) if stop_pattern is not None else None
+            if stop_match is not None:
+                final_content = final_content[:stop_match.start()]
+            if final_content:
+                yield final_content
 
         elapsed_s = time.perf_counter() - start_time
         logger.info(
             "LLM streaming generation | model=%s prompt_tokens=%d output_tokens=%d "
-            "time_s=%.2f",
-            self._model_id, prompt_tokens, token_count, elapsed_s,
+            "time_s=%.2f stopped_on_stop_token=%s",
+            self._model_id, prompt_tokens, token_count, elapsed_s, stopped_on_stop_token,
         )
 
     def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
@@ -548,23 +547,20 @@ class MlxGenerator:
         parts.append("Assistant:")
         return "\n\n".join(parts)
 
-    @staticmethod
-    def _strip_thinking_blocks(text: str) -> str:
+    def _strip_thinking_blocks(self, text: str) -> str:
         if not text:
             return text
-        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return self._thinking_block_pattern.sub("", text).strip()
 
-    @staticmethod
-    def _apply_stop_tokens(text: str, stop_tokens: list[str]) -> str:
+    def _apply_stop_tokens(self, text: str, stop_tokens: list[str]) -> str:
         """Truncate output at first stop token occurrence."""
-        if not stop_tokens:
+        stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
+        if stop_pattern is None:
             return text
-        earliest_pos = len(text)
-        for token in stop_tokens:
-            pos = text.find(token)
-            if pos != -1 and pos < earliest_pos:
-                earliest_pos = pos
-        return text[:earliest_pos].rstrip()
+        match = stop_pattern.search(text)
+        if match is None:
+            return text
+        return text[:match.start()].rstrip()
 
 
 def count_tokens(text: str, tokenizer: Any) -> int:
@@ -666,15 +662,14 @@ def _truncate_to_tokens(text: str, target_tokens: int, tokenizer: Any, *, tolera
     search_region = text[search_start:min(len(text), char_estimate + 200)]
     best_pos: Optional[int] = None
 
-    for ending in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
-        relative_limit = max(0, min(char_estimate - search_start, len(search_region)))
-        if relative_limit == 0:
-            continue
-        pos = search_region.rfind(ending, 0, relative_limit)
-        if pos != -1:
-            candidate = search_start + pos + len(ending)
-            if candidate <= char_estimate and (best_pos is None or candidate > best_pos):
-                best_pos = candidate
+    relative_limit = max(0, min(char_estimate - search_start, len(search_region)))
+    if relative_limit > 0:
+        for match in SENTENCE_BOUNDARY_REGEX.finditer(search_region):
+            boundary_end = match.end()
+            if boundary_end <= relative_limit:
+                candidate = search_start + boundary_end
+                if best_pos is None or candidate > best_pos:
+                    best_pos = candidate
 
     truncated = text[:best_pos or char_estimate].rstrip()
     actual_tokens = count_tokens(truncated, tokenizer)
