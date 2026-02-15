@@ -924,7 +924,7 @@ class RagEngine:
             generator = self._ensure_generator()
 
         gen_config = GenerationConfig(
-            max_tokens=600 if cite else 1200,
+            max_tokens=1200,
             context_window=config.context_window,
         )
 
@@ -1301,7 +1301,7 @@ class RagEngine:
             generator = self._ensure_generator()
 
         gen_config = GenerationConfig(
-            max_tokens=600 if cite else 1200,
+            max_tokens=1200,
             context_window=config.context_window,
         )
 
