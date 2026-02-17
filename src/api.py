@@ -16,7 +16,6 @@ Architecture
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -26,7 +25,6 @@ from typing import AsyncGenerator, Optional
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sse_starlette.sse import EventSourceResponse
 
 from .api_schemas import (
     ChatRequest,
@@ -55,6 +53,7 @@ from .query_events import (
 from .stream_protocol import (
     annotation_error,
     annotation_error_with_metadata,
+    annotation_citations,
     annotation_intent,
     annotation_sources,
     annotation_status,
@@ -63,6 +62,7 @@ from .stream_protocol import (
     encode_finish_step,
     encode_text,
     http_error_body,
+    STREAM_HEADERS,
 )
 
 # Ensure chat/producer logs are visible under uvicorn
@@ -187,38 +187,12 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Chat stream: plain-text format for AI SDK Text Stream Protocol
+# Chat stream: AI SDK UI message stream protocol (SSE)
 # ---------------------------------------------------------------------------
-
-# Headers for useChat with TextStreamChatTransport (plain text, no data protocol)
-TEXT_STREAM_HEADERS: dict[str, str] = {
-    "Content-Type": "text/plain; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "X-Accel-Buffering": "no",
-}
-
-
-def _event_to_text_chunk(event: QueryEvent) -> Optional[str]:
-    """Convert a QueryEvent to a plain-text chunk for the text stream.
-
-    We send status events as lines so the client receives data during long
-    model-load phases and does not timeout. Text tokens and errors are sent as-is.
-    CitationListEvent is serialised as a ``CITATIONS:{json}`` line.
-    """
-    if isinstance(event, StatusEvent):
-        return event.status + "\n"
-    if isinstance(event, TextTokenEvent):
-        return event.token
-    if isinstance(event, CitationListEvent):
-        import json as _json
-        return f"CITATIONS:{_json.dumps(event.citations)}\n"
-    if isinstance(event, ErrorEvent):
-        return f"Error: {event.message}\n"
-    return None
 
 
 def _encode_event(event: QueryEvent) -> Optional[str]:
-    """Convert a QueryEvent to an AI SDK Data Stream Protocol line.
+    """Convert a QueryEvent to an AI SDK UI message stream line.
 
     Returns None for events that don't need a protocol line (shouldn't happen,
     but handles unexpected event types gracefully).
@@ -229,6 +203,8 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
         return annotation_intent(event.intent, event.confidence, event.method)
     elif isinstance(event, SourcesEvent):
         return annotation_sources(event.source_ids)
+    elif isinstance(event, CitationListEvent):
+        return annotation_citations(event.citations)
     elif isinstance(event, TextTokenEvent):
         return encode_text(event.token)
     elif isinstance(event, ErrorEvent):
@@ -243,6 +219,7 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
             encode_finish_step(event.finish_reason)
             + encode_finish_message(
                 event.finish_reason,
+                prompt_tokens=event.prompt_tokens,
                 completion_tokens=event.completion_tokens,
             )
         )
@@ -263,7 +240,7 @@ async def _chat_stream_generator(
     chat_request: ChatRequest,
     stop_event: threading.Event,
 ) -> AsyncGenerator[str, None]:
-    """Generate AI SDK Data Stream Protocol lines from query_events.
+    """Generate AI SDK UI message stream lines from query_events.
 
     Runs ``RagEngine.query_events()`` in a background thread. Events are
     pushed into an ``asyncio.Queue`` via ``loop.call_soon_threadsafe`` and
@@ -277,13 +254,15 @@ async def _chat_stream_generator(
     query_text = last_message.get_text().strip()
 
     if not query_text:
-        yield "Error: Empty query\n"
+        yield encode_error("Empty query")
+        yield encode_finish_step("error")
+        yield encode_finish_message("error")
         return
 
     # Send an immediate chunk so the client gets a first byte before model loading.
     # _get_engine() in the producer can take 30–60+ seconds on first request.
     logger.info("Chat stream: sending initial status (engine may load next)")
-    yield "Loading RAG engine…\n"
+    yield annotation_status("Loading RAG engine…")
 
     source_id = None
     citations_enabled = None
@@ -335,7 +314,7 @@ async def _chat_stream_generator(
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
             except asyncio.TimeoutError:
-                yield " \n"  # keepalive (space+newline) so client can ignore, connection stays open
+                yield ": ping\n\n"
                 continue
             if event is _SENTINEL:
                 break
@@ -343,7 +322,7 @@ async def _chat_stream_generator(
                 logger.info("Chat consumer: first event from producer (stream connected)")
                 first_event = False
 
-            chunk = _event_to_text_chunk(event)
+            chunk = _encode_event(event)
             if chunk:
                 yield chunk
 
@@ -352,7 +331,10 @@ async def _chat_stream_generator(
         logger.info("Chat stream consumer cancelled")
     except Exception as exc:
         logger.exception("Chat stream consumer error: %s", exc)
-        yield f"Error: {exc}\n"
+        yield annotation_error("INTERNAL", str(exc))
+        yield encode_error(str(exc))
+        yield encode_finish_step("error")
+        yield encode_finish_message("error")
     finally:
         stop_event.set()
         # Wait for producer thread to finish
@@ -389,16 +371,16 @@ async def chat(request: Request, chat_request: ChatRequest):
 
     return StreamingResponse(
         guarded_stream(),
-        headers=TEXT_STREAM_HEADERS,
+        headers=STREAM_HEADERS,
     )
 
 
-async def _query_sse_event_generator(
+async def _query_stream_generator(
     request: Request,
     query_request: QueryRequest,
     stop_event: threading.Event,
-) -> AsyncGenerator[dict[str, str], None]:
-    """Generate SSE events from ``RagEngine.query_events()``."""
+) -> AsyncGenerator[str, None]:
+    """Generate AI SDK UI message stream lines from ``RagEngine.query_events()``."""
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -439,56 +421,9 @@ async def _query_sse_event_generator(
             if event is _SENTINEL:
                 return
 
-            if isinstance(event, StatusEvent):
-                yield {
-                    "event": "status",
-                    "data": json.dumps({"message": event.status}),
-                }
-            elif isinstance(event, IntentEvent):
-                yield {
-                    "event": "intent",
-                    "data": json.dumps(
-                        {
-                            "intent": event.intent,
-                            "confidence": event.confidence,
-                            "method": event.method,
-                        }
-                    ),
-                }
-            elif isinstance(event, SourcesEvent):
-                yield {
-                    "event": "sources",
-                    "data": json.dumps({"source_ids": event.source_ids}),
-                }
-            elif isinstance(event, CitationListEvent):
-                yield {
-                    "event": "citations",
-                    "data": json.dumps({"citations": event.citations}),
-                }
-            elif isinstance(event, TextTokenEvent):
-                yield {
-                    "event": "token",
-                    "data": json.dumps({"text": event.token}),
-                }
-            elif isinstance(event, ErrorEvent):
-                payload = {"code": event.code, "error": event.message}
-                if event.metadata:
-                    payload["metadata"] = event.metadata
-                yield {
-                    "event": "error",
-                    "data": json.dumps(payload),
-                }
-            elif isinstance(event, FinishEvent):
-                yield {
-                    "event": "complete",
-                    "data": json.dumps(
-                        {
-                            "finish_reason": event.finish_reason,
-                            "completion_tokens": event.completion_tokens,
-                            "prompt_tokens": event.prompt_tokens,
-                        }
-                    ),
-                }
+            chunk = _encode_event(event)
+            if chunk:
+                yield chunk
     finally:
         stop_event.set()
         try:
@@ -499,11 +434,7 @@ async def _query_sse_event_generator(
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query_endpoint(request: Request, query_request: QueryRequest):
-    """Query endpoint with optional SSE streaming.
-
-    When ``stream=true``, returns text/event-stream events for status + tokens.
-    Otherwise returns a single JSON payload.
-    """
+    """Query endpoint with optional AI SDK UI message stream output."""
     source_id = None
     if query_request.source_ids and len(query_request.source_ids) == 1:
         source_id = query_request.source_ids[0]
@@ -527,19 +458,15 @@ async def query_endpoint(request: Request, query_request: QueryRequest):
 
     stop_event = threading.Event()
 
-    async def guarded_event_stream() -> AsyncGenerator[dict[str, str], None]:
-        async for event in _query_sse_event_generator(
+    async def guarded_event_stream() -> AsyncGenerator[bytes, None]:
+        async for line in _query_stream_generator(
             request, query_request, stop_event
         ):
-            yield event
+            yield line.encode("utf-8")
 
-    return EventSourceResponse(
+    return StreamingResponse(
         guarded_event_stream(),
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-        media_type="text/event-stream",
+        headers=STREAM_HEADERS,
     )
 
 
