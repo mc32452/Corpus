@@ -48,6 +48,7 @@ from .metrics import (
     format_metrics_summary,
     log_metrics,
 )
+from .citation_verification import compute_highlight_texts
 from .retrieval import (
     RetrievalEngine,
     RetrievalResult,
@@ -1321,6 +1322,8 @@ class RagEngine:
             else []
         )
         generator: Optional[MlxGenerator] = None
+        citation_list: list[dict[str, object]] = []
+        packed_retrieval_results: list[RetrievalResult] = []
 
         if context_docs:
             generator = self._ensure_generator()
@@ -1348,11 +1351,11 @@ class RagEngine:
                 source_legend = build_source_legend(source_mapping)
 
                 # Build citation list for the frontend
-                citation_list: list[dict[str, object]] = []
                 for ci, pack_idx in enumerate(pack_result.packed_indices):
                     if pack_idx >= len(results):
                         continue
                     r = results[pack_idx]
+                    packed_retrieval_results.append(r)
                     citation_list.append({
                         "index": ci + 1,
                         "source_id": r.metadata.get("source_id", ""),
@@ -1401,6 +1404,7 @@ class RagEngine:
         yield StatusEvent(status="Generating answer...")
 
         token_count = 0
+        answer_tokens: list[str] = []
 
         for token in generator.generate_chat_stream(
             messages, config=gen_config, should_stop=should_stop,
@@ -1412,7 +1416,33 @@ class RagEngine:
                 yield FinishEvent(finish_reason="error")
                 return
             token_count += 1
+            answer_tokens.append(token)
             yield TextTokenEvent(token=token)
+
+        # -- post-hoc citation highlight verification --------------------------
+        # If citations were emitted, verify that highlight anchors are correct.
+        # Re-emit an updated CitationListEvent with highlight_text for any
+        # citations whose referenced content falls outside the child chunk.
+        if cite and citation_list and packed_retrieval_results:
+            full_answer = "".join(answer_tokens)
+            try:
+                highlight_map = compute_highlight_texts(full_answer, packed_retrieval_results)
+                if highlight_map:
+                    updated_citations: list[dict[str, object]] = []
+                    for cit in citation_list:
+                        cit_copy = dict(cit)
+                        cit_idx = cit_copy.get("index")
+                        if isinstance(cit_idx, int) and cit_idx in highlight_map:
+                            cit_copy["highlight_text"] = highlight_map[cit_idx]
+                        updated_citations.append(cit_copy)
+                    yield CitationListEvent(citations=updated_citations)
+                    logger.info(
+                        "Citation verification: corrected %d/%d citations",
+                        len(highlight_map),
+                        len(citation_list),
+                    )
+            except Exception as exc:
+                logger.warning("Citation verification failed (non-fatal): %s", exc)
 
         # -- INTENT_AWARE: generation logging ------------------------------
         logger.info(

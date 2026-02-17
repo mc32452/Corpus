@@ -122,10 +122,12 @@ export function CitationViewerModal({
     page_number: payload.page_number ?? chunkDetail?.page_number,
     header_path: payload.header_path ?? chunkDetail?.header_path,
     chunk_text: payload.chunk_text ?? chunkDetail?.chunk_text,
+    highlight_text: payload.highlight_text,
   };
 
   const hasHighlightData = !!(
     highlightPayload.chunk_text ||
+    highlightPayload.highlight_text ||
     highlightPayload.header_path ||
     highlightPayload.page_number
   );

@@ -8,6 +8,8 @@ export interface HighlightPayload {
   page_number?: number | null;
   header_path?: string;
   chunk_text?: string;
+  /** Corrected highlight passage from parent chunk (post-hoc verification). */
+  highlight_text?: string;
 }
 
 interface DocumentRendererProps {
@@ -31,10 +33,18 @@ function PlainTextRenderer({
 
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || !highlight?.chunk_text) return;
+    if (!el) return;
+
+    const searchText = highlight?.highlight_text || highlight?.chunk_text;
+    if (!searchText) return;
 
     const timer = setTimeout(() => {
-      const mark = findAndHighlight(el, highlight.chunk_text!);
+      // Try highlight_text first (corrected passage from parent chunk),
+      // fall back to chunk_text if highlight_text fails to match.
+      let mark = findAndHighlight(el, searchText);
+      if (!mark && highlight?.highlight_text && highlight?.chunk_text) {
+        mark = findAndHighlight(el, highlight.chunk_text);
+      }
       if (mark) {
         mark.scrollIntoView({ behavior: "smooth", block: "center" });
       }

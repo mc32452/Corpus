@@ -45,6 +45,9 @@ export interface CitationEntry {
   display_page?: string | null;
   header_path?: string;
   chunk_text: string;
+  /** Corrected highlight passage from the parent chunk, present only when
+   *  the cited content falls outside the child chunk boundaries. */
+  highlight_text?: string;
 }
 
 /** Payload passed to CitationViewerModal on citation click. */
@@ -55,6 +58,8 @@ export interface CitationPayload {
   display_page?: string | null;
   header_path?: string;
   chunk_text?: string;
+  /** Corrected highlight passage from parent chunk (post-hoc verification). */
+  highlight_text?: string;
 }
 
 /** Response from GET /api/sources/{source_id}/chunk/{chunk_id}. */

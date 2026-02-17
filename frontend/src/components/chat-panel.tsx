@@ -399,6 +399,7 @@ export function ChatPanel({
                               display_page: c.display_page,
                               header_path: c.header_path,
                               chunk_text: c.chunk_text,
+                              highlight_text: c.highlight_text,
                             })}
                             className="inline-flex items-center justify-center min-w-5 h-5 px-1.5 text-[10px] font-bold text-blue-400 hover:text-blue-300 bg-blue-500/20 hover:bg-blue-500/30 rounded-full cursor-pointer transition-colors"
                             title={`View: ${c.source_id}`}

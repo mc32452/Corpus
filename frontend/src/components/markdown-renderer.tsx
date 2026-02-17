@@ -8,6 +8,7 @@ interface HighlightPayload {
   page_number?: number | null;
   header_path?: string;
   chunk_text?: string;
+  highlight_text?: string;
 }
 
 interface MarkdownRendererProps {
@@ -47,11 +48,19 @@ export function MarkdownRenderer({ content, highlight }: MarkdownRendererProps) 
     const timer = setTimeout(() => {
       let scrollTarget: HTMLElement | null = null;
 
-      // 1. Try text highlight
-      if (highlight?.chunk_text) {
-        const mark = findAndHighlight(el, highlight.chunk_text);
+      // 1. Try highlight_text first (corrected passage from parent chunk),
+      //    then fall back to chunk_text
+      const searchText = highlight?.highlight_text || highlight?.chunk_text;
+      if (searchText) {
+        const mark = findAndHighlight(el, searchText);
         if (mark) {
           scrollTarget = mark;
+        } else if (highlight?.highlight_text && highlight?.chunk_text) {
+          // highlight_text didn't match — retry with original chunk_text
+          const fallbackMark = findAndHighlight(el, highlight.chunk_text);
+          if (fallbackMark) {
+            scrollTarget = fallbackMark;
+          }
         }
       }
 

@@ -97,6 +97,7 @@ export function ChatMarkdown({
                     display_page: citation.display_page,
                     header_path: citation.header_path,
                     chunk_text: citation.chunk_text,
+                    highlight_text: citation.highlight_text,
                   }
                 : undefined;
 
