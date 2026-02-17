@@ -35,6 +35,89 @@ class ModelConfig:
     system_ram_gb: float = 0.0
 
 
+# ── Intent-aware parameter overrides ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class IntentRetrievalOverrides:
+    top_k_dense_scale: float = 1.0
+    top_k_fused_scale: float = 1.0
+    top_k_rerank_scale: float = 1.0
+    top_k_final: Optional[int] = None          # absolute override, not scale
+    reranker_threshold_scale: float = 1.0
+    reranker_min_docs: Optional[int] = None     # absolute override, not scale
+
+
+@dataclass(frozen=True)
+class IntentGenerationParams:
+    temperature: float
+    top_p: float
+
+
+@dataclass(frozen=True)
+class ResolvedRetrievalParams:
+    top_k_dense: int
+    top_k_fused: int
+    top_k_rerank: int
+    top_k_final: int
+    reranker_threshold: float
+    reranker_min_docs: int
+
+
+INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
+    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.7, top_k_fused_scale=0.5, top_k_final=3, reranker_threshold_scale=1.3),
+    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=5),
+    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=6),
+    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=5),
+    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=8, reranker_threshold_scale=0.8),
+    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=8, reranker_threshold_scale=0.8),
+    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=6),
+    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=0.8, top_k_fused_scale=0.5, top_k_final=4, reranker_threshold_scale=1.2),
+}
+
+INTENT_GENERATION_PARAMS: dict[str, IntentGenerationParams] = {
+    "FACTUAL":    IntentGenerationParams(temperature=0.1, top_p=0.2),
+    "SUMMARIZE":  IntentGenerationParams(temperature=0.3, top_p=0.6),
+    "OVERVIEW":   IntentGenerationParams(temperature=0.3, top_p=0.6),
+    "EXPLAIN":    IntentGenerationParams(temperature=0.4, top_p=0.7),
+    "ANALYZE":    IntentGenerationParams(temperature=0.4, top_p=0.7),
+    "COMPARE":    IntentGenerationParams(temperature=0.35, top_p=0.65),
+    "CRITIQUE":   IntentGenerationParams(temperature=0.45, top_p=0.75),
+    "COLLECTION": IntentGenerationParams(temperature=0.2, top_p=0.4),
+}
+
+
+def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedRetrievalParams:
+    """Apply intent-specific scale factors to base mode config values.
+
+    Scale factors multiply the mode's base value. Absolute overrides (top_k_final,
+    reranker_min_docs) replace the base value when not None. All scaled values are
+    clamped to minimum 1. Falls back to base mode values if intent is not recognized.
+    """
+    overrides = INTENT_RETRIEVAL_OVERRIDES.get(intent.upper(), IntentRetrievalOverrides())
+    return ResolvedRetrievalParams(
+        top_k_dense=max(1, round(mode_config.top_k_dense * overrides.top_k_dense_scale)),
+        top_k_fused=max(1, round(mode_config.top_k_fused * overrides.top_k_fused_scale)),
+        top_k_rerank=max(1, round(mode_config.top_k_rerank * overrides.top_k_rerank_scale)),
+        top_k_final=(
+            overrides.top_k_final
+            if overrides.top_k_final is not None
+            else mode_config.top_k_final
+        ),
+        reranker_threshold=mode_config.reranker_threshold * overrides.reranker_threshold_scale,
+        reranker_min_docs=(
+            overrides.reranker_min_docs
+            if overrides.reranker_min_docs is not None
+            else mode_config.reranker_min_docs
+        ),
+    )
+
+
+def resolve_generation_params(intent: str) -> IntentGenerationParams:
+    """Return generation params for intent. Falls back to OVERVIEW if unrecognized."""
+    return INTENT_GENERATION_PARAMS.get(intent.upper(), INTENT_GENERATION_PARAMS["OVERVIEW"])
+
+
 def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
     """Get mode configuration with RAM-aware token budget adjustments."""
 

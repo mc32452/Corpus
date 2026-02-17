@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from operator import itemgetter
 from typing import Any, Optional
 
-from .config import ModelConfig
+from .config import ModelConfig, ResolvedRetrievalParams
 from .metrics import (
     RetrievalMetrics,
     TimingMetrics,
@@ -245,6 +245,7 @@ class RetrievalEngine:
         top_k_final: Optional[int] = None,
         source_id: Optional[str] = None,
         collect_metrics: bool = True,
+        params: Optional[ResolvedRetrievalParams] = None,
     ) -> list[RetrievalResult]:
         """Execute hybrid search with timing and metrics collection.
 
@@ -253,11 +254,25 @@ class RetrievalEngine:
         2. Deduplicate by parent
         3. Rerank child chunks (Jina v3) → threshold filter → top_k_final
         4. Expand surviving children to parent text for downstream context
+
+        When *params* is provided, its values take priority over explicit
+        kwargs and the mode config.
         """
         cfg = self._config
-        k_fused = top_k_fused or (cfg.top_k_fused if cfg else 50)
-        k_rerank = top_k_rerank or (cfg.top_k_rerank if cfg else 20)
-        k_final = top_k_final or (cfg.top_k_final if cfg else 5)
+
+        if params is not None:
+            k_fused = params.top_k_fused
+            k_rerank = params.top_k_rerank
+            k_final = params.top_k_final
+            reranker_threshold = params.reranker_threshold
+            reranker_min_docs = params.reranker_min_docs
+        else:
+            k_fused = top_k_fused or (cfg.top_k_fused if cfg else 50)
+            k_rerank = top_k_rerank or (cfg.top_k_rerank if cfg else 20)
+            k_final = top_k_final or (cfg.top_k_final if cfg else 5)
+            reranker_threshold = float(cfg.reranker_threshold) if cfg else 0.05
+            reranker_min_docs = cfg.reranker_min_docs if cfg else 3
+
         reranker_enabled = bool(cfg.reranker_enabled) if cfg else self._reranker is not None
         context_expansion_enabled = bool(cfg.context_expansion_enabled) if cfg else True
 
@@ -295,9 +310,9 @@ class RetrievalEngine:
 
         # Stage 4: Threshold filtering
         threshold_metrics = ThresholdMetrics()
-        if cfg and reranked:
-            threshold = float(cfg.reranker_threshold)
-            min_docs = cfg.reranker_min_docs
+        if reranked:
+            threshold = reranker_threshold
+            min_docs = reranker_min_docs
             items_before = len(reranked)
             score_key = "rerank_score" if reranker_enabled else "score"
 

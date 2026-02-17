@@ -651,6 +651,7 @@ class IntentClassifier:
             return None
 
         import mlx_lm  # noqa: local lazy import
+        from mlx_lm.generate import make_sampler
 
         prompt = _build_classification_prompt(query)
 
@@ -663,12 +664,16 @@ class IntentClassifier:
         else:
             formatted = prompt
 
+        # Use sampler instead of temperature kwarg — mlx_lm.generate_step()
+        # does not accept temperature directly; sampling is controlled via
+        # the sampler callable.
+        sampler = make_sampler(temp=0.0, top_p=0.1)
         response = mlx_lm.generate(
             self._llm_model,
             self._llm_tokenizer,
             prompt=formatted,
             max_tokens=60,
-            temperature=0.0,
+            sampler=sampler,
         )
 
         parsed = _parse_llm_response(response)

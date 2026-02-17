@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from .config import CITATIONS_ENABLED_DEFAULT, ModelConfig, select_mode_config
+from .config import (
+    CITATIONS_ENABLED_DEFAULT,
+    ModelConfig,
+    resolve_generation_params,
+    resolve_retrieval_params,
+    select_mode_config,
+)
 from .generation import build_messages
 from .embeddings import MlxEmbeddingModel
 from .generator import (
@@ -546,13 +552,16 @@ class RagEngine:
         self._on_status("Retrieval models loaded.")
 
     def _release_retrieval_models(self) -> None:
-        """Free embedding + reranker memory before LLM generation."""
-        self._embedding_model = None
-        self._reranker = None
+        """Free unreferenced MLX memory before LLM generation.
+
+        The embedding model and reranker stay loaded on the instance so
+        subsequent queries skip the reload.  Only orphaned Metal buffers
+        and Python garbage are collected here.
+        """
         gc.collect()
         _release_mlx_cache()
         logger.debug(
-            "Released reranker and embedding model to free memory for LLM generation"
+            "Ran gc.collect + MLX cache clear before LLM generation"
         )
 
     def _classify_intent(
@@ -747,6 +756,18 @@ class RagEngine:
             intent_result=intent_result,
         )
 
+        # -- resolve intent-aware parameters --------------------------------
+        retrieval_params = resolve_retrieval_params(config, intent_result.intent.value)
+        generation_params = resolve_generation_params(intent_result.intent.value)
+
+        logger.info(
+            "INTENT_CLASSIFIED | intent=%s | confidence=%.2f | method=%s | mode=%s",
+            intent_result.intent.value,
+            intent_result.confidence,
+            intent_result.method,
+            config.mode,
+        )
+
         # -- query expansion -----------------------------------------------
         search_query = query_text
         if expansion:
@@ -814,30 +835,12 @@ class RagEngine:
                     config=config,
                 )
 
-        elif intent_result.intent == Intent.SUMMARIZE and not source_id:
-            self._on_status("Checking multi-document summarise path...")
-            multi_result = self._handle_multi_doc_summarize(
-                config=config,
-                model_id=model_id,
-                no_generate=no_generate,
-                citations_enabled=cite,
-                profiler=profiler,
-                retrieval_engine=retrieval_engine,
-                search_query=search_query,
-                source_id=source_id,
-            )
-            context = multi_result["context"]
-            results = multi_result["results"]
-            source_ids = multi_result["source_ids"]
-            context_docs = multi_result["parent_texts"]
-            cite = multi_result["citations_enabled"]
-            extra_instructions = multi_result.get("extra_instructions")
-
         else:
             self._on_status("Searching knowledge base...")
             with profiler.span("Retrieval (hybrid search + rerank)"):
                 results = retrieval_engine.search(
-                    search_query, source_id=source_id
+                    search_query, source_id=source_id,
+                    params=retrieval_params,
                 )
             source_ids = sorted(
                 {
@@ -854,6 +857,22 @@ class RagEngine:
 
         retrieval_metrics: Optional[RetrievalMetrics] = (
             results[0].metrics if results and results[0].metrics else None
+        )
+
+        # -- BASELINE: retrieval results logging ---------------------------
+        _scores = [r.score for r in results] if results else []
+        logger.info(
+            "INTENT_AWARE | intent=%s | retrieval_results=%d | top_score=%.4f | low_score=%.4f | "
+            "params: top_k_dense=%d top_k_fused=%d top_k_rerank=%d top_k_final=%d threshold=%.4f",
+            intent_result.intent.value,
+            len(results),
+            max(_scores) if _scores else 0.0,
+            min(_scores) if _scores else 0.0,
+            retrieval_params.top_k_dense,
+            retrieval_params.top_k_fused,
+            retrieval_params.top_k_rerank,
+            retrieval_params.top_k_final,
+            retrieval_params.reranker_threshold,
         )
 
         # -- release retrieval models for LLM headroom ---------------------
@@ -974,7 +993,22 @@ class RagEngine:
 
         self._on_status("Generating answer...")
         with profiler.span("LLM generation"):
-            raw_answer = generator.generate_chat(messages, config=gen_config)
+            raw_answer = generator.generate_chat(
+                messages,
+                config=gen_config,
+                temperature=generation_params.temperature,
+                top_p=generation_params.top_p,
+            )
+
+        # -- INTENT_AWARE: generation logging ------------------------------
+        _gen_tokens = count_tokens(raw_answer, generator.tokenizer)
+        logger.info(
+            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | tokens_generated=%d",
+            intent_result.intent.value,
+            generation_params.temperature,
+            generation_params.top_p,
+            _gen_tokens,
+        )
 
         with profiler.span("Output sanitisation"):
             answer = sanitize_output(raw_answer)
@@ -1145,6 +1179,18 @@ class RagEngine:
             yield FinishEvent(finish_reason="error")
             return
 
+        # -- resolve intent-aware parameters --------------------------------
+        retrieval_params = resolve_retrieval_params(config, intent_result.intent.value)
+        generation_params = resolve_generation_params(intent_result.intent.value)
+
+        logger.info(
+            "INTENT_CLASSIFIED | intent=%s | confidence=%.2f | method=%s | mode=%s",
+            intent_result.intent.value,
+            intent_result.confidence,
+            intent_result.method,
+            config.mode,
+        )
+
         # -- query expansion -----------------------------------------------
         search_query = query_text
         if expansion:
@@ -1212,33 +1258,12 @@ class RagEngine:
                 yield FinishEvent(finish_reason="error")
                 return
 
-        elif intent_result.intent == Intent.SUMMARIZE and not source_id:
-            yield StatusEvent(status="Checking multi-document summarise path...")
-            profiler = LatencyProfiler(enabled=False)
-            multi_result = self._handle_multi_doc_summarize(
-                config=config,
-                model_id=model_id,
-                no_generate=False,
-                citations_enabled=cite,
-                profiler=profiler,
-                retrieval_engine=retrieval_engine,
-                search_query=search_query,
-                source_id=source_id,
-            )
-            context = multi_result["context"]
-            results = multi_result["results"]
-            source_ids = multi_result["source_ids"]
-            context_docs = multi_result["parent_texts"]
-            cite = multi_result["citations_enabled"]
-            extra_instructions = multi_result.get("extra_instructions")
-            if should_stop():
-                yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during multi-document summarize retrieval")
-                yield FinishEvent(finish_reason="error")
-                return
-
         else:
             yield StatusEvent(status="Searching knowledge base...")
-            results = retrieval_engine.search(search_query, source_id=source_id)
+            results = retrieval_engine.search(
+                search_query, source_id=source_id,
+                params=retrieval_params,
+            )
             source_ids = sorted(
                 {
                     r.metadata.get("source_id")
@@ -1259,6 +1284,22 @@ class RagEngine:
         # Emit sources
         if source_ids:
             yield SourcesEvent(source_ids=source_ids)
+
+        # -- BASELINE: retrieval results logging ---------------------------
+        _scores = [r.score for r in results] if results else []
+        logger.info(
+            "INTENT_AWARE | intent=%s | retrieval_results=%d | top_score=%.4f | low_score=%.4f | "
+            "params: top_k_dense=%d top_k_fused=%d top_k_rerank=%d top_k_final=%d threshold=%.4f",
+            intent_result.intent.value,
+            len(results),
+            max(_scores) if _scores else 0.0,
+            min(_scores) if _scores else 0.0,
+            retrieval_params.top_k_dense,
+            retrieval_params.top_k_fused,
+            retrieval_params.top_k_rerank,
+            retrieval_params.top_k_final,
+            retrieval_params.reranker_threshold,
+        )
 
         if should_stop():
             yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled")
@@ -1362,7 +1403,9 @@ class RagEngine:
         token_count = 0
 
         for token in generator.generate_chat_stream(
-            messages, config=gen_config, should_stop=should_stop
+            messages, config=gen_config, should_stop=should_stop,
+            temperature=generation_params.temperature,
+            top_p=generation_params.top_p,
         ):
             if should_stop():
                 yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
@@ -1370,6 +1413,15 @@ class RagEngine:
                 return
             token_count += 1
             yield TextTokenEvent(token=token)
+
+        # -- INTENT_AWARE: generation logging ------------------------------
+        logger.info(
+            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | tokens_generated=%d",
+            intent_result.intent.value,
+            generation_params.temperature,
+            generation_params.top_p,
+            token_count,
+        )
 
         # -- finish ---------------------------------------------------------
         yield FinishEvent(
@@ -1435,101 +1487,6 @@ class RagEngine:
             )
             citations_enabled = False
         return context, sources, citations_enabled
-
-    def _handle_multi_doc_summarize(
-        self,
-        *,
-        config: ModelConfig,
-        model_id: str,
-        no_generate: bool,
-        citations_enabled: bool,
-        profiler: LatencyProfiler,
-        retrieval_engine: RetrievalEngine,
-        search_query: str,
-        source_id: Optional[str],
-    ) -> dict[str, Any]:
-        """Handle SUMMARIZE intent across multiple sources."""
-        sources = self._storage.list_source_ids()
-
-        if len(sources) > 1:
-            summaries = self._storage.get_source_summaries()
-            missing = [s for s in sources if s not in summaries]
-
-            if missing and no_generate:
-                return {
-                    "context": "Multiple documents available but some lack summaries.",
-                    "results": [],
-                    "source_ids": sources,
-                    "parent_texts": [],
-                    "citations_enabled": False,
-                    "extra_instructions": None,
-                }
-
-            if missing:
-                generator = self._ensure_generator()
-                for source in missing:
-                    p_texts = self._storage.get_parent_texts_by_source(
-                        source_id=source
-                    )
-                    context_text = "\n\n".join(p_texts)
-                    if len(context_text) > 12_000:
-                        context_text = context_text[:12_000]
-                    summary_messages = build_messages(
-                        context=context_text,
-                        question="Summarize this document.",
-                        intent=Intent.SUMMARIZE,
-                        mode=config.mode,
-                    )
-                    summary_text = generator.generate_chat(summary_messages)
-                    self._storage.upsert_source_summary(
-                        source_id=source, summary=summary_text
-                    )
-                summaries = self._storage.get_source_summaries()
-
-            summary_blocks = [
-                f"Source: {source}\nSummary: {summaries[source]}"
-                for source in sources
-                if source in summaries
-            ]
-            if citations_enabled:
-                logger.info(
-                    "Auto-disabling citations: context from document summaries"
-                )
-                citations_enabled = False
-            return {
-                "context": "\n\n".join(summary_blocks),
-                "results": [],
-                "source_ids": sources,
-                "parent_texts": [],
-                "citations_enabled": citations_enabled,
-                "extra_instructions": (
-                    "Provide a single consolidated answer addressing the user's question. "
-                    "Do not output per-source summaries or repeat points."
-                ),
-            }
-
-        # Single source — fall through to normal retrieval
-        with profiler.span("Retrieval (hybrid search + rerank)"):
-            results = retrieval_engine.search(search_query, source_id=source_id)
-        source_ids = sorted(
-            {
-                r.metadata.get("source_id")
-                for r in results
-                if r.metadata.get("source_id")
-            }
-        )
-        return {
-            "context": "",
-            "results": results,
-            "source_ids": source_ids,
-            "parent_texts": [
-                (r.parent_text if r.parent_text else r.text)
-                for r in results
-                if (r.parent_text if r.parent_text else r.text)
-            ],
-            "citations_enabled": citations_enabled,
-            "extra_instructions": None,
-        }
 
     # -- cleanup -----------------------------------------------------------
 

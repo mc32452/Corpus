@@ -406,19 +406,23 @@ class MlxGenerator:
         messages: list[dict[str, str]],
         *,
         config: Optional[GenerationConfig] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> str:
         if not messages:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
         prompt = self._apply_chat_template(messages)
-        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
+        effective_temp = temperature if temperature is not None else resolved_temperature
+        effective_top_p = top_p if top_p is not None else resolved_top_p
         output = self._generate_full_text(
             prompt,
             final_max_tokens,
-            temperature,
-            top_p,
+            effective_temp,
+            effective_top_p,
             repetition_penalty,
             stop_tokens,
             prompt_tokens,
@@ -431,6 +435,8 @@ class MlxGenerator:
         *,
         config: Optional[GenerationConfig] = None,
         should_stop: Optional[callable] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ):
         """Streaming version of generate_chat that yields individual tokens.
 
@@ -442,6 +448,10 @@ class MlxGenerator:
             Generation parameters.
         should_stop : callable | None
             If provided, called periodically; returning True aborts generation.
+        temperature : float | None
+            When provided, overrides the model-size adaptive default.
+        top_p : float | None
+            When provided, overrides the model-size adaptive default.
 
         Yields
         ------
@@ -458,22 +468,24 @@ class MlxGenerator:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
         prompt = self._apply_chat_template(messages)
-        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
+        effective_temp = temperature if temperature is not None else resolved_temperature
+        effective_top_p = top_p if top_p is not None else resolved_top_p
 
         try:
             from mlx_lm.generate import stream_generate
 
             yield from self._stream_tokens(
-                prompt, final_max_tokens, temperature, top_p,
+                prompt, final_max_tokens, effective_temp, effective_top_p,
                 repetition_penalty, stop_tokens, prompt_tokens,
                 should_stop=should_stop,
             )
         except ImportError:
             # Fallback: generate full output, yield as single token
             output = self._generate_full_text(
-                prompt, final_max_tokens, temperature, top_p,
+                prompt, final_max_tokens, effective_temp, effective_top_p,
                 repetition_penalty, stop_tokens, prompt_tokens,
             )
             output = self._strip_thinking_blocks(output)
