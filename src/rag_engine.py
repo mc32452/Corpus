@@ -12,6 +12,7 @@ import gc
 import logging
 import os
 import re
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -433,6 +434,8 @@ class RagEngine:
         self._embedding_model: Any = None
         self._reranker: Any = None
         self._generator: Optional[MlxGenerator] = None
+        self._generator_load_lock = threading.Lock()
+        self._preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     # -- properties --------------------------------------------------------
 
@@ -497,18 +500,45 @@ class RagEngine:
     def _ensure_generator(self) -> MlxGenerator:
         if self._generator is not None:
             return self._generator
-        model_id = self._cfg.model or self._model_config.llm_model
-        logger.info("_ensure_generator: loading LLM %s...", model_id.split("/")[-1])
-        self._on_status(f"Loading LLM ({model_id.split('/')[-1]})...")
-        try:
-            import mlx.core as mx
+        with self._generator_load_lock:
+            if self._generator is not None:
+                return self._generator
+            model_id = self._cfg.model or self._model_config.llm_model
+            logger.info("_ensure_generator: loading LLM %s...", model_id.split("/")[-1])
+            self._on_status(f"Loading LLM ({model_id.split('/')[-1]})...")
+            try:
+                import mlx.core as mx
 
-            mx.set_cache_limit(0)
-        except Exception:
-            pass
-        self._generator = MlxGenerator(model_id)
-        logger.info("_ensure_generator: done")
+                mx.set_cache_limit(0)
+            except Exception:
+                pass
+            self._generator = MlxGenerator(model_id)
+            logger.info("_ensure_generator: done")
         return self._generator
+
+    def _start_generator_preload(self) -> Optional[concurrent.futures.Future[MlxGenerator]]:
+        """Speculatively begin loading the LLM in the background.
+
+        Used to overlap model load latency with retrieval/reranking work.
+        """
+        if self._generator is not None:
+            return None
+        logger.info("Starting speculative LLM preload during retrieval")
+        return self._preload_executor.submit(self._ensure_generator)
+
+    def _consume_preloaded_generator(
+        self,
+        preload_future: Optional[concurrent.futures.Future[MlxGenerator]],
+    ) -> MlxGenerator:
+        if preload_future is None:
+            return self._ensure_generator()
+        try:
+            return preload_future.result()
+        except Exception:
+            logger.exception(
+                "Speculative LLM preload failed; falling back to synchronous load"
+            )
+            return self._ensure_generator()
 
     def load_retrieval_models(self) -> None:
         """Pre-load embedding + reranker in parallel (call once at startup)."""
@@ -797,6 +827,7 @@ class RagEngine:
         source_ids: list[str] = []
         context_docs: list[str] = []
         generator: Optional[MlxGenerator] = None
+        generator_preload_future: Optional[concurrent.futures.Future[MlxGenerator]] = None
 
         if bypass_retrieval:
             self._on_status("Query is unclear — skipping retrieval...")
@@ -838,6 +869,8 @@ class RagEngine:
 
         else:
             self._on_status("Searching knowledge base...")
+            if not no_generate:
+                generator_preload_future = self._start_generator_preload()
             with profiler.span("Retrieval (hybrid search + rerank)"):
                 results = retrieval_engine.search(
                     search_query, source_id=source_id,
@@ -891,7 +924,9 @@ class RagEngine:
 
         if not no_generate and context_docs:
             if generator is None:
-                generator = self._ensure_generator()
+                generator = self._consume_preloaded_generator(
+                    generator_preload_future
+                )
 
             self._on_status("Packing token budget...")
             with profiler.span("Budget packing"):
@@ -985,7 +1020,7 @@ class RagEngine:
 
         # -- generate -------------------------------------------------------
         if generator is None:
-            generator = self._ensure_generator()
+            generator = self._consume_preloaded_generator(generator_preload_future)
 
         gen_config = GenerationConfig(
             max_tokens=1200,
@@ -1226,6 +1261,7 @@ class RagEngine:
         results: list[RetrievalResult] = []
         source_ids: list[str] = []
         context_docs: list[str] = []
+        generator_preload_future: Optional[concurrent.futures.Future[MlxGenerator]] = None
 
         if bypass_retrieval:
             yield StatusEvent(status="Query is unclear — asking for clarification...")
@@ -1261,6 +1297,7 @@ class RagEngine:
 
         else:
             yield StatusEvent(status="Searching knowledge base...")
+            generator_preload_future = self._start_generator_preload()
             results = retrieval_engine.search(
                 search_query, source_id=source_id,
                 params=retrieval_params,
@@ -1326,7 +1363,7 @@ class RagEngine:
         packed_retrieval_results: list[RetrievalResult] = []
 
         if context_docs:
-            generator = self._ensure_generator()
+            generator = self._consume_preloaded_generator(generator_preload_future)
 
             yield StatusEvent(status="Packing token budget...")
             pack_result = enforce_token_budget(
@@ -1394,7 +1431,7 @@ class RagEngine:
 
         # -- generate with streaming tokens --------------------------------
         if generator is None:
-            generator = self._ensure_generator()
+            generator = self._consume_preloaded_generator(generator_preload_future)
 
         gen_config = GenerationConfig(
             max_tokens=1200,
@@ -1525,5 +1562,6 @@ class RagEngine:
         self._embedding_model = None
         self._reranker = None
         self._generator = None
+        self._preload_executor.shutdown(wait=False)
         gc.collect()
         _release_mlx_cache()
