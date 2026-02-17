@@ -66,12 +66,12 @@ class ResolvedRetrievalParams:
 
 INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
     "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.7, top_k_fused_scale=0.5, top_k_final=3, reranker_threshold_scale=1.3),
-    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=5),
-    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=6),
-    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=5),
-    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=8, reranker_threshold_scale=0.8),
-    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=8, reranker_threshold_scale=0.8),
-    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=6),
+    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=8),
+    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=8),
+    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=8),
+    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=12, reranker_threshold_scale=0.8),
+    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=12, reranker_threshold_scale=0.8),
+    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=10),
     "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=0.8, top_k_fused_scale=0.5, top_k_final=4, reranker_threshold_scale=1.2),
 }
 
