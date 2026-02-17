@@ -1363,7 +1363,7 @@ class RagEngine:
                         "page_number": r.metadata.get("page_number"),
                         "display_page": r.metadata.get("display_page"),
                         "header_path": r.metadata.get("header_path", ""),
-                        "chunk_text": r.text[:500] if r.text else "",
+                        "chunk_text": r.text if r.text else "",
                     })
                 if citation_list:
                     yield CitationListEvent(citations=citation_list)

@@ -31,30 +31,47 @@ export function findBestMatch(
   const h = normalise(haystack);
   const n = normalise(needle);
 
+  console.log('[HIGHLIGHT DEBUG] haystack length:', h.length);
+  console.log('[HIGHLIGHT DEBUG] needle length:', n.length);
+  console.log('[HIGHLIGHT DEBUG] needle first 100:', n.slice(0, 100));
+  console.log('[HIGHLIGHT DEBUG] needle last 100:', n.slice(-100));
+
   if (!n || !h) return null;
 
   // Exact full match
   const exactIdx = h.indexOf(n);
+  console.log('[HIGHLIGHT DEBUG] exact match result:', exactIdx);
   if (exactIdx !== -1) {
     return { start: exactIdx, length: n.length };
   }
 
   // Try progressively shorter prefixes
   const minLen = Math.min(50, n.length);
-  for (let len = Math.min(200, n.length); len >= minLen; len -= 10) {
+  const step = Math.max(10, Math.floor(n.length / 100));
+  for (let len = n.length - 1; len >= minLen; len -= step) {
     const sub = n.slice(0, len);
     const idx = h.indexOf(sub);
     if (idx !== -1) {
-      return { start: idx, length: sub.length };
+      console.log('[HIGHLIGHT DEBUG] prefix match at len:', len, 'of', n.length, 'idx:', idx);
+      let end = idx + sub.length;
+      while (end < h.length && h[end] !== " " && (end - (idx + sub.length)) < 20) {
+        end++;
+      }
+      return { start: idx, length: end - idx };
     }
   }
 
   // Try progressively shorter suffixes
-  for (let len = Math.min(200, n.length); len >= minLen; len -= 10) {
+  for (let len = n.length - 1; len >= minLen; len -= step) {
     const sub = n.slice(n.length - len);
     const idx = h.indexOf(sub);
     if (idx !== -1) {
-      return { start: idx, length: sub.length };
+      console.log('[HIGHLIGHT DEBUG] suffix match at len:', len, 'of', n.length, 'idx:', idx);
+      let end = idx + sub.length;
+      while (end < h.length && h[end] !== " " && (end - (idx + sub.length)) < 20) {
+        end++;
+      }
+      return { start: idx, length: end - idx };
     }
   }
 
@@ -125,6 +142,19 @@ export function highlightRange(
   return wrapped;
 }
 
+export function clearHighlights(container: HTMLElement): void {
+  const marks = container.querySelectorAll("mark.citation-highlight");
+  marks.forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    // Replace <mark> with its text content
+    const text = document.createTextNode(mark.textContent ?? "");
+    parent.replaceChild(text, mark);
+    // Merge adjacent text nodes
+    parent.normalize();
+  });
+}
+
 /**
  * High-level helper: find `chunkText` in the container's text and
  * wrap it with `<mark>`.  Returns the first <mark> element (for
@@ -134,11 +164,48 @@ export function findAndHighlight(
   container: HTMLElement,
   chunkText: string
 ): HTMLElement | null {
-  const flatText = container.innerText ?? container.textContent ?? "";
-  const result = findBestMatch(flatText, chunkText);
+  clearHighlights(container);
+  const rawText = container.innerText ?? container.textContent ?? "";
+  const result = findBestMatch(rawText, chunkText);
   if (!result) return null;
 
-  highlightRange(container, result.start, result.length);
+  // Map normalised offsets back to raw text offsets.
+  // Build a mapping: for each index in the normalised string,
+  // track the corresponding index in the raw string.
+  const raw = rawText;
+  const normToRaw: number[] = [];
+  let ri = 0;
+  let inWhitespace = false;
+
+  // Skip leading whitespace (mirrors the .trim() in normalise)
+  let rawStart = 0;
+  while (rawStart < raw.length && /\s/.test(raw[rawStart])) {
+    rawStart++;
+  }
+  ri = rawStart;
+
+  for (; ri < raw.length; ri++) {
+    const ch = raw[ri];
+    if (/\s/.test(ch)) {
+      if (!inWhitespace) {
+        // This whitespace char becomes the single space in normalised text
+        normToRaw.push(ri);
+        inWhitespace = true;
+      }
+      // Additional whitespace chars are collapsed — no normalised index
+    } else {
+      normToRaw.push(ri);
+      inWhitespace = false;
+    }
+  }
+
+  const rawMatchStart = normToRaw[result.start] ?? 0;
+  const rawMatchEnd =
+    normToRaw[result.start + result.length - 1] ?? rawMatchStart;
+  // +1 because highlightRange end is exclusive
+  const rawLength = rawMatchEnd - rawMatchStart + 1;
+
+  highlightRange(container, rawMatchStart, rawLength);
 
   return container.querySelector("mark.citation-highlight");
 }

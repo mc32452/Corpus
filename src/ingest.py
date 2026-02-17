@@ -25,6 +25,10 @@ CHILD_MIN_TOKENS = 200
 CHILD_MAX_TOKENS = 300
 CHILD_TARGET_TOKENS = 250
 CHILD_OVERLAP_TOKENS = 50
+CHILD_OVERLAP_SENTENCES = 2
+
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CLAUSE_BOUNDARY_RE = re.compile(r";\s+|,\s+(?:and|but|which|or)\s+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,10 @@ def _tokenize(text: str) -> list[str]:
 
 def _detokenize(tokens: Iterable[str]) -> str:
     return " ".join(tokens).strip()
+
+
+def _token_count(text: str) -> int:
+    return len(_tokenize(text))
 
 
 def clean_ocr_artifacts(text: str) -> str:
@@ -68,6 +76,33 @@ def _split_tokens(tokens: list[str], chunk_size: int, overlap: int) -> list[list
             break
         start = end - overlap
     return chunks
+
+
+def _split_sentences(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    return [sentence.strip() for sentence in SENTENCE_SPLIT_RE.split(stripped) if sentence.strip()]
+
+
+def _split_long_sentence_on_clause(sentence: str, target_tokens: int) -> list[str]:
+    if _token_count(sentence) <= max(1, int(target_tokens * 0.4)):
+        return [sentence]
+
+    boundary_matches = list(CLAUSE_BOUNDARY_RE.finditer(sentence))
+    if not boundary_matches:
+        return [sentence]
+
+    midpoint = len(sentence) / 2
+    best = min(boundary_matches, key=lambda match: abs(match.start() - midpoint))
+    split_index = best.start() + 1 if sentence[best.start()] in {",", ";"} else best.start()
+
+    left = sentence[:split_index].strip()
+    right = sentence[split_index:].strip()
+    if not left or not right:
+        return [sentence]
+
+    return [left, right]
 
 
 def _parse_markdown_sections(text: str) -> list[_Section]:
@@ -141,19 +176,41 @@ def _split_parent_chunks(
 
 
 def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
-    tokens = _tokenize(parent.text)
-    if not tokens:
+    sentences = _split_sentences(parent.text)
+    if not sentences:
         return []
 
-    token_chunks = _split_tokens(tokens, CHILD_TARGET_TOKENS, CHILD_OVERLAP_TOKENS)
+    units: list[str] = []
+    for sentence in sentences:
+        units.extend(_split_long_sentence_on_clause(sentence, CHILD_TARGET_TOKENS))
+
+    sentence_chunks: list[list[str]] = []
+    current_chunk: list[str] = []
+    current_tokens = 0
+
+    for unit in units:
+        unit_tokens = _token_count(unit)
+
+        if current_chunk and (current_tokens + unit_tokens) > CHILD_TARGET_TOKENS:
+            sentence_chunks.append(current_chunk)
+            overlap_sentences = current_chunk[-CHILD_OVERLAP_SENTENCES:] if CHILD_OVERLAP_SENTENCES > 0 else []
+            current_chunk = list(overlap_sentences)
+            current_tokens = sum(_token_count(sentence) for sentence in current_chunk)
+
+        current_chunk.append(unit)
+        current_tokens += unit_tokens
+
+    if current_chunk:
+        sentence_chunks.append(current_chunk)
+
     child_chunks: list[ChildChunk] = []
 
-    for chunk_tokens in token_chunks:
-        if len(chunk_tokens) < CHILD_MIN_TOKENS:
+    for chunk_sentences in sentence_chunks:
+        text = " ".join(chunk_sentences).strip()
+        token_count = _token_count(text)
+        if token_count < CHILD_MIN_TOKENS:
             continue
-        if len(chunk_tokens) > CHILD_MAX_TOKENS:
-            chunk_tokens = chunk_tokens[:CHILD_MAX_TOKENS]
-        text = _detokenize(chunk_tokens)
+
         metadata = Metadata(
             source_id=parent.metadata.source_id,
             page_number=parent.metadata.page_number,

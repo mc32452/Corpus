@@ -12,7 +12,7 @@ from src.models import ChildChunk, Metadata, ParentChunk
 from src.ingest import (
     CHILD_MAX_TOKENS,
     CHILD_MIN_TOKENS,
-    CHILD_OVERLAP_TOKENS,
+    CHILD_OVERLAP_SENTENCES,
     CHILD_TARGET_TOKENS,
     PARENT_MAX_TOKENS,
     PARENT_MIN_TOKENS,
@@ -20,6 +20,8 @@ from src.ingest import (
     PARENT_TARGET_TOKENS,
     _parse_markdown_sections,
     _split_child_chunks,
+    _split_long_sentence_on_clause,
+    _split_sentences,
     _split_parent_chunks,
     _split_tokens,
     _tokenize,
@@ -286,16 +288,55 @@ class TestChildChunkSplitting:
             assert child.metadata.parent_id == parent.id
 
     def test_child_token_bounds(self):
-        """Child chunks respect min/max token limits."""
-        text = " ".join(["word"] * (CHILD_MAX_TOKENS * 5))
+        """Child chunks stay near target size with sentence-aware soft limits."""
+        sentence = " ".join(["word"] * 25) + "."
+        text = " ".join([sentence] * 120)
         meta = Metadata(source_id="doc1", header_path="Test", parent_id=None)
         parent = ParentChunk(text=text, metadata=meta)
         children = _split_child_chunks(parent)
+        assert len(children) > 0
+        avg_tokens = sum(len(_tokenize(child.text)) for child in children) / len(children)
+        assert avg_tokens == pytest.approx(CHILD_TARGET_TOKENS, rel=0.15)
+
         for child in children:
             token_count = len(_tokenize(child.text))
-            assert token_count <= CHILD_MAX_TOKENS, (
-                f"Child has {token_count} tokens, max is {CHILD_MAX_TOKENS}"
+            assert token_count >= CHILD_MIN_TOKENS
+            assert token_count <= int(CHILD_TARGET_TOKENS * 1.5), (
+                f"Child has {token_count} tokens, expected soft cap near target"
             )
+
+    def test_child_chunks_preserve_sentence_boundaries(self):
+        text = " ".join([f"Sentence {i} ends here." for i in range(1, 80)])
+        meta = Metadata(source_id="doc1", header_path="Test", parent_id=None)
+        parent = ParentChunk(text=text, metadata=meta)
+        children = _split_child_chunks(parent)
+        assert len(children) > 0
+        for child in children:
+            stripped = child.text.strip()
+            assert stripped[-1] in {".", "!", "?"}
+
+    def test_child_chunk_sentence_overlap(self):
+        sentence_tokens = " ".join(["word"] * 24)
+        text = " ".join([f"S{i} {sentence_tokens}." for i in range(1, 80)])
+        meta = Metadata(source_id="doc1", header_path="Test", parent_id=None)
+        parent = ParentChunk(text=text, metadata=meta)
+        children = _split_child_chunks(parent)
+        if len(children) > 1:
+            prev_sentences = _split_sentences(children[0].text)
+            next_sentences = _split_sentences(children[1].text)
+            assert next_sentences[:CHILD_OVERLAP_SENTENCES] == prev_sentences[-CHILD_OVERLAP_SENTENCES:]
+
+    def test_long_sentence_clause_fallback(self):
+        lead = " ".join(["intro"] * 60)
+        middle = " ".join(["detail"] * 45)
+        tail = " ".join(["evidence"] * 20)
+        long_sentence = (
+            f"{lead}, and {middle}, which {tail}."
+        )
+        parts = _split_long_sentence_on_clause(long_sentence, CHILD_TARGET_TOKENS)
+        assert len(parts) == 2
+        assert all(part.strip() for part in parts)
+        assert "," in parts[0] or ";" in parts[0]
 
     def test_child_metadata_inherits_source(self):
         """Children inherit source metadata from parent."""

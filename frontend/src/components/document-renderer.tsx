@@ -35,15 +35,18 @@ function PlainTextRenderer({
     const el = containerRef.current;
     if (!el) return;
 
-    const searchText = highlight?.highlight_text || highlight?.chunk_text;
+    const searchText = highlight?.chunk_text || highlight?.highlight_text;
+    const needleSource = highlight?.chunk_text ? "chunk_text" : "highlight_text";
     if (!searchText) return;
 
+    console.log('[HIGHLIGHT DEBUG] needle passed to highlighter, length:', searchText.length);
+    console.log('[HIGHLIGHT DEBUG] needle source:', needleSource);
+
     const timer = setTimeout(() => {
-      // Try highlight_text first (corrected passage from parent chunk),
-      // fall back to chunk_text if highlight_text fails to match.
+      // Try full chunk_text first, then fall back to highlight_text.
       let mark = findAndHighlight(el, searchText);
-      if (!mark && highlight?.highlight_text && highlight?.chunk_text) {
-        mark = findAndHighlight(el, highlight.chunk_text);
+      if (!mark && highlight?.chunk_text && highlight?.highlight_text) {
+        mark = findAndHighlight(el, highlight.highlight_text);
       }
       if (mark) {
         mark.scrollIntoView({ behavior: "smooth", block: "center" });

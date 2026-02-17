@@ -121,7 +121,7 @@ export function CitationViewerModal({
   const highlightPayload: HighlightPayload = {
     page_number: payload.page_number ?? chunkDetail?.page_number,
     header_path: payload.header_path ?? chunkDetail?.header_path,
-    chunk_text: payload.chunk_text ?? chunkDetail?.chunk_text,
+    chunk_text: chunkDetail?.chunk_text ?? payload.chunk_text,
     highlight_text: payload.highlight_text,
   };
 
