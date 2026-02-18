@@ -189,7 +189,7 @@ const ComposerAction: FC<{ deepResearchAvailable: boolean }> = ({ deepResearchAv
             className="aui-composer-send size-8 rounded-full bg-[#2a2a2a] hover:bg-[#383838] text-white border-0"
             aria-label="Send message"
           >
-            <ArrowUpIcon className="aui-composer-send-icon size-4" />
+            <ArrowUpIcon className="aui-composer-send-icon size-4 aui-icon-accent" />
           </TooltipIconButton>
         </ComposerPrimitive.Send>
       </AuiIf>

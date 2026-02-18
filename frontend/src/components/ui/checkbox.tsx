@@ -46,15 +46,15 @@ export function Checkbox({
           "transition-colors duration-100",
           "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30",
           checked
-            ? "bg-white border border-white"
+            ? "bg-muted-foreground border border-muted-foreground/70"
             : "bg-transparent border border-[#555] hover:border-[#888]",
           disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer",
-        ].join(" ")}
+        ].join(" ") }
       >
         {checked && (
           <svg
             viewBox="0 0 24 24"
-            className="w-3 h-3 text-black"
+            className="w-3 h-3 text-foreground"
             fill="none"
             stroke="currentColor"
             strokeWidth={2.8}

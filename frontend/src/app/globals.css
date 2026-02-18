@@ -54,8 +54,37 @@
   --input: #1a1a1a;
   --ring: #444444;
 
+  /* Icon accent (used for send arrow + file icons) */
+  --icon-accent: #93C5FD; /* Pastel Sky */
+  --icon-accent-hover: #BEE7FF;
+
   /* Radius */
   --radius: 0.5rem;
+}
+
+/* Icon accent utility (applies to SVGs using currentColor) */
+.aui-icon-accent {
+  color: var(--icon-accent);
+}
+.aui-icon-accent:hover {
+  color: var(--icon-accent-hover);
+}
+/* also change send-arrow when its button is hovered */
+.aui-composer-send:hover .aui-composer-send-icon.aui-icon-accent {
+  color: var(--icon-accent-hover);
+}
+
+/* Citation badge (small source-number) — uses the shared icon accent */
+.aui-citation-badge {
+  color: var(--icon-accent);
+  background-color: rgba(147,197,253,0.12); /* fallback */
+  background-color: color-mix(in srgb, var(--icon-accent) 12%, transparent);
+  border: 1px solid rgba(147,197,253,0.18); /* fallback */
+  border-color: color-mix(in srgb, var(--icon-accent) 20%, transparent);
+}
+.aui-citation-badge:hover {
+  color: var(--icon-accent-hover);
+  background-color: color-mix(in srgb, var(--icon-accent-hover) 14%, transparent);
 }
 
 @theme inline {
