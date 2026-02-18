@@ -136,8 +136,8 @@ mark.citation-highlight {
 
 /* ─── Thread viewport footer separator ──────────────────────────────────────── */
 .aui-thread-viewport-footer {
-  border-top: 1px solid #1e1e1e;
-  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
+  border-top: 0;
+  box-shadow: none;
 }
 
 /* Markdown content prose overrides for dark theme */

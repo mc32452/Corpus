@@ -4,6 +4,7 @@ import { ThinkingPanel } from "@/components/assistant-ui/thinking-panel";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -15,6 +16,7 @@ import {
   MessagePrimitive,
   SuggestionPrimitive,
   ThreadPrimitive,
+  useAuiState,
 } from "@assistant-ui/react";
 import {
   ArrowDownIcon,
@@ -244,51 +246,159 @@ const AssistantMessage: FC = () => {
 };
 
 const AssistantActionBar: FC = () => {
+  const isRunning = useAuiState((s) => s.message.status?.type === "running");
+
   return (
     <ActionBarPrimitive.Root
-      hideWhenRunning
       autohide="not-last"
       autohideFloat="single-branch"
       className="aui-assistant-action-bar-root col-start-3 row-start-2 -ml-1 flex gap-1 text-muted-foreground data-floating:absolute data-floating:rounded-md data-floating:border data-floating:bg-background data-floating:p-1 data-floating:shadow-sm"
     >
-      <ActionBarPrimitive.Copy asChild>
-        <TooltipIconButton tooltip="Copy">
-          <AuiIf condition={(s) => s.message.isCopied}>
-            <CheckIcon />
-          </AuiIf>
-          <AuiIf condition={(s) => !s.message.isCopied}>
-            <CopyIcon />
-          </AuiIf>
-        </TooltipIconButton>
-      </ActionBarPrimitive.Copy>
-      <ActionBarPrimitive.Reload asChild>
-        <TooltipIconButton tooltip="Refresh">
-          <RefreshCwIcon />
-        </TooltipIconButton>
-      </ActionBarPrimitive.Reload>
-      <ActionBarMorePrimitive.Root>
-        <ActionBarMorePrimitive.Trigger asChild>
-          <TooltipIconButton
-            tooltip="More"
-            className="data-[state=open]:bg-accent"
-          >
-            <MoreHorizontalIcon />
+      {!isRunning && (
+        <ActionBarPrimitive.Copy asChild>
+          <TooltipIconButton tooltip="Copy" side="top">
+            <AuiIf condition={(s) => s.message.isCopied}>
+              <CheckIcon />
+            </AuiIf>
+            <AuiIf condition={(s) => !s.message.isCopied}>
+              <CopyIcon />
+            </AuiIf>
           </TooltipIconButton>
-        </ActionBarMorePrimitive.Trigger>
-        <ActionBarMorePrimitive.Content
-          side="bottom"
-          align="start"
-          className="aui-action-bar-more-content z-50 min-w-32 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
-        >
-          <ActionBarPrimitive.ExportMarkdown asChild>
-            <ActionBarMorePrimitive.Item className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground">
-              <DownloadIcon className="size-4" />
-              Export as Markdown
-            </ActionBarMorePrimitive.Item>
-          </ActionBarPrimitive.ExportMarkdown>
-        </ActionBarMorePrimitive.Content>
-      </ActionBarMorePrimitive.Root>
+        </ActionBarPrimitive.Copy>
+      )}
+      {!isRunning && (
+        <ActionBarPrimitive.Reload asChild>
+          <TooltipIconButton tooltip="Refresh" side="top">
+            <RefreshCwIcon />
+          </TooltipIconButton>
+        </ActionBarPrimitive.Reload>
+      )}
+      <MessageTimingBadge />
+      {!isRunning && (
+        <ActionBarMorePrimitive.Root>
+          <ActionBarMorePrimitive.Trigger asChild>
+            <TooltipIconButton
+              tooltip="More"
+              side="top"
+              className="data-[state=open]:bg-accent"
+            >
+              <MoreHorizontalIcon />
+            </TooltipIconButton>
+          </ActionBarMorePrimitive.Trigger>
+          <ActionBarMorePrimitive.Content
+            side="bottom"
+            align="start"
+            className="aui-action-bar-more-content z-50 min-w-32 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+          >
+            <ActionBarPrimitive.ExportMarkdown asChild>
+              <ActionBarMorePrimitive.Item className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground">
+                <DownloadIcon className="size-4" />
+                Export as Markdown
+              </ActionBarMorePrimitive.Item>
+            </ActionBarPrimitive.ExportMarkdown>
+          </ActionBarMorePrimitive.Content>
+        </ActionBarMorePrimitive.Root>
+      )}
     </ActionBarPrimitive.Root>
+  );
+};
+
+const MessageTimingBadge: FC = () => {
+  const messageId = useAuiState((s) => s.message.id);
+  const isLast = useAuiState((s) => s.message.isLast);
+  const isRunning = useAuiState((s) => s.message.status?.type === "running");
+  const text = useAuiState((s) =>
+    s.message.parts.reduce((allText, part) => {
+      if (part.type !== "text") return allText;
+      if (!("text" in part) || typeof part.text !== "string") return allText;
+      return allText + part.text;
+    }, ""),
+  );
+
+  const [streamStartAt, setStreamStartAt] = useState<number | undefined>(undefined);
+  const [firstTokenAt, setFirstTokenAt] = useState<number | undefined>(undefined);
+  const [completedAt, setCompletedAt] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      setStreamStartAt(undefined);
+      setFirstTokenAt(undefined);
+      setCompletedAt(undefined);
+    });
+  }, [messageId]);
+
+  useEffect(() => {
+    if (!isRunning || streamStartAt !== undefined) return;
+    queueMicrotask(() => setStreamStartAt(Date.now()));
+  }, [isRunning, streamStartAt]);
+
+  useEffect(() => {
+    if (!isRunning || streamStartAt === undefined || firstTokenAt !== undefined || text.length === 0) return;
+    queueMicrotask(() => setFirstTokenAt(Date.now()));
+  }, [firstTokenAt, isRunning, streamStartAt, text]);
+
+  useEffect(() => {
+    if (isRunning || streamStartAt === undefined || completedAt !== undefined) return;
+    queueMicrotask(() => setCompletedAt(Date.now()));
+  }, [completedAt, isRunning, streamStartAt]);
+
+  if (!isLast) return null;
+  if (isRunning) return null;
+  if (streamStartAt === undefined || completedAt === undefined) return null;
+
+  const totalMs = Math.max(0, completedAt - streamStartAt);
+
+  const estimatedTokenCount = Math.max(1, Math.round(text.length / 4));
+  const tokensPerSecond =
+    totalMs >= 400 && estimatedTokenCount >= 8
+      ? estimatedTokenCount / (totalMs / 1000)
+      : undefined;
+  const retrievalMs =
+    streamStartAt !== undefined && firstTokenAt !== undefined
+      ? Math.max(0, firstTokenAt - streamStartAt)
+      : undefined;
+
+  const formatDetailedMs = (ms: number) =>
+    ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(2)}s`;
+  const formatBadgeMs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex h-6 items-center justify-center whitespace-nowrap rounded-md px-2 text-sm font-medium text-muted-foreground ring-offset-background transition-colors hover:bg-accent hover:text-accent-foreground"
+          aria-label="Message timing"
+        >
+          <span className="font-mono leading-none">{formatBadgeMs(totalMs)}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        align="center"
+        sideOffset={8}
+        className="min-w-52 border-[#2e2e2e] bg-[#1a1a1a] text-white shadow-xl"
+      >
+        <div className="space-y-1.5 text-sm">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-muted-foreground">Total</span>
+            <span className="font-mono text-foreground">{formatDetailedMs(totalMs)}</span>
+          </div>
+          {tokensPerSecond !== undefined && Number.isFinite(tokensPerSecond) && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-muted-foreground">Speed</span>
+              <span className="font-mono text-foreground">{tokensPerSecond.toFixed(1)} tok/s</span>
+            </div>
+          )}
+          {retrievalMs !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-muted-foreground">Retrieval</span>
+              <span className="font-mono text-foreground">{formatDetailedMs(retrievalMs)}</span>
+            </div>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
   );
 };
 
