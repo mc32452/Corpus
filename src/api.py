@@ -90,33 +90,64 @@ logger = logging.getLogger(__name__)
 # Module-level state (set during lifespan)
 # ---------------------------------------------------------------------------
 
-_engine: Optional[object] = None  # Will be RagEngine once loaded
+_engine: object | None = None        # the single currently-loaded RagEngine
+_engine_mode: str | None = None      # which mode that engine was built for
 _engine_init_lock = threading.Lock()
 _engine_loaded: bool = False
 
+# Map frontend model IDs (from assistant-ui ModelSelector) to backend mode strings
+_FRONTEND_MODE_MAP: dict[str, str] = {
+    "regular": "regular",
+    "deep-research": "power-deep-research",
+    "turbo": "turbo",
+}
 
-def _get_engine():
-    """Return the RagEngine instance, importing lazily to avoid heavy imports at module level."""
-    global _engine, _engine_loaded
-    if _engine is not None:
+
+def _get_engine(mode: str = "regular"):
+    """Return the RagEngine for the given mode.
+
+    Only one engine is kept in memory at a time.  If the requested mode
+    differs from the currently-loaded engine, the old engine is closed and a
+    new one is initialised for the new mode.
+    """
+    global _engine, _engine_mode, _engine_loaded
+
+    # Fast path — already the right model.
+    if _engine is not None and _engine_mode == mode:
         return _engine
 
     from .rag_engine import RagEngine, RagEngineConfig
 
     with _engine_init_lock:
-        if _engine is not None:
+        # Re-check under the lock in case another thread just swapped.
+        if _engine is not None and _engine_mode == mode:
             return _engine
+
+        # Unload the old engine if one is loaded.
+        if _engine is not None:
+            logger.info(
+                "Swapping engine: unloading mode=%r, loading mode=%r",
+                _engine_mode,
+                mode,
+            )
+            try:
+                _engine.close()  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("Error closing old engine (mode=%r)", _engine_mode)
+            _engine = None
+            _engine_mode = None
+            _engine_loaded = False
+
         try:
-            logger.info("Initializing RagEngine...")
-            config = RagEngineConfig()
+            logger.info("Initializing RagEngine (mode=%s)...", mode)
+            config = RagEngineConfig(mode=mode)
             _engine = RagEngine(config)
+            _engine_mode = mode
             _engine_loaded = True
-            logger.info("RagEngine initialized successfully")
+            logger.info("RagEngine (mode=%s) initialized successfully", mode)
             return _engine
         except Exception:
-            _engine = None
-            _engine_loaded = False
-            logger.exception("RagEngine initialization failed")
+            logger.exception("RagEngine initialization failed (mode=%s)", mode)
             raise
 
 
@@ -128,7 +159,7 @@ def _get_engine():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: initialize engine on startup, cleanup on shutdown."""
-    global _engine, _engine_loaded
+    global _engine_loaded
     try:
         import os
 
@@ -138,12 +169,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to initialize RagEngine at startup")
     yield
+    global _engine, _engine_mode
     if _engine is not None:
         try:
             _engine.close()  # type: ignore[union-attr]
         except Exception:
             pass
-    _engine = None
+        _engine = None
+        _engine_mode = None
     _engine_loaded = False
 
 
@@ -189,6 +222,20 @@ async def validation_exception_handler(request: Request, exc: Exception):
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="ok", engine_loaded=_engine_loaded)
+
+
+@app.get("/api/system-info")
+async def system_info():
+    """Return basic hardware info so the frontend can conditionally enable features."""
+    import subprocess
+    try:
+        ram_bytes_str = subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"], text=True
+        ).strip()
+        ram_gb = int(int(ram_bytes_str) / (1024 ** 3))
+    except Exception:
+        ram_gb = 0
+    return JSONResponse({"ram_gb": ram_gb})
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +328,7 @@ async def _chat_stream_generator(
 
     source_id = None
     citations_enabled = None
+    request_mode = "regular"
     if chat_request.data:
         # Support both source_ids (plural, from frontend) and source_id (singular, legacy).
         # The engine only supports single source_id filtering; if exactly one source
@@ -293,11 +341,17 @@ async def _chat_stream_generator(
         if "citations_enabled" in chat_request.data:
             citations_enabled = bool(chat_request.data["citations_enabled"])
 
+    # Extract mode from AI SDK config.modelName (sent by the ModelSelector component)
+    frontend_config = (chat_request.model_extra or {}).get("config") or {}
+    frontend_model_name = frontend_config.get("modelName", "regular")
+    request_mode = _FRONTEND_MODE_MAP.get(frontend_model_name, "regular")
+    logger.info("Chat request: frontend model=%r → backend mode=%r", frontend_model_name, request_mode)
+
     # --- Producer: runs in thread, pushes events to queue ---
     def _producer() -> None:
         try:
             logger.info("Chat producer: thread started")
-            engine = _get_engine()
+            engine = _get_engine(request_mode)
             logger.info("Chat producer: _get_engine() returned, starting query_events")
             for event in engine.query_events(
                 query_text,

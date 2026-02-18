@@ -1,9 +1,5 @@
-import {
-  ComposerAddAttachment,
-  ComposerAttachments,
-  UserMessageAttachments,
-} from "@/components/assistant-ui/attachment";
 import { ChatMarkdownRendererWithSmooth } from "@/components/assistant-ui/chat-markdown-renderer";
+import { ModelSelector } from "@/components/assistant-ui/model-selector";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
@@ -32,7 +28,7 @@ import {
   RefreshCwIcon,
   SquareIcon,
 } from "lucide-react";
-import type { FC } from "react";
+import { type FC, useEffect, useState } from "react";
 
 export const Thread: FC = () => {
   return (
@@ -131,11 +127,27 @@ const ThreadSuggestionItem: FC = () => {
   );
 };
 
+function useDeepResearchAvailable(): boolean {
+  const [available, setAvailable] = useState(false);
+  useEffect(() => {
+    fetch("/api/system-info")
+      .then((r) => r.json())
+      .then((data) => setAvailable((data?.ram_gb ?? 0) >= 48))
+      .catch(() => setAvailable(false));
+  }, []);
+  return available;
+}
+
+const MODES = [
+  { id: "regular", name: "Regular", description: "Standard research mode" },
+  { id: "deep-research", name: "Deep Research", description: "In-depth multi-step analysis" },
+];
+
 const Composer: FC = () => {
+  const deepResearchAvailable = useDeepResearchAvailable();
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone className="aui-composer-attachment-dropzone flex w-full flex-col rounded-[14px] border border-[#2e2e2e] bg-[#1a1a1a] px-1 pt-2 outline-none transition-shadow has-[textarea:focus-visible]:border-[#444444] has-[textarea:focus-visible]:ring-2 has-[textarea:focus-visible]:ring-[#333333] data-[dragging=true]:border-[#444444] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[#222222]">
-        <ComposerAttachments />
+      <div className="aui-composer-attachment-dropzone flex w-full flex-col rounded-[14px] border border-[#2e2e2e] bg-[#1a1a1a] px-1 pt-2 outline-none transition-shadow focus-within:border-[#444444]">
         <ComposerPrimitive.Input
           placeholder="Send a message..."
           className="aui-composer-input mb-1 max-h-32 min-h-14 w-full resize-none bg-transparent px-4 pt-2 pb-3 text-sm text-white outline-none placeholder:text-[#555555] focus-visible:ring-0"
@@ -143,16 +155,25 @@ const Composer: FC = () => {
           autoFocus
           aria-label="Message input"
         />
-        <ComposerAction />
-      </ComposerPrimitive.AttachmentDropzone>
+        <ComposerAction deepResearchAvailable={deepResearchAvailable} />
+      </div>
     </ComposerPrimitive.Root>
   );
 };
 
-const ComposerAction: FC = () => {
+const ComposerAction: FC<{ deepResearchAvailable: boolean }> = ({ deepResearchAvailable }) => {
   return (
     <div className="aui-composer-action-wrapper relative mx-2 mb-2 flex items-center justify-between">
-      <ComposerAddAttachment />
+      <div>
+        {deepResearchAvailable && (
+          <ModelSelector
+            models={MODES}
+            defaultValue="regular"
+            variant="ghost"
+            size="sm"
+          />
+        )}
+      </div>
       <AuiIf condition={(s) => !s.thread.isRunning}>
         <ComposerPrimitive.Send asChild>
           <TooltipIconButton
@@ -274,8 +295,6 @@ const UserMessage: FC = () => {
       className="aui-user-message-root fade-in slide-in-from-bottom-1 mx-auto grid w-full max-w-(--thread-max-width) animate-in auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 py-4 duration-150 [&:where(>*)]:col-start-2"
       data-role="user"
     >
-      <UserMessageAttachments />
-
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div
           className="aui-user-message-content wrap-break-word px-4 py-3 text-white"
