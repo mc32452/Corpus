@@ -79,15 +79,20 @@ export default function Page() {
     switch (event.type) {
       case "status":
         dispatch({ type: "SET_STATUS", status: event.status });
+        dispatch({ type: "ADD_THINKING_STEP", message: event.status });
         break;
-      case "intent":
+      case "intent": {
         dispatch({
           type: "SET_INTENT",
           intent: event.intent,
           confidence: event.confidence,
           method: event.method,
         });
+        const intentLabel = event.intent.charAt(0).toUpperCase() + event.intent.slice(1);
+        const pct = Math.round(event.confidence * 100);
+        dispatch({ type: "ADD_THINKING_STEP", message: `Intent identified: ${intentLabel} (${pct}% confidence)` });
         break;
+      }
       case "sources":
         dispatch({ type: "SET_SOURCES", sourceIds: event.sourceIds });
         break;

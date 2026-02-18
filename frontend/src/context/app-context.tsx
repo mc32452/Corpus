@@ -28,6 +28,17 @@ import type { Citation } from "@/lib/event-parser";
 export type { Citation };
 
 // ---------------------------------------------------------------------------
+// Thinking step — one status update emitted during RAG pipeline execution
+// ---------------------------------------------------------------------------
+
+export interface ThinkingStep {
+  /** Unique monotonic ID so React can key the list */
+  id: number;
+  /** User-friendly label for this pipeline step */
+  message: string;
+}
+
+// ---------------------------------------------------------------------------
 // State shape
 // ---------------------------------------------------------------------------
 
@@ -46,6 +57,10 @@ export interface AppState {
   citations: Citation[];
   /** The citation the user most recently clicked — read by CitationViewerModal */
   activeCitation: Citation | null;
+  /** Ordered log of pipeline steps emitted during the current query (cleared on QUERY_STARTED) */
+  thinkingSteps: ThinkingStep[];
+  /** Internal counter for generating unique ThinkingStep IDs */
+  _stepCounter: number;
 }
 
 const initialState: AppState = {
@@ -56,6 +71,8 @@ const initialState: AppState = {
   lastSources: [],
   citations: [],
   activeCitation: null,
+  thinkingSteps: [],
+  _stepCounter: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,7 +100,8 @@ export type AppAction =
   | { type: "SET_INTENT"; intent: string; confidence: number; method: string }
   | { type: "SET_SOURCES"; sourceIds: string[] }
   | { type: "SET_CITATIONS"; citations: Citation[] }
-  | { type: "SET_ACTIVE_CITATION"; citation: Citation | null };
+  | { type: "SET_ACTIVE_CITATION"; citation: Citation | null }
+  | { type: "ADD_THINKING_STEP"; message: string };
 
 // ---------------------------------------------------------------------------
 // Reducer
@@ -100,6 +118,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
         lastIntent: null,
         lastSources: [],
         citations: [],
+        thinkingSteps: [],
+        _stepCounter: 0,
       };
     case "QUERY_FINISHED":
       return {
@@ -133,6 +153,14 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, citations: action.citations };
     case "SET_ACTIVE_CITATION":
       return { ...state, activeCitation: action.citation };
+    case "ADD_THINKING_STEP": {
+      const id = state._stepCounter + 1;
+      return {
+        ...state,
+        _stepCounter: id,
+        thinkingSteps: [...state.thinkingSteps, { id, message: action.message }],
+      };
+    }
     default:
       return state;
   }

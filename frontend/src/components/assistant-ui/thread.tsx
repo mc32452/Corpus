@@ -1,5 +1,6 @@
 import { ChatMarkdownRendererWithSmooth } from "@/components/assistant-ui/chat-markdown-renderer";
 import { ModelSelector } from "@/components/assistant-ui/model-selector";
+import { ThinkingPanel } from "@/components/assistant-ui/thinking-panel";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
@@ -224,6 +225,7 @@ const AssistantMessage: FC = () => {
       data-role="assistant"
     >
       <div className="aui-assistant-message-content wrap-break-word px-2 text-foreground text-base leading-[1.65]">
+        <ThinkingPanel />
         <MessagePrimitive.Parts
           components={{
             Text: ChatMarkdownRendererWithSmooth,

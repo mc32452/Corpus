@@ -1,5 +1,25 @@
 @import "tailwindcss";
 
+/* ── Shimmer animation (replaces tw-shimmer package) ─────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.55) 50%,
+    transparent 100%
+  );
+  background-size: 200% auto;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 2s linear infinite;
+}
+
 /* ─── Monochrome dark theme (blacks / dark greys / white) ─────────────────── */
 :root {
   --background: #111111;
@@ -87,6 +107,22 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: #3a3a3a;
+}
+
+/* ── ThinkingPanel shimmer sweep ─────────────────────────────────────────── */
+@keyframes thinking-shimmer {
+  0%   { transform: translateX(-150%); }
+  100% { transform: translateX(150%); }
+}
+
+.thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.025) 50%,
+    transparent 100%
+  );
+  animation: thinking-shimmer 2.4s linear infinite;
 }
 
 /* Citation highlight in document viewer */
