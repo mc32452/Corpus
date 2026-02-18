@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { sourceApi, type SourceInfo } from "@/lib/api-client";
 import { IngestModal, type UploadRequest } from "@/components/ingest-modal";
 import { CitationPanelReader } from "@/components/citation-viewer-modal";
+import { File } from "@/components/assistant-ui/file";
 import { useAppState, useAppDispatch } from "@/context/app-context";
 
 interface SourcePanelProps {
@@ -251,7 +252,7 @@ export function SourcePanel({
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
+      <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: "#1e1e1e" }}>
         <h2 className="text-sm font-semibold text-foreground tracking-wide">
           Sources
         </h2>
@@ -302,7 +303,7 @@ export function SourcePanel({
       <div className="px-4 pt-3 pb-2">
         <button
           onClick={() => setShowIngestModal(true)}
-          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 rounded-xl text-sm text-muted-foreground hover:text-foreground font-medium transition-colors"
+          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-[#1e1e1e] hover:bg-[#252525] border border-[#2a2a2a] hover:border-[#333333] rounded-xl text-sm text-white font-medium transition-colors"
         >
           <svg
             className="w-4 h-4"
@@ -323,13 +324,13 @@ export function SourcePanel({
 
       {/* Select all */}
       {displaySources.length > 0 && (
-        <div className="px-4 py-2 border-b" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
+        <div className="px-4 py-2 border-b" style={{ borderColor: "#1e1e1e" }}>
           <label className="flex items-center gap-2.5 cursor-pointer group">
             <input
               type="checkbox"
               checked={allSelected}
               onChange={handleSelectAll}
-              className="w-4 h-4 rounded border-white/20 bg-white/5 accent-indigo-500 cursor-pointer"
+              className="w-4 h-4 rounded border-white/20 bg-white/5 accent-white cursor-pointer"
             />
             <span className="text-xs text-muted-foreground group-hover:text-foreground transition-colors">
               Select all sources
@@ -364,16 +365,16 @@ export function SourcePanel({
         <div className="px-3 py-1 space-y-1">
           {/* Inline upload status */}
           {uploadStatus?.stage === "uploading" && (
-            <div className="flex items-center gap-3 px-3 py-3 bg-blue-900/20 border border-blue-800/30 rounded-xl animate-pulse">
-              <svg className="w-5 h-5 text-blue-400 animate-spin shrink-0" viewBox="0 0 24 24" fill="none">
+            <div className="flex items-center gap-3 px-3 py-3 bg-white/5 border border-white/15 rounded-xl animate-pulse">
+              <svg className="w-5 h-5 text-white/80 animate-spin shrink-0" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
               <div className="min-w-0">
-                <p className="text-sm font-medium text-blue-300 truncate">
+                <p className="text-sm font-medium text-gray-100 truncate">
                   Ingesting {uploadStatus.fileName}...
                 </p>
-                <p className="text-xs text-blue-400/70 mt-0.5">
+                <p className="text-xs text-gray-400 mt-0.5">
                   Chunking, embedding &amp; summarizing
                   {uploadStatus.queued > 0 ? ` · ${uploadStatus.queued} queued` : ""}
                 </p>
@@ -415,8 +416,8 @@ export function SourcePanel({
             return (
               <div
                 key={source.source_id}
-                className={`px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors group cursor-pointer ${
-                  isHighlighted ? "ring-2 ring-blue-500/60 bg-blue-900/20" : ""
+                className={`px-3 py-2.5 rounded-lg hover:bg-[#1a1a1a] transition-colors group cursor-pointer ${
+                  isHighlighted ? "bg-[#1c1c1c]" : ""
                 }`}
                 onClick={() =>
                   setActiveSourceId((prev) =>
@@ -435,24 +436,20 @@ export function SourcePanel({
                 }}
               >
                 <div className="flex items-center gap-3">
-                  {/* PDF icon */}
-                  <svg
-                    className="w-8 h-8 text-red-400 shrink-0"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={1.5}
+                  <File.Root
+                    variant="ghost"
+                    size="sm"
+                    className="p-0 border-0 bg-transparent"
                   >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"
+                    <File.Icon
+                      mimeType="application/pdf"
+                      className="w-8 h-8 text-white/85 shrink-0"
                     />
-                  </svg>
+                  </File.Root>
 
                   {/* Title */}
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-foreground truncate">
+                    <p className="text-sm font-medium text-[#e0e0e0] truncate">
                       {source.source_id}
                     </p>
                     <p className="mt-0.5 text-xs text-muted-foreground/70 truncate">
@@ -494,7 +491,7 @@ export function SourcePanel({
                     onChange={() => handleToggleSource(source.source_id)}
                     onClick={(e) => e.stopPropagation()}
                     disabled={isPending}
-                    className="w-4 h-4 rounded border-white/20 bg-white/5 accent-indigo-500 cursor-pointer shrink-0 disabled:opacity-50"
+                    className="w-4 h-4 rounded border-white/20 bg-white/5 accent-white cursor-pointer shrink-0 disabled:opacity-50"
                   />
                 </div>
 
@@ -541,7 +538,7 @@ export function SourcePanel({
       </div>
 
       {/* Footer */}
-      <div className="px-4 py-2 border-t text-xs text-muted-foreground/50" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
+      <div className="px-4 py-2 border-t text-xs text-[#555555]" style={{ borderColor: "#1e1e1e" }}>
         {displaySources.length} source{displaySources.length !== 1 ? "s" : ""} &middot;{" "}
         {selectedSourceIds.length} selected
       </div>

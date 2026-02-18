@@ -1,38 +1,38 @@
 @import "tailwindcss";
 
-/* ─── Shadcn/assistant-ui CSS variable theme (dark slate) ─────────────────── */
+/* ─── Monochrome dark theme (blacks / dark greys / white) ─────────────────── */
 :root {
-  --background: #030712;
-  --foreground: #f3f4f6;
+  --background: #111111;
+  --foreground: #ffffff;
 
   /* Card / popover surfaces */
-  --card: #0f172a;
-  --card-foreground: #f3f4f6;
-  --popover: #0f172a;
-  --popover-foreground: #f3f4f6;
+  --card: #1a1a1a;
+  --card-foreground: #ffffff;
+  --popover: #1a1a1a;
+  --popover-foreground: #ffffff;
 
-  /* Primary interactive elements */
-  --primary: #f8fafc;
-  --primary-foreground: #0f172a;
+  /* Primary interactive elements (dark buttons with white text) */
+  --primary: #2a2a2a;
+  --primary-foreground: #ffffff;
 
   /* Secondary / muted */
-  --secondary: #1e293b;
-  --secondary-foreground: #f8fafc;
-  --muted: #1e293b;
-  --muted-foreground: #94a3b8;
+  --secondary: #1e1e1e;
+  --secondary-foreground: #ffffff;
+  --muted: #1e1e1e;
+  --muted-foreground: #888888;
 
   /* Accent */
-  --accent: #1e293b;
-  --accent-foreground: #f8fafc;
+  --accent: #1c1c1c;
+  --accent-foreground: #ffffff;
 
   /* Destructive */
   --destructive: #ef4444;
   --destructive-foreground: #f8fafc;
 
   /* Input / ring / border */
-  --border: #1e293b;
-  --input: #1e293b;
-  --ring: #94a3b8;
+  --border: #2a2a2a;
+  --input: #1a1a1a;
+  --ring: #444444;
 
   /* Radius */
   --radius: 0.5rem;
@@ -68,7 +68,7 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 /* Custom scrollbar for dark theme */
@@ -81,12 +81,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #374151;
+  background: #2a2a2a;
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: #3a3a3a;
 }
 
 /* Citation highlight in document viewer */
@@ -100,8 +100,8 @@ mark.citation-highlight {
 
 /* ─── Thread viewport footer separator ──────────────────────────────────────── */
 .aui-thread-viewport-footer {
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.4);
+  border-top: 1px solid #1e1e1e;
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
 }
 
 /* Markdown content prose overrides for dark theme */
@@ -116,4 +116,16 @@ mark.citation-highlight {
 .markdown-content h5,
 .markdown-content h6 {
   scroll-margin-top: 80px;
+}
+
+/* Force monochrome citation chips across renderers */
+button[title^="View source:"] {
+  background: #2a2a2a !important;
+  border: 1px solid #3a3a3a !important;
+  color: #e0e0e0 !important;
+  line-height: 1 !important;
+}
+
+button[title^="View source:"]:hover:not(:disabled) {
+  background: #333333 !important;
 }

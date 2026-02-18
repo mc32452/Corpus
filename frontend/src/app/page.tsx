@@ -145,7 +145,7 @@ export default function Page() {
 
         {/* Left: Source Panel — 30% width, independently scrollable */}
         {!isPanelCollapsed ? (
-          <aside className="w-[30%] min-w-60 max-w-sm border-r shrink-0 overflow-hidden flex flex-col" style={{ borderRightColor: "rgba(255,255,255,0.08)" }}>
+          <aside className="w-[30%] min-w-60 max-w-sm border-r shrink-0 overflow-hidden flex flex-col" style={{ borderRightColor: "#1e1e1e" }}>
             <SourcePanel
               selectedSourceIds={selectedSourceIds}
               onSelectedSourceIdsChange={setSelectedSourceIds}
@@ -154,7 +154,7 @@ export default function Page() {
           </aside>
         ) : (
           /* Collapsed state: thin strip with expand button */
-          <aside className="w-10 border-r shrink-0 flex flex-col items-center pt-3" style={{ borderRightColor: "rgba(255,255,255,0.08)" }}>
+          <aside className="w-10 border-r shrink-0 flex flex-col items-center pt-3" style={{ borderRightColor: "#1e1e1e" }}>
             <button
               onClick={() => setIsPanelCollapsed(false)}
               className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-white/5 rounded transition-colors"

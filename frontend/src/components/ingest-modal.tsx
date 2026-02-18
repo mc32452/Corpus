@@ -158,9 +158,9 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
             onClick={() => fileInputRef.current?.click()}
             className={`flex flex-col items-center justify-center gap-2 px-4 py-8 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${
               dragOver
-                ? "border-blue-500 bg-blue-500/10"
+                ? "border-white/60 bg-white/10"
                 : files.length > 0
-                ? "border-green-600/50 bg-green-900/10"
+                ? "border-white/40 bg-white/5"
                 : "border-gray-700 hover:border-gray-600 bg-gray-800/30"
             }`}
           >
@@ -181,7 +181,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
 
             {files.length > 0 ? (
               <>
-                <svg className="w-8 h-8 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <svg className="w-8 h-8 text-white/80" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 <p className="text-sm text-gray-200 font-medium truncate max-w-full">
@@ -200,7 +200,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
                 </svg>
                 <p className="text-sm text-gray-400">
-                  Drop a file here or <span className="text-blue-400">browse</span>
+                  Drop a file here or <span className="text-white">browse</span>
                 </p>
                 <p className="text-xs text-gray-600">
                   PDF, Markdown &middot; Up to 50MB
@@ -226,7 +226,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                   })
                 }
                 placeholder="Auto-generated from filename"
-                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white/40 focus:border-transparent disabled:opacity-50"
               />
               <p className="mt-1 text-[11px] text-gray-600">
                 Unique identifier. Letters, numbers, hyphens, underscores.
@@ -251,7 +251,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                           return next;
                         })
                       }
-                      className="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      className="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white/40 focus:border-transparent"
                     />
                   </div>
                 ))}
@@ -265,7 +265,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
               type="checkbox"
               checked={summarize}
               onChange={(e) => setSummarize(e.target.checked)}
-              className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500 focus:ring-offset-0 focus:ring-1 cursor-pointer"
+              className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-white focus:ring-white/40 focus:ring-offset-0 focus:ring-1 cursor-pointer"
             />
             <span className="text-sm text-gray-300">
               Generate summary during ingest
@@ -294,7 +294,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
               files.length === 0 ||
               sourceIds.some((sid) => !(sid ?? "").trim())
             }
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed"
+            className="px-4 py-2 bg-white text-black hover:bg-gray-200 disabled:bg-gray-700 disabled:text-gray-500 text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed"
           >
             {files.length > 1 ? `Upload & Ingest ${files.length} Files` : "Upload & Ingest"}
           </button>

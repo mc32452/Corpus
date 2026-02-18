@@ -90,7 +90,7 @@ export function ChatMarkdown({
               );
 
               return (
-                <sup className="inline-flex items-center ml-0.5 mr-0.5">
+                <span className="inline-flex items-center mx-0.5 align-middle">
                   <button
                     type="button"
                     onClick={(event) => {
@@ -100,20 +100,13 @@ export function ChatMarkdown({
                         dispatch({ type: "SET_ACTIVE_CITATION", citation });
                       }
                     }}
-                    className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-semibold text-indigo-300 hover:text-indigo-100 rounded-full cursor-pointer transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                    style={{
-                      background: "rgba(99,102,241,0.15)",
-                      border: "1px solid rgba(99,102,241,0.35)",
-                      lineHeight: 1,
-                    }}
+                    className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-semibold text-black rounded-full cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed bg-white/90 border border-white/80 hover:bg-white"
                     title={citation ? `View source: ${citation.source_id}` : "Source (no metadata)"}
                     disabled={!citation}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(99,102,241,0.28)"; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(99,102,241,0.15)"; }}
                   >
                     {children}
                   </button>
-                </sup>
+                </span>
               );
             }
 
@@ -122,7 +115,7 @@ export function ChatMarkdown({
                 href={href}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-blue-400 hover:underline"
+                className="text-foreground hover:text-white underline underline-offset-2 decoration-white/40"
               >
                 {children}
               </a>

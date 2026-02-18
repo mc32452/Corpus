@@ -95,9 +95,9 @@ function CitationPanelReaderInner() {
   );
 
   const formatBadgeColors: Record<string, string> = {
-    pdf: "bg-red-900/50 text-red-300 border-red-800",
-    markdown: "bg-purple-900/50 text-purple-300 border-purple-800",
-    text: "bg-gray-800 text-gray-400 border-gray-700",
+    pdf: "bg-white/10 text-gray-100 border-white/20",
+    markdown: "bg-white/10 text-gray-100 border-white/20",
+    text: "bg-gray-800 text-gray-300 border-gray-700",
   };
 
   return (
@@ -132,7 +132,7 @@ function CitationPanelReaderInner() {
         {isLoading && (
           <div className="flex items-center justify-center h-full text-muted-foreground">
             <div className="flex items-center gap-2">
-              <div className="w-3.5 h-3.5 border-2 border-gray-600 border-t-indigo-400 rounded-full animate-spin" />
+              <div className="w-3.5 h-3.5 border-2 border-gray-600 border-t-white rounded-full animate-spin" />
               <span className="text-xs">Loading…</span>
             </div>
           </div>

@@ -3,8 +3,7 @@ import {
   ComposerAttachments,
   UserMessageAttachments,
 } from "@/components/assistant-ui/attachment";
-import { MarkdownText } from "@/components/assistant-ui/markdown-text";
-import { ChatMarkdownRenderer } from "@/components/assistant-ui/chat-markdown-renderer";
+import { ChatMarkdownRendererWithSmooth } from "@/components/assistant-ui/chat-markdown-renderer";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
@@ -74,7 +73,7 @@ const ThreadScrollToBottom: FC = () => {
       <TooltipIconButton
         tooltip="Scroll to bottom"
         variant="outline"
-        className="aui-thread-scroll-to-bottom absolute -top-12 z-10 self-center rounded-full p-4 disabled:invisible dark:bg-background dark:hover:bg-accent"
+        className="aui-thread-scroll-to-bottom absolute -top-12 z-10 self-center rounded-full p-4 disabled:invisible bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] text-white"
       >
         <ArrowDownIcon />
       </TooltipIconButton>
@@ -118,7 +117,7 @@ const ThreadSuggestionItem: FC = () => {
       <SuggestionPrimitive.Trigger send asChild>
         <Button
           variant="ghost"
-          className="aui-thread-welcome-suggestion h-auto w-full @md:flex-col flex-wrap items-start justify-start gap-1 rounded-2xl border px-4 py-3 text-left text-sm transition-colors hover:bg-muted"
+          className="aui-thread-welcome-suggestion h-auto w-full @md:flex-col flex-wrap items-start justify-start gap-1 rounded-2xl border border-[#2a2a2a] bg-[#1a1a1a] hover:bg-[#222222] px-4 py-3 text-left text-sm transition-colors"
         >
           <span className="aui-thread-welcome-suggestion-text-1 font-medium">
             <SuggestionPrimitive.Title />
@@ -135,11 +134,11 @@ const ThreadSuggestionItem: FC = () => {
 const Composer: FC = () => {
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone className="aui-composer-attachment-dropzone flex w-full flex-col rounded-xl border border-input bg-white/5 px-1 pt-2 outline-none transition-shadow has-[textarea:focus-visible]:border-indigo-500/50 has-[textarea:focus-visible]:ring-2 has-[textarea:focus-visible]:ring-indigo-500/20 data-[dragging=true]:border-ring data-[dragging=true]:border-dashed data-[dragging=true]:bg-accent/50">
+      <ComposerPrimitive.AttachmentDropzone className="aui-composer-attachment-dropzone flex w-full flex-col rounded-[14px] border border-[#2e2e2e] bg-[#1a1a1a] px-1 pt-2 outline-none transition-shadow has-[textarea:focus-visible]:border-[#444444] has-[textarea:focus-visible]:ring-2 has-[textarea:focus-visible]:ring-[#333333] data-[dragging=true]:border-[#444444] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[#222222]">
         <ComposerAttachments />
         <ComposerPrimitive.Input
           placeholder="Send a message..."
-          className="aui-composer-input mb-1 max-h-32 min-h-14 w-full resize-none bg-transparent px-4 pt-2 pb-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-0"
+          className="aui-composer-input mb-1 max-h-32 min-h-14 w-full resize-none bg-transparent px-4 pt-2 pb-3 text-sm text-white outline-none placeholder:text-[#555555] focus-visible:ring-0"
           rows={1}
           autoFocus
           aria-label="Message input"
@@ -162,7 +161,7 @@ const ComposerAction: FC = () => {
             type="submit"
             variant="default"
             size="icon"
-            className="aui-composer-send size-8 rounded-full"
+            className="aui-composer-send size-8 rounded-full bg-[#2a2a2a] hover:bg-[#383838] text-white border-0"
             aria-label="Send message"
           >
             <ArrowUpIcon className="aui-composer-send-icon size-4" />
@@ -175,7 +174,7 @@ const ComposerAction: FC = () => {
             type="button"
             variant="default"
             size="icon"
-            className="aui-composer-cancel size-8 rounded-full"
+            className="aui-composer-cancel size-8 rounded-full bg-[#2a2a2a] hover:bg-[#383838] text-white border-0"
             aria-label="Stop generating"
           >
             <SquareIcon className="aui-composer-cancel-icon size-3 fill-current" />
@@ -205,7 +204,7 @@ const AssistantMessage: FC = () => {
       <div className="aui-assistant-message-content wrap-break-word px-2 text-foreground text-base leading-[1.65]">
         <MessagePrimitive.Parts
           components={{
-            Text: ChatMarkdownRenderer,
+            Text: ChatMarkdownRendererWithSmooth,
             tools: { Fallback: ToolFallback },
           }}
         />
@@ -281,7 +280,7 @@ const UserMessage: FC = () => {
         <div
           className="aui-user-message-content wrap-break-word px-4 py-3 text-white"
           style={{
-            background: "rgba(79,70,229,0.85)",
+            background: "#2a2a2a",
             borderRadius: "18px 18px 4px 18px",
           }}
         >
