@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Checkbox } from "@/components/ui/checkbox";
 
 export interface UploadRequest {
   file: File;
@@ -122,7 +123,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -130,19 +131,19 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
       <div
         ref={modalRef}
         tabIndex={-1}
-        className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-md mx-4 outline-none"
+        className="bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-2xl w-full max-w-md mx-4 outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
-          <h2 className="text-base font-semibold text-gray-100">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border)]">
+          <h2 className="text-sm font-semibold text-[var(--foreground)]">
             Add Source Document
           </h2>
           <button
             onClick={onClose}
-            className="p-1 text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors"
+            className="p-1 text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-white/5 rounded-lg transition-colors"
           >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
@@ -150,7 +151,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
 
         {/* Body */}
         <div className="px-6 py-5 space-y-4">
-          {/* Drag & drop zone / file picker */}
+          {/* Drag & drop zone */}
           <div
             onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
             onDragLeave={() => setDragOver(false)}
@@ -158,10 +159,10 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
             onClick={() => fileInputRef.current?.click()}
             className={`flex flex-col items-center justify-center gap-2 px-4 py-8 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${
               dragOver
-                ? "border-white/60 bg-white/10"
+                ? "border-white/50 bg-white/8"
                 : files.length > 0
-                ? "border-white/40 bg-white/5"
-                : "border-gray-700 hover:border-gray-600 bg-gray-800/30"
+                ? "border-white/25 bg-white/4"
+                : "border-[var(--border)] hover:border-[#3a3a3a] bg-[var(--secondary)]"
             }`}
           >
             <input
@@ -174,20 +175,19 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                 if (e.target.files && e.target.files.length > 0) {
                   handleFileSelect(e.target.files);
                 }
-                // Reset so same file can be re-selected
                 e.target.value = "";
               }}
             />
 
             {files.length > 0 ? (
               <>
-                <svg className="w-8 h-8 text-white/80" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <svg className="w-8 h-8 text-white/70" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <p className="text-sm text-gray-200 font-medium truncate max-w-full">
+                <p className="text-sm text-[var(--foreground)] font-medium truncate max-w-full">
                   {files.length === 1 ? files[0].name : `${files.length} files selected`}
                 </p>
-                <p className="text-xs text-gray-500">
+                <p className="text-xs text-[var(--muted-foreground)]">
                   {files.length === 1
                     ? `${(files[0].size / 1024).toFixed(0)} KB`
                     : `${(files.reduce((total, f) => total + f.size, 0) / (1024 * 1024)).toFixed(1)} MB total`}
@@ -196,14 +196,14 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
               </>
             ) : (
               <>
-                <svg className="w-8 h-8 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <svg className="w-8 h-8 text-[var(--muted-foreground)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
                 </svg>
-                <p className="text-sm text-gray-400">
-                  Drop a file here or <span className="text-white">browse</span>
+                <p className="text-sm text-[var(--muted-foreground)]">
+                  Drop a file here or <span className="text-[var(--foreground)]">browse</span>
                 </p>
-                <p className="text-xs text-gray-600">
-                  PDF, Markdown &middot; Up to 50MB
+                <p className="text-xs text-[var(--muted-foreground)]/60">
+                  PDF, Markdown &middot; Up to 50 MB
                 </p>
               </>
             )}
@@ -212,7 +212,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
           {/* Source ID input(s) */}
           {files.length <= 1 ? (
             <div>
-              <label className="block text-xs text-gray-400 mb-1.5">
+              <label className="block text-xs text-[var(--muted-foreground)] mb-1.5">
                 Source ID
               </label>
               <input
@@ -226,19 +226,19 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                   })
                 }
                 placeholder="Auto-generated from filename"
-                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white/40 focus:border-transparent disabled:opacity-50"
+                className="w-full px-3 py-2 bg-[var(--secondary)] border border-[var(--border)] rounded-lg text-sm text-[var(--foreground)] placeholder-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-white/20 focus:border-transparent transition-colors"
               />
-              <p className="mt-1 text-[11px] text-gray-600">
+              <p className="mt-1 text-[11px] text-[var(--muted-foreground)]/60">
                 Unique identifier. Letters, numbers, hyphens, underscores.
               </p>
             </div>
           ) : (
             <div className="space-y-2">
-              <p className="text-xs text-gray-400">Source IDs</p>
+              <p className="text-xs text-[var(--muted-foreground)]">Source IDs</p>
               <div className="max-h-40 overflow-y-auto space-y-2 pr-1">
                 {files.map((file, idx) => (
                   <div key={`${file.name}-${file.size}-${idx}`}>
-                    <label className="block text-[11px] text-gray-500 mb-1 truncate" title={file.name}>
+                    <label className="block text-[11px] text-[var(--muted-foreground)] mb-1 truncate" title={file.name}>
                       {file.name}
                     </label>
                     <input
@@ -251,7 +251,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
                           return next;
                         })
                       }
-                      className="w-full px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white/40 focus:border-transparent"
+                      className="w-full px-3 py-1.5 bg-[var(--secondary)] border border-[var(--border)] rounded-lg text-sm text-[var(--foreground)] placeholder-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-white/20 focus:border-transparent"
                     />
                   </div>
                 ))}
@@ -260,31 +260,29 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
           )}
 
           {/* Summarize checkbox */}
-          <label className="flex items-center gap-2.5 cursor-pointer">
-            <input
-              type="checkbox"
+          <label className="flex items-center gap-2.5 cursor-pointer" onClick={() => setSummarize((v) => !v)}>
+            <Checkbox
               checked={summarize}
-              onChange={(e) => setSummarize(e.target.checked)}
-              className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-white focus:ring-white/40 focus:ring-offset-0 focus:ring-1 cursor-pointer"
+              onChange={setSummarize}
             />
-            <span className="text-sm text-gray-300">
+            <span className="text-sm text-[var(--muted-foreground)]">
               Generate summary during ingest
             </span>
           </label>
 
           {/* Validation error */}
           {validationError && (
-            <div className="px-3 py-2 bg-red-900/30 border border-red-800/50 rounded-lg text-sm text-red-300">
+            <div className="px-3 py-2 bg-red-900/20 border border-red-800/40 rounded-lg text-sm text-red-400">
               {validationError}
             </div>
           )}
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-800">
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[var(--border)]">
           <button
             onClick={onClose}
-            className="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors"
+            className="px-4 py-2 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-white/5 rounded-lg transition-colors"
           >
             Cancel
           </button>
@@ -294,7 +292,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
               files.length === 0 ||
               sourceIds.some((sid) => !(sid ?? "").trim())
             }
-            className="px-4 py-2 bg-white text-black hover:bg-gray-200 disabled:bg-gray-700 disabled:text-gray-500 text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed"
+            className="px-4 py-2 bg-white text-black hover:bg-white/90 disabled:bg-[var(--secondary)] disabled:text-[var(--muted-foreground)] text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed"
           >
             {files.length > 1 ? `Upload & Ingest ${files.length} Files` : "Upload & Ingest"}
           </button>

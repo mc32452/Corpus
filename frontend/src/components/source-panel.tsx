@@ -6,6 +6,7 @@ import { IngestModal, type UploadRequest } from "@/components/ingest-modal";
 import { CitationPanelReader } from "@/components/citation-viewer-modal";
 import { File } from "@/components/assistant-ui/file";
 import { useAppState, useAppDispatch } from "@/context/app-context";
+import { Checkbox } from "@/components/ui/checkbox";
 
 interface SourcePanelProps {
   selectedSourceIds: string[];
@@ -325,12 +326,10 @@ export function SourcePanel({
       {/* Select all */}
       {displaySources.length > 0 && (
         <div className="px-4 py-2 border-b" style={{ borderColor: "#1e1e1e" }}>
-          <label className="flex items-center gap-2.5 cursor-pointer group">
-            <input
-              type="checkbox"
+          <label className="flex items-center gap-2.5 cursor-pointer group" onClick={handleSelectAll}>
+            <Checkbox
               checked={allSelected}
               onChange={handleSelectAll}
-              className="w-4 h-4 rounded border-white/20 bg-white/5 accent-white cursor-pointer"
             />
             <span className="text-xs text-muted-foreground group-hover:text-foreground transition-colors">
               Select all sources
@@ -485,14 +484,13 @@ export function SourcePanel({
                   )}
 
                   {/* Checkbox */}
-                  <input
-                    type="checkbox"
-                    checked={isChecked}
-                    onChange={() => handleToggleSource(source.source_id)}
-                    onClick={(e) => e.stopPropagation()}
-                    disabled={isPending}
-                    className="w-4 h-4 rounded border-white/20 bg-white/5 accent-white cursor-pointer shrink-0 disabled:opacity-50"
-                  />
+                  <span onClick={(e) => e.stopPropagation()}>
+                    <Checkbox
+                      checked={isChecked}
+                      onChange={() => handleToggleSource(source.source_id)}
+                      disabled={isPending}
+                    />
+                  </span>
                 </div>
 
                 {isActive && (

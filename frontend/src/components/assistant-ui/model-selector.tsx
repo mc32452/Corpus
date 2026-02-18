@@ -94,7 +94,7 @@ function ModelSelectorTrigger({
       data-slot="model-selector-trigger"
       variant={variant}
       size={size}
-      className={cn("aui-model-selector-trigger", className)}
+      className={cn("aui-model-selector-trigger text-muted-foreground", className)}
       {...props}
     >
       {children ?? <SelectPrimitive.Value />}
