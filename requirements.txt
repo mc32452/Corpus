@@ -20,3 +20,9 @@ uvicorn
 httpx
 python-multipart
 sse-starlette
+
+# Offline Speech-to-Text (MLX Whisper)
+mlx-whisper
+soundfile          # audio decoding (WAV, WebM, OGG)
+scipy              # resampling + WAV fallback decoder
+av                 # robust WebM/OGG/Opus decode fallback (PyAV)

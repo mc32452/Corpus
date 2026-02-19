@@ -5,6 +5,7 @@ import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useSpeechToText } from "@/hooks/useSpeechToText";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -16,6 +17,7 @@ import {
   MessagePrimitive,
   SuggestionPrimitive,
   ThreadPrimitive,
+  useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
@@ -32,7 +34,7 @@ import {
   RefreshCwIcon,
   SquareIcon,
 } from "lucide-react";
-import { type FC, useEffect, useState } from "react";
+import { type FC, useCallback, useEffect, useRef, useState } from "react";
 
 export const Thread: FC = () => {
   return (
@@ -137,7 +139,122 @@ const MODES = [
   { id: "deep-research", name: "Deep Research", description: "Qwen3-Next-80B-A3B" },
 ];
 
+const ComposerSpeechButton: FC<{ disabled?: boolean }> = ({ disabled = false }) => {
+  const aui = useAui();
+  const composerText = useAuiState((s) => s.composer.text);
+  const [errorText, setErrorText] = useState<string>("");
+  const clearErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastChunkRef = useRef<{ text: string; at: number } | null>(null);
+  const lastInsertedRef = useRef<string>("");
+
+  const showError = useCallback((message: string) => {
+    setErrorText(message);
+    if (clearErrorTimerRef.current) clearTimeout(clearErrorTimerRef.current);
+    clearErrorTimerRef.current = setTimeout(() => setErrorText(""), 3500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (clearErrorTimerRef.current) clearTimeout(clearErrorTimerRef.current);
+    };
+  }, []);
+
+  const applyTranscript = useCallback((chunk: string, isFinal: boolean) => {
+    if (isFinal && !chunk) {
+      lastChunkRef.current = null;
+      lastInsertedRef.current = "";
+      return;
+    }
+    const inputEl = document.querySelector("textarea.aui-composer-input, input.aui-composer-input") as HTMLTextAreaElement | HTMLInputElement | null;
+    if (!chunk) return;
+
+    const normalized = chunk.trim().toLowerCase().replace(/\s+/g, " ");
+    const now = Date.now();
+    if (
+      normalized &&
+      lastChunkRef.current &&
+      lastChunkRef.current.text === normalized &&
+      now - lastChunkRef.current.at < 5000
+    ) {
+      return;
+    }
+
+    const lastNorm = lastInsertedRef.current.trim().toLowerCase().replace(/\s+/g, " ");
+    const shouldReplacePrevious =
+      !!lastNorm &&
+      normalized.length > lastNorm.length &&
+      normalized.startsWith(lastNorm) &&
+      now - (lastChunkRef.current?.at ?? 0) < 6000;
+
+    const current = composerText ?? "";
+    const start = inputEl?.selectionStart ?? current.length;
+    const end = inputEl?.selectionEnd ?? current.length;
+    const effectiveStart = shouldReplacePrevious
+      ? Math.max(0, start - lastInsertedRef.current.length)
+      : start;
+    const before = current.slice(0, effectiveStart);
+    const after = current.slice(end);
+    const sep = before.length > 0 && !before.endsWith(" ") ? " " : "";
+    const inserted = sep + chunk;
+    const nextValue = before + inserted + after;
+
+    aui.composer().setText(nextValue);
+    const nextPos = before.length + inserted.length;
+    requestAnimationFrame(() => {
+      inputEl?.setSelectionRange(nextPos, nextPos);
+      inputEl?.focus();
+    });
+
+    lastInsertedRef.current = inserted;
+    lastChunkRef.current = { text: normalized, at: now };
+  }, [aui, composerText]);
+
+  const { isListening, toggle, stop } = useSpeechToText({
+    onTranscript: applyTranscript,
+    onPermissionDenied: () => showError("Mic access denied. Allow microphone access."),
+    onNoSpeech: () => showError("No speech heard. Try again."),
+    onError: (msg) => showError(msg),
+  });
+
+  useEffect(() => {
+    if (disabled && isListening) {
+      stop();
+    }
+  }, [disabled, isListening, stop]);
+
+  const onClick = useCallback(() => {
+    if (disabled) {
+      showError("Wait for the current response to finish.");
+      return;
+    }
+    setErrorText("");
+    toggle();
+  }, [disabled, showError, toggle]);
+
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={isListening ? "Stop listening" : "Voice input"}
+        onClick={onClick}
+        className={cn(
+          "absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[empty=false]/composer:scale-0 group-data-[empty=false]/composer:opacity-0 group-data-[empty=false]/composer:pointer-events-none group-data-[running=true]/composer:scale-0 group-data-[running=true]/composer:opacity-0 group-data-[running=true]/composer:pointer-events-none",
+          isListening ? "bg-red-500" : "",
+        )}
+      >
+        <MicIcon className={cn("size-4 text-black", isListening ? "animate-pulse" : "")} />
+      </button>
+      {errorText ? (
+        <div className="absolute -top-10 right-0 z-30 rounded-md border border-red-700 bg-red-900 px-2 py-1 text-[11px] text-red-100 whitespace-nowrap">
+          {errorText}
+        </div>
+      ) : null}
+    </>
+  );
+};
+
 const Composer: FC = () => {
+  const aui = useAui();
   const isEmpty = useAuiState((s) => s.composer.isEmpty);
   const isRunning = useAuiState((s) => s.thread.isRunning);
   return (
@@ -155,6 +272,14 @@ const Composer: FC = () => {
           rows={1}
           autoFocus
           aria-label="Message input"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              if (!isRunning) {
+                aui.composer().send();
+              }
+            }
+          }}
         />
 
         {/* Model selector — always visible */}
@@ -169,17 +294,11 @@ const Composer: FC = () => {
         {/* Animated 3-state button */}
         <div className="relative shrink-0 size-9 rounded-full bg-white">
           {/* Mic — visible only when empty & not running */}
-          <button
-            type="button"
-            aria-label="Voice input"
-            className="absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[empty=false]/composer:scale-0 group-data-[empty=false]/composer:opacity-0 group-data-[running=true]/composer:scale-0 group-data-[running=true]/composer:opacity-0"
-          >
-            <MicIcon className="size-4 text-black" />
-          </button>
+          <ComposerSpeechButton disabled={isRunning} />
 
           {/* Send — visible when text present & not running */}
           <ComposerPrimitive.Send
-            className="absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[empty=true]/composer:scale-0 group-data-[empty=true]/composer:opacity-0 group-data-[running=true]/composer:scale-0 group-data-[running=true]/composer:opacity-0"
+            className="absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[empty=true]/composer:scale-0 group-data-[empty=true]/composer:opacity-0 group-data-[empty=true]/composer:pointer-events-none group-data-[running=true]/composer:scale-0 group-data-[running=true]/composer:opacity-0 group-data-[running=true]/composer:pointer-events-none"
             aria-label="Send message"
           >
             <ArrowUpIcon className="size-4 text-black" />
@@ -187,7 +306,7 @@ const Composer: FC = () => {
 
           {/* Cancel — visible only when running */}
           <ComposerPrimitive.Cancel
-            className="absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[running=false]/composer:scale-0 group-data-[running=false]/composer:opacity-0"
+            className="absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150 group-data-[running=false]/composer:scale-0 group-data-[running=false]/composer:opacity-0 group-data-[running=false]/composer:pointer-events-none"
             aria-label="Stop generating"
           >
             <SquareIcon className="size-3 fill-black text-black" />

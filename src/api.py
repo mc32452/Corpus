@@ -251,6 +251,52 @@ async def system_info():
 
 
 # ---------------------------------------------------------------------------
+# Speech-to-Text  (MLX Whisper — fully offline)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    sample_rate: int = Form(16000),
+):
+    """Accept a raw audio chunk from the frontend and return a transcript.
+
+    The frontend records in small chunks (e.g. every 2–3 s) via
+    ``MediaRecorder``.  Each chunk is sent as a multipart/form-data upload.
+    MLX Whisper transcribes it locally — **no network calls**.
+
+    Returns ``{"transcript": "...", "is_final": true}``.
+    The ``is_final`` flag is always ``true`` here because each upload is an
+    independent committed chunk; real-time interim display is handled on the
+    client by accumulating chunks as they arrive.
+    """
+    from .transcription import transcribe_audio_bytes
+
+    raw = await audio.read()
+    if not raw:
+        return JSONResponse({"transcript": "", "is_final": True})
+
+    try:
+        text = await asyncio.to_thread(transcribe_audio_bytes, raw, sample_rate)
+    except RuntimeError as exc:
+        # Model failed to load — tell the client so it can show a clear error
+        logger.error("Transcription failed: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc), "code": "STT_UNAVAILABLE"},
+        )
+    except Exception:
+        logger.exception("Unexpected transcription error")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Transcription failed.", "code": "STT_ERROR"},
+        )
+
+    return JSONResponse({"transcript": text, "is_final": True})
+
+
+# ---------------------------------------------------------------------------
 # Chat stream: AI SDK UI message stream protocol (SSE)
 # ---------------------------------------------------------------------------
 

@@ -5,6 +5,7 @@ import { queryStreaming } from "@/lib/api-client";
 import { useAppDispatch, useAppState } from "@/context/app-context";
 import type { CitationEntry, CitationPayload } from "@/lib/api-client";
 import { ChatMarkdown } from "@/components/chat-markdown";
+import { SpeechToTextButton } from "@/components/speech-to-text-button";
 
 /** Last status line before the assistant message; everything before this is status. */
 const MESSAGE_START_STATUS = "Generating answer...";
@@ -576,15 +577,23 @@ export function ChatPanel({
                 isActive ? "Waiting for response..." : "Start typing..."
               }
               disabled={isActive}
-              className="w-full rounded-xl bg-gray-800 border border-gray-700 pl-4 pr-24 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full rounded-xl bg-gray-800 border border-gray-700 pl-4 pr-16 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
             />
             {/* Source count badge inside input */}
-            <div className="absolute right-12 top-1/2 -translate-y-1/2 flex items-center">
+            <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
               <span className="text-xs text-gray-500 bg-gray-700/50 px-2 py-0.5 rounded-full">
                 {sourceCount} source{sourceCount !== 1 ? "s" : ""}
               </span>
             </div>
           </div>
+
+          {/* Microphone / Speech-to-text button */}
+          <SpeechToTextButton
+            inputRef={inputRef}
+            value={inputValue}
+            onChange={setInputValue}
+            disabled={isActive}
+          />
 
           {/* Circular send / stop button */}
           {isActive ? (
