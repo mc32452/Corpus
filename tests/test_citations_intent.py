@@ -40,15 +40,15 @@ class TestCitationFormatting:
         result = format_chunk_for_citation(
             "Some text here.", source_id="doc1", display_page="5"
         )
-        assert "[CHUNK 1 | SOURCE: doc1 | PAGE: 5]" in result
+        assert "[PASSAGE 1 | SOURCE: doc1 | PAGE: 5]" in result
         assert "Some text here." in result
-        assert "[CHUNK END]" in result
+        assert "[PASSAGE END]" in result
 
     def test_format_chunk_without_page(self):
         result = format_chunk_for_citation(
             "Some text.", source_id="doc1", display_page=None
         )
-        assert "[CHUNK 1 | SOURCE: doc1]" in result
+        assert "[PASSAGE 1 | SOURCE: doc1]" in result
         assert "PAGE" not in result
 
     def test_format_chunk_empty_page(self):
@@ -598,7 +598,7 @@ class TestCollectionIntent:
         assert result.confidence >= 0.60
 
     def test_collection_generation_messages(self):
-        """COLLECTION messages should contain passage-finding instructions."""
+        """COLLECTION messages should include user-facing wording constraints."""
         messages = build_messages(
             context="Source: doc1\nSummary: About linguistics.\n\nSource: doc2\nSummary: About philosophy.",
             question="What documents do we have?",
@@ -606,7 +606,7 @@ class TestCollectionIntent:
             citations_enabled=False,
         )
         system = messages[0]["content"]
-        assert "passages" in system.lower() or "mentions" in system.lower() or "references" in system.lower()
+        assert "never reference retrieval internals" in system.lower()
 
     def test_collection_citations_auto_disabled(self):
         """COLLECTION intent uses summaries, so citation rules should NOT be injected."""

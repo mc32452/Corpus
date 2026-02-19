@@ -192,8 +192,8 @@ class TestRetrievalToCitations:
         if parent_texts and metadatas:
             # Format with citations
             context, source_mapping = format_context_with_citations(parent_texts, metadatas)
-            assert "[CHUNK START" in context
-            assert "[CHUNK END]" in context
+            assert "[PASSAGE " in context
+            assert "[PASSAGE END]" in context
 
             # Build legend
             legend = build_source_legend(source_mapping)

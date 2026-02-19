@@ -20,15 +20,17 @@ _SYSTEM_MESSAGE = """You are a research assistant. Follow these rules strictly:
 7. Only state "The provided context does not contain sufficient information" if you genuinely cannot construct ANY relevant answer. NEVER append this disclaimer after a substantive answer.
 8. Stop generating immediately after completing your answer.
 9. Do NOT include meta-commentary, self-evaluations, filler phrases, or sign-offs.
-10. Do NOT end with speculative hedges or "future possibilities" not grounded in the context."""
+10. Do NOT end with speculative hedges or "future possibilities" not grounded in the context.
+11. Never reference retrieval internals in your answer (for example: "chunk", "chunk numbers", "retrieved chunks", "vector search", "reranker", or "index").
+12. Refer to evidence naturally as "the text", "the passage", "the author", or "the document"."""
 
 _CITATION_RULES = """
 CITATION REQUIREMENTS (MANDATORY):
-- Context chunks are numbered [CHUNK 1 | SOURCE: ...], [CHUNK 2 | SOURCE: ...], etc.
-- You MUST cite every factual claim using the chunk number: [1], [2], [3], etc.
+- Context passages are numbered [PASSAGE 1 | SOURCE: ...], [PASSAGE 2 | SOURCE: ...], etc.
+- You MUST cite every factual claim using the passage number: [1], [2], [3], etc.
 - Place the citation immediately after the sentence it supports, before the period when possible.
 - Example: "The unemployment rate rose to 5.2% [1]. Housing starts declined by 12% [2]."
-- If multiple chunks support one claim, cite all of them: [1][3].
+- If multiple passages support one claim, cite all of them: [1][3].
 - Do NOT omit citations. Every statement derived from the context MUST have at least one [N] marker."""
 
 
@@ -255,7 +257,10 @@ def _prepare_config(
     citation_block = ""
     if citations_enabled:
         citation_block = f"\n{_CITATION_RULES}"
-        cfg["format"] += " Include numbered inline citations [1], [2], etc. after every factual claim."
+        cfg["format"] += (
+            " Include numbered inline citations [1], [2], etc. after every factual claim. "
+            "Treat citation numbers as references to provided passages; do not use words like 'chunk' or mention retrieval internals."
+        )
     return cfg, citation_block, extra_block
 
 

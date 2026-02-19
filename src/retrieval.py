@@ -44,25 +44,25 @@ def format_chunk_for_citation(
     display_page: Optional[str] = None,
     chunk_index: int = 1,
 ) -> str:
-    """Format a chunk with citation markers for Academic Mode.
+    """Format a retrieved passage with citation markers for Academic Mode.
 
-    Chunks are numbered sequentially so the LLM can cite by number [1], [2].
+    Passages are numbered sequentially so the LLM can cite by number [1], [2].
     When a page number is available the marker includes ``PAGE: X``.
     When page metadata is missing the PAGE field is omitted so the LLM
     cites as ``[SourceID]`` or ``[N]`` instead of ``[SourceID, p. Unknown]``.
     """
     if display_page:
-        header = f"[CHUNK {chunk_index} | SOURCE: {source_id} | PAGE: {display_page}]"
+        header = f"[PASSAGE {chunk_index} | SOURCE: {source_id} | PAGE: {display_page}]"
     else:
-        header = f"[CHUNK {chunk_index} | SOURCE: {source_id}]"
-    return f"{header}\n{text.strip()}\n[CHUNK END]"
+        header = f"[PASSAGE {chunk_index} | SOURCE: {source_id}]"
+    return f"{header}\n{text.strip()}\n[PASSAGE END]"
 
 
 def format_context_with_citations(
     texts: list[str],
     metadatas: list[dict[str, Any]],
 ) -> tuple[str, dict[str, str]]:
-    """Format chunks with citation markers and build source mapping."""
+    """Format passages with citation markers and build source mapping."""
     if len(texts) != len(metadatas):
         raise ValueError(f"texts and metadatas must have same length, got {len(texts)} vs {len(metadatas)}")
 
