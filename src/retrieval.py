@@ -165,6 +165,28 @@ class RetrievalEngine:
             source_id=source_id,
         )
 
+    def _hybrid_search_decoupled(
+        self,
+        *,
+        embedding_query: str,
+        bm25_query: str,
+        top_k: int,
+        source_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Hybrid search with separate queries for embedding and BM25."""
+        if not embedding_query.strip():
+            raise ValueError("embedding_query must be a non-empty string.")
+        if not bm25_query.strip():
+            raise ValueError("bm25_query must be a non-empty string.")
+        query_vector = self._get_query_embedding(embedding_query)
+
+        return self._storage.hybrid_search(
+            query_text=bm25_query,
+            query_vector=query_vector,
+            top_k=top_k,
+            source_id=source_id,
+        )
+
     @staticmethod
     def _deduplicate_by_parent(
         items: list[dict[str, Any]],
@@ -246,6 +268,9 @@ class RetrievalEngine:
         source_id: Optional[str] = None,
         collect_metrics: bool = True,
         params: Optional[ResolvedRetrievalParams] = None,
+        retrieval_budget: Optional[int] = None,
+        embedding_query: Optional[str] = None,
+        bm25_query: Optional[str] = None,
     ) -> list[RetrievalResult]:
         """Execute hybrid search with timing and metrics collection.
 
@@ -257,6 +282,10 @@ class RetrievalEngine:
 
         When *params* is provided, its values take priority over explicit
         kwargs and the mode config.
+
+        When *embedding_query* / *bm25_query* are provided, the vector embedding
+        is computed from *embedding_query* and BM25 full-text search uses
+        *bm25_query*. Both default to *query* if not specified.
         """
         cfg = self._config
 
@@ -279,13 +308,22 @@ class RetrievalEngine:
         timing = TimingMetrics()
         total_start = time.perf_counter()
 
+        # Resolve decoupled queries: embedding uses original, BM25 may use expanded
+        _embedding_q = embedding_query or query
+        _bm25_q = bm25_query or query
+
         t0 = time.perf_counter()
-        _ = self._get_query_embedding(query)
+        _ = self._get_query_embedding(_embedding_q)
         timing.query_embedding_ms = (time.perf_counter() - t0) * 1000
 
         # Stage 1: LanceDB native hybrid search (replaces dense + sparse + RRF)
         t0 = time.perf_counter()
-        fused = self._hybrid_search(query, k_fused, source_id=source_id)
+        fused = self._hybrid_search_decoupled(
+            embedding_query=_embedding_q,
+            bm25_query=_bm25_q,
+            top_k=k_fused,
+            source_id=source_id,
+        )
         timing.hybrid_search_ms = (time.perf_counter() - t0) * 1000
         # sparse_search_ms and rrf_fusion_ms are zero — LanceDB does it all in one call
         timing.sparse_search_ms = 0.0
@@ -308,13 +346,29 @@ class RetrievalEngine:
             raw_scores = []
         timing.rerank_ms = (time.perf_counter() - t0) * 1000
 
-        # Stage 4: Threshold filtering
+        # Stage 4: Threshold filtering (adaptive)
         threshold_metrics = ThresholdMetrics()
         if reranked:
-            threshold = reranker_threshold
+            config_threshold = reranker_threshold
             min_docs = reranker_min_docs
             items_before = len(reranked)
             score_key = "rerank_score" if reranker_enabled else "score"
+
+            # Adaptive threshold: relative to the top reranker score
+            top_score = float(reranked[0].get(score_key, 0.0)) if reranked else 0.0
+            relative_factor = 0.15
+            adaptive_threshold = max(
+                config_threshold,               # absolute floor (safety net)
+                top_score * relative_factor,     # relative to best match
+            )
+            logger.info(
+                "Adaptive threshold: top_score=%.4f relative=%.4f effective=%.4f (config floor=%.4f)",
+                top_score,
+                top_score * relative_factor,
+                adaptive_threshold,
+                config_threshold,
+            )
+            threshold = adaptive_threshold
 
             threshold_filtered = [
                 item for item in reranked
@@ -358,7 +412,41 @@ class RetrievalEngine:
                 reranker_metrics.items_reranked,
             )
 
-        # Stage 5: Final dedup + boilerplate filter
+        # Stage 5: Budget-aware expansion — raise k_final if budget is underutilized
+        budget = retrieval_budget or (cfg.retrieval_budget if cfg else 0)
+        if budget > 0 and reranked:
+            def _est_tokens(text: str) -> int:
+                return len(text.split())
+
+            # Estimate tokens for the candidates that would be selected under current k_final
+            candidates_for_final = reranked[:k_final]
+            selected_tokens = sum(
+                _est_tokens(item.get("text", "")) for item in candidates_for_final
+            )
+            budget_floor = int(budget * 0.25)
+
+            if selected_tokens < budget_floor and len(reranked) > k_final:
+                # Expand k_final to fill up to 50% of budget
+                budget_ceiling = int(budget * 0.50)
+                base_count = k_final
+                running_tokens = selected_tokens
+                expanded_k = k_final
+                for item in reranked[k_final:]:
+                    item_tokens = _est_tokens(item.get("text", ""))
+                    if running_tokens + item_tokens > budget_ceiling:
+                        break
+                    running_tokens += item_tokens
+                    expanded_k += 1
+
+                if expanded_k > k_final:
+                    pct = round(100 * running_tokens / budget) if budget else 0
+                    logger.info(
+                        "Budget-aware expansion: %d -> %d chunks (%d%% of budget)",
+                        base_count, expanded_k, pct,
+                    )
+                    k_final = expanded_k
+
+        # Stage 6: Final dedup + boilerplate filter
         final: list[dict[str, Any]] = []
         seen_parents: set[str] = set()
         seen_children: set[str] = set()

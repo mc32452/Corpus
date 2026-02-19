@@ -217,7 +217,7 @@ class TestReranking:
 
     def test_boilerplate_filtered_in_search_stage(self, retrieval_engine: RetrievalEngine, monkeypatch):
         """Boilerplate is filtered in final search stage, not _rerank()."""
-        def _fake_hybrid_search(query: str, top_k: int, *, source_id=None):
+        def _fake_hybrid_search_decoupled(*, embedding_query, bm25_query, top_k, source_id=None):
             return [
                 {
                     "id": "boiler",
@@ -233,7 +233,7 @@ class TestReranking:
                 },
             ]
 
-        monkeypatch.setattr(retrieval_engine, "_hybrid_search", _fake_hybrid_search)
+        monkeypatch.setattr(retrieval_engine, "_hybrid_search_decoupled", _fake_hybrid_search_decoupled)
         results = retrieval_engine.search("language", collect_metrics=False)
         ids = [r.child_id for r in results]
         assert "boiler" not in ids

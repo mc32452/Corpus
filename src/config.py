@@ -43,7 +43,7 @@ class IntentRetrievalOverrides:
     top_k_dense_scale: float = 1.0
     top_k_fused_scale: float = 1.0
     top_k_rerank_scale: float = 1.0
-    top_k_final: Optional[int] = None          # absolute override, not scale
+    top_k_final_scale: float = 1.0
     reranker_threshold_scale: float = 1.0
     reranker_min_docs: Optional[int] = None     # absolute override, not scale
 
@@ -65,14 +65,14 @@ class ResolvedRetrievalParams:
 
 
 INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
-    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.7, top_k_fused_scale=0.5, top_k_final=3, reranker_threshold_scale=1.3),
-    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=8),
-    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=8),
-    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final=8),
-    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=12, reranker_threshold_scale=0.8),
-    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final=12, reranker_threshold_scale=0.8),
-    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final=10),
-    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=0.8, top_k_fused_scale=0.5, top_k_final=4, reranker_threshold_scale=1.2),
+    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.7, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.3),
+    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final_scale=1.0),
+    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.0),
+    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final_scale=1.0),
+    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.25),
+    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=0.8, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.2),
 }
 
 INTENT_GENERATION_PARAMS: dict[str, IntentGenerationParams] = {
@@ -99,11 +99,7 @@ def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedR
         top_k_dense=max(1, round(mode_config.top_k_dense * overrides.top_k_dense_scale)),
         top_k_fused=max(1, round(mode_config.top_k_fused * overrides.top_k_fused_scale)),
         top_k_rerank=max(1, round(mode_config.top_k_rerank * overrides.top_k_rerank_scale)),
-        top_k_final=(
-            overrides.top_k_final
-            if overrides.top_k_final is not None
-            else mode_config.top_k_final
-        ),
+        top_k_final=max(1, round(mode_config.top_k_final * overrides.top_k_final_scale)),
         reranker_threshold=mode_config.reranker_threshold * overrides.reranker_threshold_scale,
         reranker_min_docs=(
             overrides.reranker_min_docs

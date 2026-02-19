@@ -184,8 +184,10 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
             "Do NOT provide analysis, background, or tangential information."
         ),
         "format": (
-            "Give the direct answer in 1-3 sentences (maximum 60 words). "
-            "If helpful, include a brief quote from the context. "
+            "Give the direct answer in 1-3 sentences. "
+            "Quote the specific passage from the context that supports your answer. "
+            "If the provided context does not contain the specific detail asked for, "
+            "state exactly what information is missing rather than inferring or guessing. "
             "Do NOT use bullet points. Do NOT provide additional context beyond what is asked."
         ),
         "tone": "Direct, precise, and factual.",
@@ -265,12 +267,28 @@ def build_messages(
     citations_enabled: bool = False,
     source_legend: Optional[str] = None,
     mode: Optional[str] = None,
+    retrieval_budget: Optional[int] = None,
 ) -> list[dict[str, str]]:
     """Build intent-aware chat messages for the LLM."""
     cfg, citation_block, extra_block = _prepare_config(
         intent, citations_enabled, extra_instructions, mode=mode
     )
     system_block = _build_system_block(cfg, citation_block, extra_block)
+
+    # Context-sparsity warning: if context fills < 10% of retrieval budget
+    if retrieval_budget and retrieval_budget > 0 and context:
+        context_tokens = len(context.split())
+        fill_ratio = context_tokens / retrieval_budget
+        if fill_ratio < 0.10:
+            sparsity_warning = (
+                "WARNING: Limited source material was retrieved for this query. "
+                "Base your answer strictly and exclusively on the passages provided. "
+                "Do not infer, extrapolate, or add details not explicitly present in the context. "
+                "If the context is insufficient to fully answer the question, clearly state "
+                "what cannot be determined."
+            )
+            system_block = sparsity_warning + "\n\n" + system_block
+
     legend_block = f"\n\n{source_legend}" if citations_enabled and source_legend else ""
     user_block = f"Context:\n{context}{legend_block}\n\nQuestion: {question}\n\nAnswer:"
     return [

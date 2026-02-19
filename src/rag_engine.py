@@ -201,16 +201,7 @@ _EXPANSION_TERMS: dict[Intent, list[str]] = {
         "objection",
         "advantage",
     ],
-    Intent.FACTUAL: [
-        "who",
-        "what",
-        "when",
-        "where",
-        "fact",
-        "data",
-        "claim",
-        "evidence",
-    ],
+    Intent.FACTUAL: [],
     Intent.COLLECTION: [],
 }
 
@@ -294,6 +285,47 @@ def _dedupe_context(texts: Iterable[str]) -> str:
             seen.add(cleaned)
             unique_texts.append(cleaned)
     return "\n\n".join(unique_texts)
+
+
+def _check_novel_proper_nouns(output: str, context: str) -> None:
+    """Log a warning if the output contains proper nouns absent from context.
+
+    A proper noun is defined as a capitalized word that does not start a
+    sentence.  If more than 3 such words appear in the output but not
+    anywhere in the context, there is a risk of hallucination.
+    """
+    # Split output into sentences to identify sentence-start words
+    sentences = re.split(r'(?<=[.!?])\s+', output)
+    sentence_start_words: set[str] = set()
+    for sent in sentences:
+        words = sent.split()
+        if words:
+            sentence_start_words.add(words[0])
+
+    # Find capitalized words in output that are NOT at sentence starts
+    output_words = output.split()
+    proper_nouns_in_output: set[str] = set()
+    for word in output_words:
+        # Strip punctuation for comparison
+        clean = re.sub(r'[^\w]', '', word)
+        if not clean:
+            continue
+        if clean[0].isupper() and clean not in sentence_start_words and len(clean) > 1:
+            proper_nouns_in_output.add(clean)
+
+    if not proper_nouns_in_output:
+        return
+
+    # Check which proper nouns are absent from context
+    context_lower = context.lower()
+    novel = [pn for pn in proper_nouns_in_output if pn.lower() not in context_lower]
+
+    if len(novel) > 3:
+        logger.warning(
+            "Output contains %d proper nouns not found in context — possible hallucination: %s",
+            len(novel),
+            ", ".join(sorted(novel)[:10]),
+        )
 
 
 def _enable_offline_if_cached(config: ModelConfig) -> None:
@@ -801,11 +833,14 @@ class RagEngine:
 
         # -- query expansion -----------------------------------------------
         search_query = query_text
+        embedding_query = query_text   # never expanded — preserves embedding fidelity
+        bm25_query = query_text        # may be expanded for BM25 recall
         if expansion:
             search_query, expansion_terms = _expand_query(
                 query_text,
                 intent_result.intent,
             )
+            bm25_query = search_query  # expanded version for BM25 only
             logger.info(
                 "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
                 intent_result.intent.value,
@@ -875,6 +910,9 @@ class RagEngine:
                 results = retrieval_engine.search(
                     search_query, source_id=source_id,
                     params=retrieval_params,
+                    retrieval_budget=config.retrieval_budget,
+                    embedding_query=embedding_query,
+                    bm25_query=bm25_query,
                 )
             source_ids = sorted(
                 {
@@ -1016,6 +1054,7 @@ class RagEngine:
                 citations_enabled=cite,
                 source_legend=source_legend,
                 mode=config.mode,
+                retrieval_budget=config.retrieval_budget,
             )
 
         # -- generate -------------------------------------------------------
@@ -1048,6 +1087,10 @@ class RagEngine:
 
         with profiler.span("Output sanitisation"):
             answer = sanitize_output(raw_answer)
+
+        # Claim-density heuristic: warn if output contains proper nouns not in context
+        if answer and context:
+            _check_novel_proper_nouns(answer, context)
 
         profiler.end_wall()
         latency_report = profiler.format_report()
@@ -1229,11 +1272,14 @@ class RagEngine:
 
         # -- query expansion -----------------------------------------------
         search_query = query_text
+        embedding_query = query_text   # never expanded
+        bm25_query = query_text        # may be expanded
         if expansion:
             search_query, expansion_terms = _expand_query(
                 query_text,
                 intent_result.intent,
             )
+            bm25_query = search_query
             logger.info(
                 "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
                 intent_result.intent.value,
@@ -1301,6 +1347,9 @@ class RagEngine:
             results = retrieval_engine.search(
                 search_query, source_id=source_id,
                 params=retrieval_params,
+                retrieval_budget=config.retrieval_budget,
+                embedding_query=embedding_query,
+                bm25_query=bm25_query,
             )
             # -- emit detailed retrieval step statuses ---------------------
             if results:
@@ -1469,6 +1518,7 @@ class RagEngine:
             citations_enabled=cite,
             source_legend=source_legend,
             mode=config.mode,
+            retrieval_budget=config.retrieval_budget,
         )
 
         # -- generate with streaming tokens --------------------------------

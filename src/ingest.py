@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ from .intent import Intent
 from .generation import build_messages
 from .generator import MlxGenerator
 from .storage import StorageEngine
+
+logger = logging.getLogger(__name__)
 
 # Maximum characters of parent text to feed into summary generation.
 _SUMMARY_CONTEXT_CHAR_LIMIT = 12_000
@@ -204,11 +207,35 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
         sentence_chunks.append(current_chunk)
 
     child_chunks: list[ChildChunk] = []
+    _merge_count = 0
+    _sole_child_count = 0
 
     for chunk_sentences in sentence_chunks:
         text = " ".join(chunk_sentences).strip()
         token_count = _token_count(text)
         if token_count < CHILD_MIN_TOKENS:
+            # Instead of dropping, merge into previous child or create sole child
+            if child_chunks:
+                # Merge into previous child's text
+                prev = child_chunks[-1]
+                merged_text = prev.text + " " + text
+                # Re-create with same id and metadata (frozen model)
+                child_chunks[-1] = ChildChunk.model_construct(
+                    id=prev.id, text=merged_text, metadata=prev.metadata,
+                )
+                _merge_count += 1
+            else:
+                # No previous child — create a sole child (short but searchable)
+                metadata = Metadata(
+                    source_id=parent.metadata.source_id,
+                    page_number=parent.metadata.page_number,
+                    page_label=parent.metadata.page_label,
+                    display_page=parent.metadata.display_page,
+                    header_path=parent.metadata.header_path,
+                    parent_id=parent.id,
+                )
+                child_chunks.append(ChildChunk(text=text, metadata=metadata))
+                _sole_child_count += 1
             continue
 
         metadata = Metadata(
@@ -220,6 +247,12 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
             parent_id=parent.id,
         )
         child_chunks.append(ChildChunk(text=text, metadata=metadata))
+
+    if _merge_count or _sole_child_count:
+        logger.info(
+            "Child merge: %d short segments merged, %d sole-child chunks created",
+            _merge_count, _sole_child_count,
+        )
 
     return child_chunks
 

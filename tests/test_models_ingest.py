@@ -349,13 +349,14 @@ class TestChildChunkSplitting:
             assert child.metadata.page_number == 7
 
     def test_short_parent_no_children(self):
-        """A very short parent may produce no children if below CHILD_MIN_TOKENS."""
+        """A very short parent produces a sole child (rather than losing data)."""
         text = " ".join(["word"] * (CHILD_MIN_TOKENS - 10))
         meta = Metadata(source_id="doc1", header_path="Test", parent_id=None)
         parent = ParentChunk(text=text, metadata=meta)
         children = _split_child_chunks(parent)
-        # Short text below min tokens should produce no children
-        assert len(children) == 0
+        # Short text below min tokens should produce a sole child chunk
+        assert len(children) == 1
+        assert children[0].text == text
 
 
 # ===========================================================================
