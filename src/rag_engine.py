@@ -469,6 +469,17 @@ class RagEngine:
         self._model_config: ModelConfig = select_mode_config(
             manual_mode=self._cfg.mode
         )
+        self._system_ram_gb = float(self._model_config.system_ram_gb or 0.0)
+        self._memory_constrained = (
+            self._system_ram_gb > 0.0 and self._system_ram_gb <= 40.0
+        )
+        self._generation_max_tokens = 700 if self._memory_constrained else 1200
+
+        if self._memory_constrained:
+            logger.info(
+                "Memory-aware mode enabled (%.1fGB RAM): disabling speculative preload and intent LLM fallback; unloading retrieval models before generation.",
+                self._system_ram_gb,
+            )
         _enable_offline_if_cached(self._model_config)
 
         # Open storage
@@ -573,6 +584,11 @@ class RagEngine:
 
         Used to overlap model load latency with retrieval/reranking work.
         """
+        if self._memory_constrained:
+            logger.info(
+                "Skipping speculative LLM preload in memory-aware mode"
+            )
+            return None
         if self._generator is not None:
             return None
         logger.info("Starting speculative LLM preload during retrieval")
@@ -641,11 +657,25 @@ class RagEngine:
         subsequent queries skip the reload.  Only orphaned Metal buffers
         and Python garbage are collected here.
         """
+        if self._memory_constrained:
+            self._embedding_model = None
+            self._reranker = None
+            logger.info(
+                "Memory-aware mode: unloaded embedding/reranker before generation"
+            )
         gc.collect()
         _release_mlx_cache()
         logger.debug(
             "Ran gc.collect + MLX cache clear before LLM generation"
         )
+
+    def _release_generator_model(self) -> None:
+        if self._generator is None:
+            return
+        self._generator = None
+        gc.collect()
+        _release_mlx_cache()
+        logger.info("Released generation model for retrieval-phase memory headroom")
 
     def _classify_intent(
         self,
@@ -670,7 +700,15 @@ class RagEngine:
             )
 
         def _run() -> IntentResult:
-            llm_fallback_enabled = not no_generate and self._cfg.llm_fallback
+            llm_fallback_enabled = (
+                not no_generate
+                and self._cfg.llm_fallback
+                and not self._memory_constrained
+            )
+            if self._cfg.llm_fallback and self._memory_constrained:
+                logger.info(
+                    "Memory-aware mode: disabling intent LLM fallback to reduce peak RAM"
+                )
             llm_model_id = self._cfg.intent_model if llm_fallback_enabled else None
             classifier = IntentClassifier(
                 confidence_threshold=self._cfg.intent_confidence_threshold,
@@ -803,6 +841,9 @@ class RagEngine:
             if enable_query_expansion is not None
             else self._cfg.enable_query_expansion
         )
+
+        if self._memory_constrained and self._generator is not None:
+            self._release_generator_model()
 
         # -- load retrieval models -----------------------------------------
         self._on_status("Preparing retrieval models...")
@@ -969,6 +1010,7 @@ class RagEngine:
 
         # -- release retrieval models for LLM headroom ---------------------
         with profiler.span("Memory cleanup (gc)"):
+            retrieval_engine = None
             self._release_retrieval_models()
 
         # -- token budget packing ------------------------------------------
@@ -1082,7 +1124,7 @@ class RagEngine:
             generator = self._consume_preloaded_generator(generator_preload_future)
 
         gen_config = GenerationConfig(
-            max_tokens=1200,
+            max_tokens=self._generation_max_tokens,
             context_window=config.context_window,
         )
 
@@ -1215,6 +1257,9 @@ class RagEngine:
             if enable_query_expansion is not None
             else self._cfg.enable_query_expansion
         )
+
+        if self._memory_constrained and self._generator is not None:
+            self._release_generator_model()
 
         # -- load retrieval models -----------------------------------------
         logger.info("query_events_impl: yielding 'Preparing retrieval models', then loading embedding")
@@ -1443,6 +1488,7 @@ class RagEngine:
             return
 
         # -- release retrieval models for LLM headroom ---------------------
+        retrieval_engine = None
         self._release_retrieval_models()
         if should_stop():
             yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled after model cleanup")
@@ -1546,7 +1592,7 @@ class RagEngine:
             generator = self._consume_preloaded_generator(generator_preload_future)
 
         gen_config = GenerationConfig(
-            max_tokens=1200,
+            max_tokens=self._generation_max_tokens,
             context_window=config.context_window,
         )
 
