@@ -346,6 +346,10 @@ class RetrievalEngine:
             raw_scores = []
         timing.rerank_ms = (time.perf_counter() - t0) * 1000
 
+        # Preserve full reranked pool for sub-threshold expansion (Fix 8)
+        all_reranked = list(reranked)
+        threshold = float(reranker_threshold)  # default; updated by adaptive logic below
+
         # Stage 4: Threshold filtering (adaptive)
         threshold_metrics = ThresholdMetrics()
         if reranked:
@@ -445,6 +449,41 @@ class RetrievalEngine:
                         base_count, expanded_k, pct,
                     )
                     k_final = expanded_k
+
+            # ── Sub-threshold expansion for severely starved budgets (Fix 8) ──
+            current_final_tokens = sum(
+                _est_tokens(item.get("text", "")) for item in reranked[:k_final]
+            )
+            starvation_floor = int(budget * 0.10)
+
+            if current_final_tokens < starvation_floor:
+                threshold_ids = {item.get("id") for item in reranked}
+                sub_threshold_candidates = [
+                    item for item in all_reranked
+                    if item.get("id") not in threshold_ids
+                ]
+                sub_ceiling = int(budget * 0.15)
+                running_sub = current_final_tokens
+                sub_added = 0
+                for item in sub_threshold_candidates:
+                    item_tok = _est_tokens(item.get("text", ""))
+                    if running_sub + item_tok > sub_ceiling:
+                        break
+                    meta = item.get("metadata")
+                    if isinstance(meta, dict):
+                        meta["below_threshold"] = True
+                    item["below_threshold"] = True
+                    reranked.append(item)
+                    running_sub += item_tok
+                    sub_added += 1
+                    k_final += 1
+
+                if sub_added > 0:
+                    sub_pct = round(100 * running_sub / budget) if budget else 0
+                    logger.info(
+                        "Sub-threshold expansion: added %d chunks below threshold=%.4f (budget now %d%%)",
+                        sub_added, threshold, sub_pct,
+                    )
 
         # Stage 6: Final dedup + boilerplate filter
         final: list[dict[str, Any]] = []

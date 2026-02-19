@@ -110,6 +110,10 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bwhat\s+is\s+the\s+(author|writer)\s+(talking|writing|referring)\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+does\s+the\s+(author|writer|text|document|paper)\s+(say|state|claim|argue|mention)\b", re.IGNORECASE),
         re.compile(r"\bfind\s+(me\s+)?(the|a|all)\b", re.IGNORECASE),
+        # Exhaustive enumeration queries (Fix 7)
+        re.compile(r"\blist\s+(every|all)\b", re.IGNORECASE),
+        re.compile(r"\bname\s+all\b", re.IGNORECASE),
+        re.compile(r"\bwho\s+are\s+all\s+(the\s+)?\w", re.IGNORECASE),
     ],
     # ---- OVERVIEW: high-level single-document description ----
     Intent.OVERVIEW: [
@@ -292,6 +296,10 @@ _EXTRACTION_STRUCTURES: list[re.Pattern] = [
     re.compile(r"\bgive\s+me\s+the\s+(dates?|years?|names?|citations?)\b", re.IGNORECASE),
     re.compile(r"\bformat\b.*\bas\s+(a\s+)?table\b", re.IGNORECASE),
     re.compile(r"\btabular\b", re.IGNORECASE),
+    # Exhaustive enumeration — recall-oriented factual queries (Fix 7)
+    re.compile(r"\blist\s+(every|all)\b", re.IGNORECASE),
+    re.compile(r"\bname\s+all\b", re.IGNORECASE),
+    re.compile(r"\bwho\s+are\s+all\b", re.IGNORECASE),
 ]
 
 _SUMMARIZATION_STRUCTURES: list[re.Pattern] = [
@@ -382,6 +390,83 @@ def _is_definition_style_query(query: str) -> bool:
     return True
 
 
+# ── Why-question specificity override (Fix 6) ────────────────────────────────
+
+_WHY_ENTITY_STOPWORDS: set[str] = {
+    # Determiners / pronouns / auxiliaries
+    "the", "a", "an", "is", "are", "was", "were", "do", "does", "did",
+    "in", "on", "at", "to", "for", "of", "and", "or", "but", "not",
+    "this", "that", "if", "how", "why", "what", "who", "where", "which",
+    "has", "have", "had", "will", "would", "could", "should", "can",
+    "with", "from", "about", "into", "through", "also", "just",
+    "i", "me", "my", "we", "us", "you", "your", "he", "him", "his",
+    "she", "her", "they", "them", "their", "it", "its",
+    "some", "any", "no", "all", "every", "each", "many", "much",
+    # Abstract / thematic nouns often capitalised in titles / topic phrases
+    "love", "death", "fate", "time", "life", "nature", "power", "truth",
+    "beauty", "peace", "war", "justice", "honor", "honour", "hope", "fear",
+    "theme", "role", "concept", "idea", "theory", "importance",
+}
+
+_WHY_ACTION_VERB_RE = re.compile(
+    r'\b('
+    r'ask(?:s|ed|ing)?|read(?:s|ing)?|kill(?:s|ed|ing)?|'
+    r'say(?:s|ing)?|said|go(?:es|ing)?|went|'
+    r'mak(?:e|es|ing)|made|tak(?:e|es|ing)|took|'
+    r'giv(?:e|es|ing)|gave|tell(?:s|ing)?|told|'
+    r'call(?:s|ed|ing)?|send(?:s|ing)?|sent|'
+    r'writ(?:e|es|ing)?|wrote|fight(?:s|ing)?|fought|'
+    r'die(?:s|d)?|dying|drink(?:s|ing)?|drank|'
+    r'speak(?:s|ing)?|spoke|hid(?:e|es|ing)?|'
+    r'marry|marries|married|marrying|'
+    r'refus(?:e|es|ed|ing)|want(?:s|ed|ing)?|'
+    r'poison(?:s|ed|ing)?|stab(?:s|bed|bing)?|banish(?:es|ed|ing)?|'
+    r'meet(?:s|ing)?|met|leav(?:e|es|ing)?|left|'
+    r'buy(?:s|ing)?|bought|sell(?:s|ing)?|sold|'
+    r'steal(?:s|ing)?|stole|challeng(?:e|es|ed|ing)|'
+    r'invit(?:e|es|ed|ing)|warn(?:s|ed|ing)?|'
+    r'run(?:s|ning)?|ran|carry|carries|carried|carrying|'
+    r'bring(?:s|ing)?|brought|hold(?:s|ing)?|held|'
+    r'open(?:s|ed|ing)?|clos(?:e|es|ed|ing)|'
+    r'danc(?:e|es|ed|ing)|sing(?:s|ing)?|sang|sung'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _detect_why_specificity(query: str) -> tuple[Optional[str], Optional[str]]:
+    """Detect if a why-question references a named entity performing a specific action.
+
+    Returns ``(entity, verb)`` when both are found, ``(None, None)`` otherwise.
+    """
+    words = query.split()
+    if len(words) < 4:
+        return None, None
+
+    # Detect proper noun: capitalised word not at position 0 and not a stopword
+    entity: Optional[str] = None
+    for word in words[1:]:
+        clean = re.sub(r"[^A-Za-z]", "", word)
+        if (
+            clean
+            and len(clean) >= 2
+            and clean[0].isupper()
+            and clean.lower() not in _WHY_ENTITY_STOPWORDS
+        ):
+            entity = clean
+            break
+
+    if entity is None:
+        return None, None
+
+    # Detect concrete action verb
+    match = _WHY_ACTION_VERB_RE.search(query)
+    if match is None:
+        return None, None
+
+    return entity, match.group(1)
+
+
 def _classify_heuristic(query: str) -> IntentResult:
     """Classify intent using regex pattern matching + structural signals."""
     normalized_query = _normalize_for_intent(query)
@@ -445,6 +530,16 @@ def _classify_heuristic(query: str) -> IntentResult:
             best_intent = Intent.COLLECTION
             best_score = scores[Intent.COLLECTION]
 
+    # COLLECTION wins ties with FACTUAL for document-selection queries
+    # ("which document is about X" should be COLLECTION, not FACTUAL).
+    if (
+        Intent.COLLECTION in matching_intents
+        and Intent.FACTUAL in matching_intents
+        and scores[Intent.COLLECTION] >= scores[Intent.FACTUAL]
+    ):
+        best_intent = Intent.COLLECTION
+        best_score = scores[Intent.COLLECTION]
+
     # COMPARE wins ties with CRITIQUE ("similarity in Chomsky's critique").
     if (
         scores[Intent.COMPARE] > 0
@@ -467,6 +562,22 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     if best_intent in (Intent.ANALYZE, Intent.COMPARE, Intent.CRITIQUE) and analyze_bias:
         confidence = min(0.95, confidence + 0.15)
+
+    # ---- Why-question specificity override (Fix 6) ----
+    # "Why does [Character] [action]?" → FACTUAL (asks for specific cause)
+    # "Why is the theme of fate important?" → stays ANALYZE
+    if best_intent in (Intent.ANALYZE, Intent.EXPLAIN) and re.match(
+        r"^\s*why\b", query, re.IGNORECASE
+    ):
+        entity, verb = _detect_why_specificity(query)
+        if entity is not None and verb is not None:
+            original = best_intent.value
+            best_intent = Intent.FACTUAL
+            confidence = max(confidence, _HEURISTIC_CONFIDENCE["strong_match"])
+            logger.info(
+                "Why-question specificity override: %s -> factual (entity='%s', action='%s')",
+                original, entity, verb,
+            )
 
     return IntentResult(intent=best_intent, confidence=confidence, method="heuristic")
 
