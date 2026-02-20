@@ -330,6 +330,77 @@ class TestThresholdFiltering:
             metrics = results[0].metrics
             assert metrics.threshold is not None
 
+    def test_safety_net_tags_below_threshold_items(
+        self,
+        tmp_storage,
+        mock_embedder,
+        mock_reranker,
+        monkeypatch,
+    ):
+        """min_docs safety net: sub-threshold items get below_threshold=True;
+        above-threshold items are not tagged."""
+        # Set a threshold of 0.5 so only the first item passes.
+        # min_docs=3 forces the safety net to extend to 3 items (2 backfill).
+        config = ModelConfig(
+            mode="regular",
+            llm_model="test",
+            embedding_model="test",
+            reranker_model="test",
+            top_k_dense=10,
+            top_k_sparse=10,
+            top_k_fused=6,
+            top_k_rerank=6,
+            top_k_final=5,
+            reranker_threshold=0.5,
+            reranker_min_docs=3,
+        )
+        engine = RetrievalEngine(
+            storage=tmp_storage,
+            embedding_model=mock_embedder,
+            reranker=mock_reranker,
+            config=config,
+        )
+
+        def _fake_hybrid(*, embedding_query, bm25_query, top_k, source_id=None, query_vector=None):
+            return [
+                {"id": "a1", "text": "above threshold", "score": 0.9, "metadata": {"parent_id": "pa1", "source_id": "src"}},
+                {"id": "b1", "text": "below threshold one", "score": 0.8, "metadata": {"parent_id": "pb1", "source_id": "src"}},
+                {"id": "c1", "text": "below threshold two", "score": 0.7, "metadata": {"parent_id": "pc1", "source_id": "src"}},
+            ]
+
+        def _fake_rerank(query, items):
+            # Sorted descending: a1 above threshold (0.9), b1 and c1 below (0.1, 0.08)
+            reranked = [
+                {**items[0], "rerank_score": 0.90},
+                {**items[1], "rerank_score": 0.10},
+                {**items[2], "rerank_score": 0.08},
+            ]
+            return reranked, [0.90, 0.10, 0.08]
+
+        monkeypatch.setattr(engine, "_hybrid_search_decoupled", _fake_hybrid)
+        monkeypatch.setattr(engine, "_rerank", _fake_rerank)
+
+        results = engine.search("test query")
+
+        # Safety net fires: threshold=0.5 passes only a1 (score 0.90), but
+        # min_docs=3 extends to b1 and c1.
+        assert len(results) == 3
+
+        by_id = {r.child_id: r for r in results}
+
+        # a1 scored 0.90 >= 0.5 threshold: must NOT be tagged
+        assert not by_id["a1"].metadata.get("below_threshold"), (
+            "above-threshold item should not have below_threshold=True"
+        )
+
+        # b1 and c1 scored below threshold: must be tagged
+        assert by_id["b1"].metadata.get("below_threshold") is True, (
+            "sub-threshold safety-net item b1 missing below_threshold=True"
+        )
+        assert by_id["c1"].metadata.get("below_threshold") is True, (
+            "sub-threshold safety-net item c1 missing below_threshold=True"
+        )
+
     def test_sub_threshold_expansion_scoped_to_above_threshold_sources(
         self,
         tmp_storage,

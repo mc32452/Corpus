@@ -455,7 +455,22 @@ class RetrievalEngine:
                     f"Threshold filter produced {len(threshold_filtered)} docs "
                     f"(< min {min_docs}), using top {min_docs} reranked results"
                 )
+                # `reranked` is sorted descending by rerank_score.  `threshold_filtered`
+                # is therefore exactly `reranked[:N]` (scores are monotonically
+                # non-increasing so no gap is possible).  `reranked[:min_docs]`
+                # = positions 0..N-1 (all threshold-passers) + positions N..min_docs-1
+                # (sub-threshold backfill).  Every item that passed the threshold is
+                # guaranteed to be in the slice — no threshold-passing item is dropped.
                 reranked = reranked[:min_docs]
+                # Tag items that only made it through the safety net (below threshold).
+                # Mirrors the below_threshold flag set by the Fix-8 budget expansion
+                # path; allows callers to distinguish confident results from backfill.
+                for item in reranked:
+                    if float(item.get(score_key, float("-inf"))) < threshold:
+                        item["below_threshold"] = True
+                        meta = item.get("metadata")
+                        if isinstance(meta, dict):
+                            meta["below_threshold"] = True
                 threshold_metrics = ThresholdMetrics(
                     threshold_value=threshold,
                     items_before_threshold=items_before,
