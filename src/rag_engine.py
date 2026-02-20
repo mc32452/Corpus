@@ -1,4 +1,4 @@
-"""Decoupled RAG engine — reusable from CLI, Chainlit, or any other frontend.
+"""Decoupled RAG engine — reusable from CLI and other frontends.
 
 This module extracts the full retrieval-augmented generation pipeline from
 ``cli.py`` into a stateful ``RagEngine`` class that returns structured results
@@ -15,13 +15,16 @@ import os
 import re
 import threading
 import time as _time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from .config import (
     CITATIONS_ENABLED_DEFAULT,
+    IntentGenerationParams,
     ModelConfig,
+    ResolvedRetrievalParams,
     resolve_generation_params,
     resolve_retrieval_params,
     select_mode_config,
@@ -113,8 +116,8 @@ class _ClassifyResult:
 
     intent_result: IntentResult
     before_guard_intent: IntentResult  # original intent before collection guard
-    retrieval_params: Any
-    generation_params: Any
+    retrieval_params: ResolvedRetrievalParams
+    generation_params: IntentGenerationParams
     force_collection: bool
     bypass_retrieval: bool
 
@@ -125,13 +128,13 @@ class _RetrieveResult:
 
     # context is None only when COLLECTION intent finds no documents (early exit)
     context: Optional[str]
-    results: Any  # list[RetrievalResult]
-    source_ids: Any  # list[str]
-    context_docs: Any  # list[str]
+    results: list[RetrievalResult]
+    source_ids: list[str]
+    context_docs: list[str]
     cite: bool
     extra_instructions: Optional[str]
-    retrieval_metrics: Any  # Optional[RetrievalMetrics]
-    generator_preload_future: Any  # Optional[Future[MlxGenerator]]
+    retrieval_metrics: Optional[RetrievalMetrics]
+    generator_preload_future: Optional[concurrent.futures.Future[MlxGenerator]]
 
 
 @dataclass
@@ -141,12 +144,12 @@ class _PackResult:
     context: str
     cite: bool
     source_legend: Optional[str]
-    result_metadatas: Any  # list[dict]
-    budget_metrics: Any  # Optional[BudgetMetrics]
-    citation_list: Any  # list[dict]
-    packed_retrieval_results: Any  # list[RetrievalResult]
-    pack_result: Any  # Optional[BudgetPackResult] — None for no_generate path
-    packed_metadatas: Any  # list[dict]
+    result_metadatas: list[dict[str, Any]]
+    budget_metrics: Optional[BudgetMetrics]
+    citation_list: list[dict[str, Any]]
+    packed_retrieval_results: list[RetrievalResult]
+    pack_result: Optional[BudgetPackResult]
+    packed_metadatas: list[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -1211,19 +1214,13 @@ class RagEngine:
         source_id: Optional[str],
         intent_override: Optional[str],
         no_generate: bool,
-        profiler: Optional[Any] = None,
+        profiler: Optional[LatencyProfiler] = None,
     ) -> _ClassifyResult:
         """Classify intent, apply collection guard, resolve retrieval/gen params."""
         config = self._model_config
+        _span = profiler.span if profiler is not None else lambda _: nullcontext()
 
-        if profiler:
-            with profiler.span("Intent classification"):
-                intent_result = self._classify_intent(
-                    query_text=query_text,
-                    intent_override=intent_override,
-                    no_generate=no_generate,
-                )
-        else:
+        with _span("Intent classification"):
             intent_result = self._classify_intent(
                 query_text=query_text,
                 intent_override=intent_override,
@@ -1275,11 +1272,11 @@ class RagEngine:
         retrieval_engine: Any,
         cite: bool,
         no_generate: bool,
-        profiler: Optional[Any] = None,
+        profiler: Optional[LatencyProfiler] = None,
     ) -> _RetrieveResult:
         """Execute the retrieval phase — bypass, collection summary, or hybrid search."""
         config = self._model_config
-        model_id = self._cfg.model or config.llm_model
+        _span = profiler.span if profiler is not None else lambda _: nullcontext()
 
         extra_instructions: Optional[str] = None
         context = ""
@@ -1303,7 +1300,6 @@ class RagEngine:
         elif classified.intent_result.intent == Intent.COLLECTION:
             context, source_ids, cite = self._handle_collection(
                 config=config,
-                model_id=model_id,
                 no_generate=no_generate,
                 citations_enabled=cite,
             )
@@ -1329,16 +1325,7 @@ class RagEngine:
             if not no_generate:
                 generator_preload_future = self._start_generator_preload()
 
-            if profiler:
-                with profiler.span("Retrieval (hybrid search + rerank)"):
-                    results = retrieval_engine.search(
-                        query_text,
-                        source_id=source_id,
-                        params=classified.retrieval_params,
-                        retrieval_budget=config.retrieval_budget,
-                        intent=classified.intent_result.intent.value,
-                    )
-            else:
+            with _span("Retrieval (hybrid search + rerank)"):
                 results = retrieval_engine.search(
                     query_text,
                     source_id=source_id,
@@ -1511,7 +1498,6 @@ class RagEngine:
         self,
         *,
         config: ModelConfig,
-        model_id: str,
         no_generate: bool,
         citations_enabled: bool,
     ) -> tuple[Optional[str], list[str], bool]:

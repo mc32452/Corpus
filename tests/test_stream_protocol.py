@@ -1,7 +1,11 @@
-"""Tests for AI SDK Data Stream Protocol v1 encoder.
+"""Tests for AI SDK UI message stream (SSE) encoder.
 
-Validates exact line format, JSON validity, newline termination,
+Validates exact SSE frame format, JSON validity, double-newline termination,
 and edge cases (empty strings, unicode, special characters).
+
+Protocol format::
+
+    data: {json_payload}\\n\\n
 """
 
 from __future__ import annotations
@@ -31,66 +35,70 @@ from src.stream_protocol import (
 # ---------------------------------------------------------------------------
 
 
-def _parse_line(line: str) -> tuple[str, object]:
-    """Parse a protocol line into (type_code, decoded_json_value).
+def _parse_sse_frame(frame: str) -> dict:
+    """Parse one SSE frame (``data: {...}\\n\\n``) into a Python dict."""
+    frame = frame.strip()
+    assert frame.startswith("data: "), f"Frame must start with 'data: ': {frame!r}"
+    payload = frame[6:]  # strip "data: "
+    return json.loads(payload)
 
-    Every valid line is ``{type_code}:{json}\n``.
+
+def _parse_sse_body(body: str) -> list[dict]:
+    """Split a stream body into individual SSE frames and parse each one.
+
+    Skips the terminal ``data: [DONE]`` sentinel if present.
     """
-    assert line.endswith("\n"), f"Line must end with newline: {line!r}"
-    body = line[:-1]  # strip trailing \n
-    colon_idx = body.index(":")
-    type_code = body[:colon_idx]
-    json_str = body[colon_idx + 1 :]
-    value = json.loads(json_str)
-    return type_code, value
+    events: list[dict] = []
+    for chunk in body.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if chunk == "data: [DONE]":
+            continue
+        events.append(_parse_sse_frame(chunk))
+    return events
+
 
 
 # ---------------------------------------------------------------------------
-# encode_text
+# encode_text  (legacy alias: emits 3 SSE frames)
 # ---------------------------------------------------------------------------
 
 
 class TestEncodeText:
-    def test_simple_token(self) -> None:
-        line = encode_text("Hello")
-        assert line == '0:"Hello"\n'
-        code, val = _parse_line(line)
-        assert code == "0"
-        assert val == "Hello"
+    def test_simple_token_produces_three_frames(self) -> None:
+        body = encode_text("Hello")
+        events = _parse_sse_body(body)
+        assert len(events) == 3
+        assert events[0] == {"type": "text-start", "id": "text-0"}
+        assert events[1] == {"type": "text-delta", "id": "text-0", "delta": "Hello"}
+        assert events[2] == {"type": "text-end", "id": "text-0"}
 
     def test_empty_string(self) -> None:
-        line = encode_text("")
-        assert line == '0:""\n'
-        code, val = _parse_line(line)
-        assert code == "0"
-        assert val == ""
+        events = _parse_sse_body(encode_text(""))
+        assert events[1]["delta"] == ""
 
     def test_unicode_characters(self) -> None:
-        line = encode_text("Héllo wörld 你好 🌍")
-        code, val = _parse_line(line)
-        assert code == "0"
-        assert val == "Héllo wörld 你好 🌍"
+        text = "Héllo wörld 你好 🌍"
+        events = _parse_sse_body(encode_text(text))
+        assert events[1]["delta"] == text
 
     def test_special_json_characters(self) -> None:
-        """Quotes, backslashes, and newlines must be JSON-escaped."""
+        """Quotes, backslashes, and newlines must survive JSON round-trip."""
         text = 'He said "hello"\nand\\walked away'
-        line = encode_text(text)
-        code, val = _parse_line(line)
-        assert code == "0"
-        assert val == text
+        events = _parse_sse_body(encode_text(text))
+        assert events[1]["delta"] == text
 
     def test_single_space(self) -> None:
-        line = encode_text(" ")
-        code, val = _parse_line(line)
-        assert val == " "
+        events = _parse_sse_body(encode_text(" "))
+        assert events[1]["delta"] == " "
 
-    def test_multiline_content(self) -> None:
-        text = "line1\nline2\nline3"
-        line = encode_text(text)
-        code, val = _parse_line(line)
-        assert val == text
-        # The encoded line itself should be a single line (embedded newlines are escaped)
-        assert line.count("\n") == 1
+    def test_frame_terminator(self) -> None:
+        """Every SSE frame must end with \\n\\n."""
+        body = encode_text("hi")
+        for frame in body.split("\n\n"):
+            if frame.strip():
+                assert frame.startswith("data: ")
 
 
 # ---------------------------------------------------------------------------
@@ -99,30 +107,32 @@ class TestEncodeText:
 
 
 class TestEncodeData:
-    def test_single_object(self) -> None:
-        line = encode_data([{"key": "value"}])
-        code, val = _parse_line(line)
-        assert code == "2"
-        assert val == [{"key": "value"}]
+    def test_single_object_with_type(self) -> None:
+        body = encode_data([{"type": "status", "status": "Loading"}])
+        events = _parse_sse_body(body)
+        assert len(events) == 1
+        assert events[0]["type"] == "data-status"
+        assert events[0]["data"] == {"type": "status", "status": "Loading"}
 
-    def test_empty_array(self) -> None:
-        line = encode_data([])
-        code, val = _parse_line(line)
-        assert code == "2"
-        assert val == []
+    def test_empty_array_produces_no_frames(self) -> None:
+        body = encode_data([])
+        events = _parse_sse_body(body)
+        assert events == []
 
-    def test_multiple_objects(self) -> None:
-        data = [{"a": 1}, {"b": 2}]
-        line = encode_data(data)
-        code, val = _parse_line(line)
-        assert code == "2"
-        assert val == data
+    def test_multiple_items_produce_multiple_frames(self) -> None:
+        body = encode_data([
+            {"type": "status", "status": "a"},
+            {"type": "sources", "sourceIds": ["x"]},
+        ])
+        events = _parse_sse_body(body)
+        assert len(events) == 2
+        assert events[0]["type"] == "data-status"
+        assert events[1]["type"] == "data-sources"
 
-    def test_nested_objects(self) -> None:
-        data = [{"outer": {"inner": [1, 2, 3]}}]
-        line = encode_data(data)
-        code, val = _parse_line(line)
-        assert val == data
+    def test_nested_objects_survive_round_trip(self) -> None:
+        item = {"type": "custom", "nested": {"a": [1, 2, 3]}}
+        events = _parse_sse_body(encode_data([item]))
+        assert events[0]["data"] == item
 
 
 # ---------------------------------------------------------------------------
@@ -132,24 +142,19 @@ class TestEncodeData:
 
 class TestEncodeError:
     def test_simple_error(self) -> None:
-        line = encode_error("Something went wrong")
-        assert line == '3:"Something went wrong"\n'
-        code, val = _parse_line(line)
-        assert code == "3"
-        assert val == "Something went wrong"
+        body = encode_error("Something went wrong")
+        assert body == 'data: {"type": "error", "error": "Something went wrong"}\n\n'
+        events = _parse_sse_body(body)
+        assert events[0] == {"type": "error", "error": "Something went wrong"}
 
     def test_error_with_quotes(self) -> None:
         msg = 'File "test.pdf" not found'
-        line = encode_error(msg)
-        code, val = _parse_line(line)
-        assert code == "3"
-        assert val == msg
+        events = _parse_sse_body(encode_error(msg))
+        assert events[0]["error"] == msg
 
     def test_empty_error(self) -> None:
-        line = encode_error("")
-        code, val = _parse_line(line)
-        assert code == "3"
-        assert val == ""
+        events = _parse_sse_body(encode_error(""))
+        assert events[0]["error"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -158,26 +163,24 @@ class TestEncodeError:
 
 
 class TestEncodeAnnotation:
-    def test_single_annotation(self) -> None:
-        line = encode_annotation([{"type": "status", "status": "Loading..."}])
-        code, val = _parse_line(line)
-        assert code == "8"
-        assert val == [{"type": "status", "status": "Loading..."}]
+    def test_single_annotation_with_known_type(self) -> None:
+        body = encode_annotation([{"type": "status", "status": "Loading..."}])
+        events = _parse_sse_body(body)
+        assert len(events) == 1
+        assert events[0]["type"] == "data-status"
+        assert events[0]["data"]["status"] == "Loading..."
 
-    def test_empty_annotations(self) -> None:
-        line = encode_annotation([])
-        code, val = _parse_line(line)
-        assert code == "8"
-        assert val == []
+    def test_empty_annotations_produce_no_frames(self) -> None:
+        body = encode_annotation([])
+        assert _parse_sse_body(body) == []
 
-    def test_multiple_annotations(self) -> None:
+    def test_multiple_annotations_produce_multiple_frames(self) -> None:
         annotations = [
             {"type": "status", "status": "step1"},
             {"type": "sources", "sourceIds": ["a"]},
         ]
-        line = encode_annotation(annotations)
-        code, val = _parse_line(line)
-        assert val == annotations
+        events = _parse_sse_body(encode_annotation(annotations))
+        assert len(events) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -186,28 +189,22 @@ class TestEncodeAnnotation:
 
 
 class TestEncodeFinishMessage:
-    def test_default_finish(self) -> None:
-        line = encode_finish_message()
-        code, val = _parse_line(line)
-        assert code == "d"
-        assert val["finishReason"] == "stop"
-        assert val["usage"]["promptTokens"] == 0
-        assert val["usage"]["completionTokens"] == 0
+    def test_default_finish_emits_type_finish(self) -> None:
+        body = encode_finish_message()
+        assert body == 'data: {"type": "finish"}\n\n'
+        events = _parse_sse_body(body)
+        assert events[0] == {"type": "finish"}
 
-    def test_custom_reason_and_usage(self) -> None:
-        line = encode_finish_message(
-            "length", prompt_tokens=100, completion_tokens=50
-        )
-        code, val = _parse_line(line)
-        assert code == "d"
-        assert val["finishReason"] == "length"
-        assert val["usage"]["promptTokens"] == 100
-        assert val["usage"]["completionTokens"] == 50
+    def test_params_do_not_appear_on_wire(self) -> None:
+        """finish_reason and usage tokens are ignored per AI SDK v6 spec."""
+        body = encode_finish_message("length", prompt_tokens=100, completion_tokens=50)
+        events = _parse_sse_body(body)
+        assert events[0] == {"type": "finish"}
 
-    def test_error_finish_reason(self) -> None:
-        line = encode_finish_message("error")
-        code, val = _parse_line(line)
-        assert val["finishReason"] == "error"
+    def test_error_reason_produces_same_frame(self) -> None:
+        body = encode_finish_message("error")
+        events = _parse_sse_body(body)
+        assert events[0]["type"] == "finish"
 
 
 # ---------------------------------------------------------------------------
@@ -217,16 +214,21 @@ class TestEncodeFinishMessage:
 
 class TestEncodeFinishStep:
     def test_default_step(self) -> None:
-        line = encode_finish_step()
-        code, val = _parse_line(line)
-        assert code == "e"
-        assert val["finishReason"] == "stop"
-        assert val["isContinued"] is False
+        body = encode_finish_step()
+        events = _parse_sse_body(body)
+        assert len(events) == 1
+        assert events[0]["type"] == "data-finish-step"
+        data = events[0]["data"]
+        assert data["finishReason"] == "stop"
+        assert data["isContinued"] is False
 
     def test_continued_step(self) -> None:
-        line = encode_finish_step("stop", is_continued=True)
-        code, val = _parse_line(line)
-        assert val["isContinued"] is True
+        events = _parse_sse_body(encode_finish_step("stop", is_continued=True))
+        assert events[0]["data"]["isContinued"] is True
+
+    def test_error_reason(self) -> None:
+        events = _parse_sse_body(encode_finish_step("error"))
+        assert events[0]["data"]["finishReason"] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -236,56 +238,52 @@ class TestEncodeFinishStep:
 
 class TestAnnotationHelpers:
     def test_status(self) -> None:
-        line = annotation_status("Classifying intent...")
-        code, val = _parse_line(line)
-        assert code == "8"
-        assert len(val) == 1
-        assert val[0]["type"] == "status"
-        assert val[0]["status"] == "Classifying intent..."
+        body = annotation_status("Classifying intent...")
+        assert body == (
+            'data: {"type": "data-status", "data": {"type": "status",'
+            ' "status": "Classifying intent..."}}\n\n'
+        )
+        events = _parse_sse_body(body)
+        assert events[0]["type"] == "data-status"
+        assert events[0]["data"]["status"] == "Classifying intent..."
 
     def test_sources(self) -> None:
-        line = annotation_sources(["doc_a", "doc_b"])
-        code, val = _parse_line(line)
-        assert val[0]["type"] == "sources"
-        assert val[0]["sourceIds"] == ["doc_a", "doc_b"]
+        events = _parse_sse_body(annotation_sources(["doc_a", "doc_b"]))
+        assert events[0]["type"] == "data-sources"
+        assert events[0]["data"]["sourceIds"] == ["doc_a", "doc_b"]
 
     def test_sources_empty(self) -> None:
-        line = annotation_sources([])
-        code, val = _parse_line(line)
-        assert val[0]["sourceIds"] == []
+        events = _parse_sse_body(annotation_sources([]))
+        assert events[0]["data"]["sourceIds"] == []
 
     def test_intent(self) -> None:
-        line = annotation_intent("analyze", 0.85, "heuristic")
-        code, val = _parse_line(line)
-        assert val[0]["type"] == "intent"
-        assert val[0]["intent"] == "analyze"
-        assert val[0]["confidence"] == 0.85
-        assert val[0]["method"] == "heuristic"
+        events = _parse_sse_body(annotation_intent("analyze", 0.85, "heuristic"))
+        assert events[0]["type"] == "data-intent"
+        d = events[0]["data"]
+        assert d["intent"] == "analyze"
+        assert d["confidence"] == 0.85
+        assert d["method"] == "heuristic"
 
     def test_intent_low_confidence(self) -> None:
-        line = annotation_intent("overview", 0.40, "fallback")
-        code, val = _parse_line(line)
-        assert val[0]["confidence"] == 0.40
+        events = _parse_sse_body(annotation_intent("overview", 0.40, "fallback"))
+        assert events[0]["data"]["confidence"] == 0.40
 
     def test_error_annotation(self) -> None:
-        line = annotation_error("INTERNAL", "Generation failed")
-        code, val = _parse_line(line)
-        assert val[0]["type"] == "error"
-        assert val[0]["error"]["code"] == "INTERNAL"
-        assert val[0]["error"]["message"] == "Generation failed"
+        events = _parse_sse_body(annotation_error("INTERNAL", "Generation failed"))
+        assert events[0]["type"] == "data-error"
+        assert events[0]["data"]["error"]["code"] == "INTERNAL"
+        assert events[0]["data"]["error"]["message"] == "Generation failed"
 
     def test_error_annotation_all_codes(self) -> None:
         """Verify all error codes from the contract can be encoded."""
         for error_code in [
-            "LOCK_BUSY",
             "SOURCE_NOT_FOUND",
             "INGEST_FAILED",
             "STREAM_CANCELLED",
             "INTERNAL",
         ]:
-            line = annotation_error(error_code, f"Test {error_code}")
-            code, val = _parse_line(line)
-            assert val[0]["error"]["code"] == error_code
+            events = _parse_sse_body(annotation_error(error_code, f"Test {error_code}"))
+            assert events[0]["data"]["error"]["code"] == error_code
 
 
 # ---------------------------------------------------------------------------
@@ -295,11 +293,11 @@ class TestAnnotationHelpers:
 
 class TestHttpErrorBody:
     def test_structure(self) -> None:
-        body = http_error_body("LOCK_BUSY", "Another query is in progress")
+        body = http_error_body("SOURCE_NOT_FOUND", "Document not found")
         assert body == {
             "error": {
-                "code": "LOCK_BUSY",
-                "message": "Another query is in progress",
+                "code": "SOURCE_NOT_FOUND",
+                "message": "Document not found",
             }
         }
 
@@ -317,10 +315,10 @@ class TestHttpErrorBody:
 
 class TestStreamHeaders:
     def test_content_type(self) -> None:
-        assert STREAM_HEADERS["Content-Type"] == "text/plain; charset=utf-8"
+        assert STREAM_HEADERS["Content-Type"] == "text/event-stream; charset=utf-8"
 
-    def test_data_stream_header(self) -> None:
-        assert STREAM_HEADERS["X-Vercel-AI-Data-Stream"] == "v1"
+    def test_ui_message_stream_header(self) -> None:
+        assert STREAM_HEADERS["X-Vercel-AI-UI-Message-Stream"] == "v1"
 
     def test_no_cache(self) -> None:
         assert STREAM_HEADERS["Cache-Control"] == "no-cache"
@@ -335,77 +333,84 @@ class TestStreamHeaders:
 
 
 class TestFullStreamSequence:
-    """Simulate a complete chat stream and verify the full byte sequence."""
+    """Simulate a complete chat stream and verify the full SSE byte sequence."""
 
     def test_happy_path_sequence(self) -> None:
         """A normal chat response: status → intent → text chunks → sources → finish."""
-        lines: list[str] = []
+        frames: list[str] = []
 
         # 1. Status updates
-        lines.append(annotation_status("Classifying intent..."))
-        lines.append(annotation_intent("analyze", 0.85, "heuristic"))
-        lines.append(annotation_status("Searching knowledge base..."))
-        lines.append(annotation_status("Generating answer..."))
+        frames.append(annotation_status("Classifying intent..."))
+        frames.append(annotation_intent("analyze", 0.85, "heuristic"))
+        frames.append(annotation_status("Searching knowledge base..."))
+        frames.append(annotation_status("Generating answer..."))
 
-        # 2. Text tokens
-        lines.append(encode_text("The "))
-        lines.append(encode_text("theory "))
-        lines.append(encode_text("of "))
-        lines.append(encode_text("generative "))
-        lines.append(encode_text("grammar..."))
+        # 2. Text tokens (using encode_text legacy helper)
+        frames.append(encode_text("The "))
+        frames.append(encode_text("theory "))
+        frames.append(encode_text("of "))
+        frames.append(encode_text("generative "))
+        frames.append(encode_text("grammar..."))
 
         # 3. Sources
-        lines.append(annotation_sources(["linguistics_doc"]))
+        frames.append(annotation_sources(["linguistics_doc"]))
 
         # 4. Finish
-        lines.append(encode_finish_step("stop"))
-        lines.append(encode_finish_message("stop", prompt_tokens=500, completion_tokens=25))
+        frames.append(encode_finish_step("stop"))
+        frames.append(encode_finish_message("stop", prompt_tokens=500, completion_tokens=25))
 
-        # Verify: all lines are valid protocol lines
-        for line in lines:
-            assert line.endswith("\n")
-            _parse_line(line)  # must not raise
+        # Verify: every frame is a parseable SSE event
+        body = "".join(frames)
+        events = _parse_sse_body(body)
+        assert len(events) > 0
 
-        # Verify: concatenation produces valid stream body
-        body = "".join(lines)
-        assert body.count("\n") == len(lines)
+        # Text tokens produce 3 frames each; 5 tokens → 15 text frames
+        text_delta_events = [e for e in events if e.get("type") == "text-delta"]
+        assert len(text_delta_events) == 5
+
+        # Stream ends with {"type": "finish"}
+        assert events[-1] == {"type": "finish"}
 
     def test_error_mid_stream_sequence(self) -> None:
         """Error occurs after some text has been sent."""
-        lines: list[str] = []
+        frames: list[str] = []
 
-        lines.append(annotation_status("Generating answer..."))
-        lines.append(encode_text("Partial "))
-        lines.append(encode_text("response"))
+        frames.append(annotation_status("Generating answer..."))
+        frames.append(encode_text("Partial "))
+        frames.append(encode_text("response"))
 
         # Error occurs
-        lines.append(annotation_error("INTERNAL", "Model crashed"))
-        lines.append(encode_error("Model crashed"))
+        frames.append(annotation_error("INTERNAL", "Model crashed"))
+        frames.append(encode_error("Model crashed"))
 
         # Finish with error reason
-        lines.append(encode_finish_step("error"))
-        lines.append(encode_finish_message("error"))
+        frames.append(encode_finish_step("error"))
+        frames.append(encode_finish_message("error"))
 
-        for line in lines:
-            _parse_line(line)
+        body = "".join(frames)
+        events = _parse_sse_body(body)
 
-        # The error annotation contains structured info
-        _, error_ann = _parse_line(lines[3])
-        assert error_ann[0]["error"]["code"] == "INTERNAL"
+        # Error annotation appears before stream-level error
+        error_ann = next(e for e in events if e.get("type") == "data-error")
+        assert error_ann["data"]["error"]["code"] == "INTERNAL"
 
-        # The error line contains the human-readable message
-        _, error_msg = _parse_line(lines[4])
-        assert error_msg == "Model crashed"
+        # Stream-level error carries human-readable message
+        stream_error = next(e for e in events if e.get("type") == "error")
+        assert stream_error["error"] == "Model crashed"
+
+        # Finish frame is last
+        assert events[-1]["type"] == "finish"
 
     def test_cancellation_sequence(self) -> None:
         """Stream cancelled by client disconnect."""
-        lines: list[str] = []
+        frames: list[str] = []
 
-        lines.append(encode_text("Partial"))
-        lines.append(annotation_error("STREAM_CANCELLED", "Client disconnected"))
-        lines.append(encode_error("Client disconnected"))
-        lines.append(encode_finish_step("error"))
-        lines.append(encode_finish_message("error"))
+        frames.append(encode_text("Partial"))
+        frames.append(annotation_error("STREAM_CANCELLED", "Client disconnected"))
+        frames.append(encode_error("Client disconnected"))
+        frames.append(encode_finish_step("error"))
+        frames.append(encode_finish_message("error"))
 
-        for line in lines:
-            _parse_line(line)
+        events = _parse_sse_body("".join(frames))
+        assert any(e.get("type") == "error" for e in events)
+        assert events[-1]["type"] == "finish"
