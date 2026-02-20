@@ -201,11 +201,7 @@ def run() -> None:
         default="mlx-community/LFM2-8B-A1B-4bit",
         help="Model for LLM intent fallback",
     )
-    query_parser.add_argument(
-        "--enable-query-expansion",
-        action="store_true",
-        help="Enable intent-based query expansion (experimental)",
-    )
+
     query_parser.add_argument(
         "--cite",
         action="store_true",
@@ -249,7 +245,7 @@ def run() -> None:
         fts_rebuild_policy=args.fts_rebuild_policy,
         fts_rebuild_batch_size=args.fts_rebuild_batch_size,
         citations_enabled=citations,
-        enable_query_expansion=getattr(args, "enable_query_expansion", False),
+
         intent_confidence_threshold=getattr(
             args, "intent_confidence_threshold", 0.6
         ),
@@ -308,7 +304,7 @@ def run() -> None:
         intent_override=args.intent,
         citations_enabled=citations,
         no_generate=args.no_generate,
-        enable_query_expansion=getattr(args, "enable_query_expansion", False),
+
     )
 
     # -- display retrieval metrics -----------------------------------------

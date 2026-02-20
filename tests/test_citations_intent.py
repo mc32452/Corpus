@@ -14,7 +14,7 @@ from src.intent import (
     is_low_information_query,
     is_source_selection_query,
 )
-from src.rag_engine import _expand_query  # type: ignore[attr-defined]
+
 from src.retrieval import (
     build_source_legend,
     format_chunk_for_citation,
@@ -770,34 +770,25 @@ class TestSourceSelectionRoutingGuard:
         assert is_source_selection_query(query) is expected
 
 
-class TestQueryExpansionDisabled:
-    """Regression tests ensuring _expand_query returns the original query
-    unchanged for every intent after static expansion terms were removed
-    (see docs/QUERY_EXPANSION_EVAL.md §8).
+class TestQueryExpansionRemoved:
+    """Verify the dead query expansion infrastructure has been fully removed."""
 
-    These tests prevent accidental re-introduction of static term lists.
-    If a future contribution re-populates _EXPANSION_TERMS it must first
-    provide a live A/B evaluation demonstrating measurable recall benefit.
-    """
-
-    @pytest.mark.parametrize("intent", list(Intent))
-    def test_expand_query_returns_original_for_all_intents(self, intent: Intent) -> None:
-        query = "What are the main findings?"
-        expanded, terms = _expand_query(query, intent)
-        assert expanded == query, (
-            f"_expand_query modified the query for intent {intent!r}: "
-            f"got {expanded!r}, expected {query!r}"
-        )
-        assert terms == [], (
-            f"_expand_query returned non-empty terms for intent {intent!r}: {terms}"
+    def test_no_expand_query_function(self) -> None:
+        import src.rag_engine as _mod
+        assert not hasattr(_mod, "_expand_query"), (
+            "_expand_query still exists — it should have been removed"
         )
 
-    @pytest.mark.parametrize("intent", list(Intent))
-    def test_expand_query_does_not_append_whitespace(self, intent: Intent) -> None:
-        """Even if an intent list were mistakenly set to [''], joining it
-        would produce a trailing space.  Guard against that too."""
-        query = "Summarize this document"
-        expanded, _ = _expand_query(query, intent)
-        assert expanded == expanded.strip(), (
-            f"_expand_query introduced leading/trailing whitespace for intent {intent!r}"
+    def test_no_expansion_terms_dict(self) -> None:
+        import src.rag_engine as _mod
+        assert not hasattr(_mod, "_EXPANSION_TERMS"), (
+            "_EXPANSION_TERMS still exists — it should have been removed"
         )
+
+    def test_query_method_no_expansion_param(self) -> None:
+        import inspect, src.rag_engine as _mod
+        sig = inspect.signature(_mod.RagEngine.query)
+        assert "enable_query_expansion" not in sig.parameters, (
+            "query() still accepts enable_query_expansion"
+        )
+
