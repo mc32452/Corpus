@@ -8,6 +8,7 @@ instead of printing to stdout.
 from __future__ import annotations
 
 import concurrent.futures
+import difflib
 import gc
 import logging
 import os
@@ -148,24 +149,6 @@ _INCOMPLETE_ENDING = re.compile(
     re.IGNORECASE,
 )
 
-# BM25 expansion terms removed — live A/B evaluation (2026-02-20) showed
-# all expansion-only chunks scored negative on the reranker, zero intents
-# showed positive Δ threshold survivors, and two cases of active harm were
-# observed (queries #17 and #21 in docs/QUERY_EXPANSION_EVAL_RESULTS.md).
-# The dict structure is preserved so a smarter expansion strategy (e.g.
-# pseudo-relevance feedback or LLM query rewrite) can be slotted in without
-# call-site changes.  See docs/QUERY_EXPANSION_EVAL.md §8 for full rationale.
-_EXPANSION_TERMS: dict[Intent, list[str]] = {
-    Intent.OVERVIEW: [],
-    Intent.SUMMARIZE: [],
-    Intent.EXPLAIN: [],
-    Intent.ANALYZE: [],
-    Intent.COMPARE: [],
-    Intent.CRITIQUE: [],
-    Intent.FACTUAL: [],
-    Intent.COLLECTION: [],
-}
-
 
 def _strip_chatter(text: str) -> str:
     """Remove trailing chatter phrases near end of text (last 20%)."""
@@ -187,7 +170,6 @@ def _dedupe_repeated_blocks(text: str) -> str:
     """Remove duplicated halves when model repeats itself (>85% similarity)."""
     if not text or len(text) < 200:
         return text
-    import difflib
 
     mid = len(text) // 2
     first_half, second_half = text[:mid].strip(), text[mid:].strip()
@@ -227,14 +209,6 @@ def sanitize_output(text: str) -> str:
                     result = result[: truncate_pos + 1]
                     break
     return result.strip()
-
-
-def _expand_query(query: str, intent: Intent) -> tuple[str, list[str]]:
-    """Append intent-specific expansion terms to query (feature-flagged)."""
-    terms = _EXPANSION_TERMS.get(intent, [])
-    if not terms:
-        return query, []
-    return f"{query} {' '.join(terms)}", list(terms)
 
 
 def _dedupe_context(texts: Iterable[str]) -> str:
@@ -358,7 +332,7 @@ class RagEngineConfig:
     fts_rebuild_policy: str = "deferred"
     fts_rebuild_batch_size: int = 0
     citations_enabled: Optional[bool] = None
-    enable_query_expansion: bool = True
+
     intent_confidence_threshold: float = 0.6
     llm_fallback: bool = True
     llm_fallback_threshold: float = 0.70
@@ -553,42 +527,17 @@ class RagEngine:
         """Pre-load embedding + reranker in parallel (call once at startup)."""
         if not self._model_config.reranker_enabled:
             self._on_status("Loading retrieval models (embedding only)...")
-            self._embedding_model = MlxEmbeddingModel(
-                self._model_config.embedding_model,
-                batch_size=16,
-                max_length=512,
-            )
-            self._validate_embedding_storage_compatibility(self._embedding_model)
-            self._reranker = None
+            self._ensure_embedding_model()
             self._on_status("Retrieval models loaded.")
             return
 
         self._on_status("Loading retrieval models (embedding + reranker)...")
-        from .reranker import JinaRerankerMLX
-
-        embed_result: list[Any] = [None]
-        reranker_result: list[Any] = [None]
-
-        def _load_embed() -> None:
-            embed_result[0] = MlxEmbeddingModel(
-                self._model_config.embedding_model,
-                batch_size=16,
-                max_length=512,
-            )
-
-        def _load_reranker() -> None:
-            reranker_result[0] = JinaRerankerMLX(
-                model_id=self._model_config.reranker_model
-            )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(_load_embed)
-            pool.submit(_load_reranker)
+            pool.submit(self._ensure_embedding_model)
+            pool.submit(self._ensure_reranker)
             pool.shutdown(wait=True)
 
-        self._embedding_model = embed_result[0]
-        self._validate_embedding_storage_compatibility(self._embedding_model)
-        self._reranker = reranker_result[0]
         self._on_status("Retrieval models loaded.")
 
     def _release_retrieval_models(self) -> None:
@@ -741,7 +690,6 @@ class RagEngine:
         intent_override: Optional[str] = None,
         citations_enabled: Optional[bool] = None,
         no_generate: bool = False,
-        enable_query_expansion: Optional[bool] = None,
     ) -> QueryResult:
         """Execute the full RAG pipeline and return a structured result.
 
@@ -757,8 +705,6 @@ class RagEngine:
             Override citation mode. ``None`` uses the engine default.
         no_generate : bool
             If True, skip LLM generation and return only retrieved context.
-        enable_query_expansion : bool | None
-            Override query expansion setting.
         """
         config = self._model_config
         model_id = self._cfg.model or config.llm_model
@@ -775,12 +721,6 @@ class RagEngine:
         logger.info(
             "Citations mode: %s",
             "ENABLED (Academic Mode)" if cite else "DISABLED (Casual Mode)",
-        )
-
-        expansion = (
-            enable_query_expansion
-            if enable_query_expansion is not None
-            else self._cfg.enable_query_expansion
         )
 
         if self._memory_constrained and self._generator is not None:
@@ -832,28 +772,6 @@ class RagEngine:
             intent_result.method,
             config.mode,
         )
-
-        # -- query expansion -----------------------------------------------
-        search_query = query_text
-        embedding_query = query_text   # never expanded — preserves embedding fidelity
-        bm25_query = query_text        # may be expanded for BM25 recall
-        if expansion:
-            search_query, expansion_terms = _expand_query(
-                query_text,
-                intent_result.intent,
-            )
-            bm25_query = search_query  # expanded version for BM25 only
-            logger.info(
-                "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
-                intent_result.intent.value,
-                intent_result.confidence,
-                expansion_terms,
-            )
-            if expansion_terms:
-                self._on_status(
-                    "Applying heuristic query expansion: "
-                    + ", ".join(expansion_terms[:4])
-                )
 
         extra_instructions: Optional[str] = None
         bypass_retrieval = is_low_information_query(query_text)
@@ -910,11 +828,9 @@ class RagEngine:
                 generator_preload_future = self._start_generator_preload()
             with profiler.span("Retrieval (hybrid search + rerank)"):
                 results = retrieval_engine.search(
-                    search_query, source_id=source_id,
+                    query_text, source_id=source_id,
                     params=retrieval_params,
                     retrieval_budget=config.retrieval_budget,
-                    embedding_query=embedding_query,
-                    bm25_query=bm25_query,
                     intent=intent_result.intent.value,
                 )
             source_ids = sorted(
@@ -1121,7 +1037,6 @@ class RagEngine:
         source_id: Optional[str] = None,
         intent_override: Optional[str] = None,
         citations_enabled: Optional[bool] = None,
-        enable_query_expansion: Optional[bool] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> Iterable[QueryEvent]:
         """Execute the RAG pipeline yielding structured events.
@@ -1142,8 +1057,6 @@ class RagEngine:
             Force a specific intent.
         citations_enabled : bool | None
             Override citation mode.
-        enable_query_expansion : bool | None
-            Override query expansion setting.
         should_stop : callable | None
             Called periodically; if it returns True, generation is
             aborted and a ``STREAM_CANCELLED`` error event is yielded.
@@ -1156,7 +1069,6 @@ class RagEngine:
                 source_id=source_id,
                 intent_override=intent_override,
                 citations_enabled=citations_enabled,
-                enable_query_expansion=enable_query_expansion,
                 should_stop=_stop,
             )
         except Exception as exc:
@@ -1178,7 +1090,6 @@ class RagEngine:
         source_id: Optional[str],
         intent_override: Optional[str],
         citations_enabled: Optional[bool],
-        enable_query_expansion: Optional[bool],
         should_stop: Callable[[], bool],
     ) -> Iterable[QueryEvent]:
         """Internal implementation of query_events (unwrapped from error handling)."""
@@ -1193,12 +1104,6 @@ class RagEngine:
             cite = self._cfg.citations_enabled
         else:
             cite = CITATIONS_ENABLED_DEFAULT
-
-        expansion = (
-            enable_query_expansion
-            if enable_query_expansion is not None
-            else self._cfg.enable_query_expansion
-        )
 
         if self._memory_constrained and self._generator is not None:
             self._release_generator_model()
@@ -1277,32 +1182,9 @@ class RagEngine:
             config.mode,
         )
 
-        # -- query expansion -----------------------------------------------
-        search_query = query_text
-        embedding_query = query_text   # never expanded
-        bm25_query = query_text        # may be expanded
-        if expansion:
-            search_query, expansion_terms = _expand_query(
-                query_text,
-                intent_result.intent,
-            )
-            bm25_query = search_query
-            logger.info(
-                "Query expansion heuristic | intent=%s confidence=%.2f terms=%s",
-                intent_result.intent.value,
-                intent_result.confidence,
-                expansion_terms,
-            )
-            if expansion_terms:
-                yield StatusEvent(
-                    status=(
-                        "Applying heuristic query expansion: "
-                        + ", ".join(expansion_terms[:4])
-                    )
-                )
 
         if should_stop():
-            yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled after query expansion")
+            yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled")
             yield FinishEvent(finish_reason="error")
             return
 
@@ -1352,11 +1234,9 @@ class RagEngine:
             yield StatusEvent(status="Searching knowledge base...")
             generator_preload_future = self._start_generator_preload()
             results = retrieval_engine.search(
-                search_query, source_id=source_id,
+                query_text, source_id=source_id,
                 params=retrieval_params,
                 retrieval_budget=config.retrieval_budget,
-                embedding_query=embedding_query,
-                bm25_query=bm25_query,
                 intent=intent_result.intent.value,
             )
             # -- emit detailed retrieval step statuses ---------------------
