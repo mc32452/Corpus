@@ -127,7 +127,7 @@ export function IngestModal({ onClose, onStartUpload }: IngestModalProps) {
 
     onStartUpload(reqs);
     onClose();
-  }, [files, sourceIds, summarize, onStartUpload, onClose]);
+  }, [files, sourceIds, citationRefs, summarize, onStartUpload, onClose]);
 
   return (
     <div

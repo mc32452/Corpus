@@ -6,6 +6,45 @@ from .intent import Intent
 
 
 # ---------------------------------------------------------------------------
+# Ingestion-only document summary system prompt
+# This is intentionally separate from the RAG query prompts — no citations,
+# different style goal: orient the reader to what the document is and contains.
+# ---------------------------------------------------------------------------
+
+_INGEST_SUMMARY_SYSTEM = """You are a research assistant that writes concise document overviews.
+Your job is to help a researcher quickly understand what a newly-ingested document is.
+
+Rules:
+1. Use ONLY the provided text. Do not rely on outside knowledge.
+2. Do NOT include citation markers such as [1], [2], etc. — there are no numbered passages.
+3. Do NOT use bullet points. Write in clear prose paragraphs.
+4. Do NOT include meta-commentary, self-evaluations, or sign-offs.
+5. Stop immediately after your final sentence."""
+
+_INGEST_SUMMARY_QUESTION = (
+    "Start with one sentence (20-30 words) identifying the document."
+    "Write a 3-4 paragraph summary of this document. "
+    "Start the first paragraph by explaining what the document is — "
+    "its type (e.g. book, report, article), its subject matter, and its scope or purpose. "
+    "Use the middle paragraphs to describe the main topics, arguments, or findings covered. "
+    "Close with a short paragraph noting the document's relevance or usefulness for research."
+)
+
+
+def build_ingest_summary_messages(context: str) -> list[dict[str, str]]:
+    """Build messages for document ingestion summary generation.
+
+    Uses a dedicated prompt that is completely separate from the RAG query
+    prompts — no citation rules, no intent instructions, correct style for
+    describing what a document *is*.
+    """
+    return [
+        {"role": "system", "content": _INGEST_SUMMARY_SYSTEM},
+        {"role": "user", "content": f"Document text:\n{context}\n\nTask: {_INGEST_SUMMARY_QUESTION}\n\nSummary:"},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # System message with paragraph formatting rules
 # ---------------------------------------------------------------------------
 
@@ -46,8 +85,8 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
         ),
         "format": (
             "List 3-5 key points as bullet points. "
-            "Each bullet should be one direct sentence (15-35 words) capturing one core idea, "
-            "followed immediately by its inline citation [N] — citations are mandatory, not commentary. "
+            "Each bullet should be one direct sentence (15-35 words) capturing one core idea. "
+            "When citations are enabled, follow each bullet immediately with its inline citation [N]. "
             "Do NOT add interpretation or evaluation beyond what the source states."
         ),
         "tone": "Academic but accessible.",
@@ -383,7 +422,15 @@ def build_messages(
             system_block = sparsity_warning + "\n\n" + system_block
 
     legend_block = f"\n\n{source_legend}" if citations_enabled and source_legend else ""
-    user_block = f"Context:\n{context}{legend_block}\n\nQuestion: {question}\n\nAnswer:"
+    # Reminder injected right before "Answer:" — at the generation trigger point where
+    # model attention peaks — to combat first-run variability where citation rules
+    # buried in the system prompt are sometimes insufficiently weighted.
+    citation_reminder = (
+        "\n\nIMPORTANT: You MUST include inline citation numbers [1], [2], etc. "
+        "after every factual claim. Use the PASSAGE numbers from the context above."
+        if citations_enabled else ""
+    )
+    user_block = f"Context:\n{context}{legend_block}\n\nQuestion: {question}{citation_reminder}\n\nAnswer:"
     return [
         {"role": "system", "content": system_block},
         {"role": "user", "content": user_block}

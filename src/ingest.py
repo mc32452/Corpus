@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .models import ChildChunk, Metadata, ParentChunk
-from .intent import Intent
-from .generation import build_messages
+from .generation import build_ingest_summary_messages
 from .generator import MlxGenerator
 from .storage import StorageEngine
 
@@ -515,11 +514,7 @@ def ingest_file_to_storage(
         context = "\n\n".join(parent.text for parent in parents)
         if len(context) > _SUMMARY_CONTEXT_CHAR_LIMIT:
             context = context[:_SUMMARY_CONTEXT_CHAR_LIMIT]
-        messages = build_messages(
-            context=context,
-            question="Summarize this document.",
-            intent=Intent.SUMMARIZE,
-        )
+        messages = build_ingest_summary_messages(context)
         summary = generator.generate_chat(messages)
         storage.upsert_source_summary(source_id=source_id, summary=summary)
 
