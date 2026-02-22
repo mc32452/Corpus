@@ -1,7 +1,7 @@
 "use client";
 
 import type { FC } from "react";
-import { INTERNAL } from "@assistant-ui/react";
+import { INTERNAL, useAuiState } from "@assistant-ui/react";
 import { StreamdownTextPrimitive } from "@assistant-ui/react-streamdown";
 import type { Citation } from "@/lib/event-parser";
 import { useAppDispatch, useAppState } from "@/context/app-context";
@@ -47,8 +47,11 @@ function extractCitationIndex(href?: string): number | null {
 }
 
 export const ChatMarkdownRenderer: FC = () => {
-  const { citations } = useAppState();
+  const { citationsByMessage } = useAppState();
+  const messageId = useAuiState((s) => s.message.id);
   const dispatch = useAppDispatch();
+
+  const citations = citationsByMessage[messageId] || [];
 
   return (
     <StreamdownTextPrimitive

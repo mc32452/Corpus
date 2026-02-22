@@ -29,6 +29,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .api_schemas import (
     ChatRequest,
+    ChunkBatchItem,
+    ChunkBatchResponse,
     ChunkDetailResponse,
     ErrorResponse,
     HealthResponse,
@@ -977,6 +979,63 @@ async def get_source_content(source_id: str):
         return JSONResponse(
             status_code=500,
             content=http_error_body("INTERNAL", f"Content fetch failed: {exc}"),
+        )
+
+
+@app.get("/api/sources/{source_id}/chunks", response_model=ChunkBatchResponse)
+async def get_chunk_batch(source_id: str, ids: str):
+    """Return an array of chunks in a single request.
+    
+    Tolerates missing chunks; returns only the ones found successfully.
+    """
+    chunk_ids = [cid.strip() for cid in ids.split(",") if cid.strip()]
+    if not chunk_ids:
+        return ChunkBatchResponse(chunks=[])
+
+    try:
+        engine = await asyncio.to_thread(_get_engine)
+        storage = engine.storage  # type: ignore[union-attr]
+
+        # Get source detail for format/source_path
+        detail = storage.get_source_detail(source_id)
+        sp = detail.get("source_path", "") if detail else ""
+        fmt = _detect_format(sp or None)
+
+        children = storage.get_children_by_ids(chunk_ids)
+
+        chunks = []
+        for cid in chunk_ids:
+            child = children.get(cid)
+            if not child:
+                continue
+            
+            meta = child.get("metadata", {})
+            if isinstance(meta, dict) and meta.get("source_id") != source_id:
+                continue
+
+            page_num_raw = meta.get("page_number") if isinstance(meta, dict) else None
+            page_number = int(page_num_raw) if page_num_raw is not None else None
+            display_page = str(meta.get("display_page", "")) if isinstance(meta, dict) and meta.get("display_page") else None
+            header_path = str(meta.get("header_path", "")) if isinstance(meta, dict) else ""
+
+            chunks.append(ChunkBatchItem(
+                source_id=source_id,
+                chunk_id=cid,
+                chunk_text=str(child.get("text", "")),
+                page_number=page_number,
+                display_page=display_page,
+                header_path=header_path,
+                format=fmt,
+                source_path=sp or None,
+            ))
+
+        return ChunkBatchResponse(chunks=chunks)
+
+    except Exception as exc:
+        logger.exception("Chunk batch failed for %s: %s", source_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=http_error_body("INTERNAL", f"Chunk batch failed: {exc}"),
         )
 
 

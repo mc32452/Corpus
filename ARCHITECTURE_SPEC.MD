@@ -26,8 +26,6 @@ The application is a **full-stack offline RAG system** designed for local-first 
 | Storage | `lancedb` + `pyarrow` | Vector ANN + FTS hybrid search with native RRF |
 | Backend API | `fastapi`, `uvicorn`, `sse-starlette`, `python-multipart` | SSE streaming + multipart upload |
 | Frontend | `next.js 16` (App Router), React 19, TypeScript 5 | Tailwind CSS 4, react-markdown |
-| Tokenizer | `mistral-common` | Compatibility dependency for certain model families |
-
 ---
 
 ## 3. Module Map

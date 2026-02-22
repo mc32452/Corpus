@@ -9,6 +9,7 @@ import { useAppState, useAppDispatch } from "@/context/app-context";
 interface ChatMarkdownProps {
   content: string;
   className?: string;
+  citations?: Citation[];
 }
 
 function addCitationLinks(content: string, citations?: Citation[]): string {
@@ -54,8 +55,8 @@ function extractCitationIndex(href?: string): number | null {
 export function ChatMarkdown({
   content,
   className = "",
+  citations = [],
 }: ChatMarkdownProps) {
-  const { citations } = useAppState();
   const dispatch = useAppDispatch();
   const markdownContent = addCitationLinks(content, citations);
 

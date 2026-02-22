@@ -53,14 +53,16 @@ export interface AppState {
   lastIntent: { intent: string; confidence: number; method: string } | null;
   /** Source IDs from latest query */
   lastSources: string[];
-  /** Citation list from the latest query's CitationListEvent */
-  citations: Citation[];
+  /** Citations grouped by assistant message ID */
+  citationsByMessage: Record<string, Citation[]>;
   /** The citation the user most recently clicked — read by CitationViewerModal */
   activeCitation: Citation | null;
   /** Ordered log of pipeline steps emitted during the current query (cleared on QUERY_STARTED) */
   thinkingSteps: ThinkingStep[];
   /** Internal counter for generating unique ThinkingStep IDs */
   _stepCounter: number;
+  /** The message ID of the assistant response currently generating */
+  currentAssistantMessageId: string | null;
 }
 
 const initialState: AppState = {
@@ -69,10 +71,11 @@ const initialState: AppState = {
   isLockBusy: false,
   lastIntent: null,
   lastSources: [],
-  citations: [],
+  citationsByMessage: {},
   activeCitation: null,
   thinkingSteps: [],
   _stepCounter: 0,
+  currentAssistantMessageId: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +103,7 @@ export type AppAction =
   | { type: "SET_INTENT"; intent: string; confidence: number; method: string }
   | { type: "SET_SOURCES"; sourceIds: string[] }
   | { type: "SET_CITATIONS"; citations: Citation[] }
+  | { type: "SET_CURRENT_MESSAGE_ID"; messageId: string }
   | { type: "SET_ACTIVE_CITATION"; citation: Citation | null }
   | { type: "ADD_THINKING_STEP"; message: string };
 
@@ -117,7 +121,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         isLockBusy: false,
         lastIntent: null,
         lastSources: [],
-        citations: [],
+        // Explicitly NOT clearing citationsByMessage so old messages retain their references drawer
         thinkingSteps: [],
         _stepCounter: 0,
       };
@@ -150,7 +154,19 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case "SET_SOURCES":
       return { ...state, lastSources: action.sourceIds };
     case "SET_CITATIONS":
-      return { ...state, citations: action.citations };
+      if (!state.currentAssistantMessageId) {
+        console.warn("Attempted to set citations but currentAssistantMessageId is null");
+        return state;
+      }
+      return {
+        ...state,
+        citationsByMessage: {
+          ...state.citationsByMessage,
+          [state.currentAssistantMessageId]: action.citations
+        }
+      };
+    case "SET_CURRENT_MESSAGE_ID":
+      return { ...state, currentAssistantMessageId: action.messageId };
     case "SET_ACTIVE_CITATION":
       return { ...state, activeCitation: action.citation };
     case "ADD_THINKING_STEP": {
@@ -171,7 +187,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
 // ---------------------------------------------------------------------------
 
 const AppStateContext = createContext<AppState>(initialState);
-const AppDispatchContext = createContext<Dispatch<AppAction>>(() => {});
+const AppDispatchContext = createContext<Dispatch<AppAction>>(() => { });
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState);

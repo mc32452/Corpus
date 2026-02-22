@@ -214,7 +214,7 @@ export function SourcePanel({
 
   function handleViewFullText(sourceId: string, e: React.MouseEvent) {
     e.stopPropagation();
-    dispatch({ type: "SET_ACTIVE_CITATION", citation: { source_id: sourceId } });
+    dispatch({ type: "SET_ACTIVE_CITATION", citation: { source_id: sourceId, chunk_id: "", number: 0 } });
   }
 
   /* ── Citation reader mode — slides in over the file list ── */
@@ -390,9 +390,8 @@ export function SourcePanel({
             return (
               <div
                 key={source.source_id}
-                className={`px-3 py-2.5 rounded-lg hover:bg-[#1a1a1a] transition-colors group cursor-pointer ${
-                  isHighlighted ? "bg-[#1c1c1c]" : ""
-                }`}
+                className={`px-3 py-2.5 rounded-lg hover:bg-[#1a1a1a] transition-colors group cursor-pointer ${isHighlighted ? "bg-[#1c1c1c]" : ""
+                  }`}
                 onClick={() =>
                   setActiveSourceId((prev) =>
                     prev === source.source_id ? null : source.source_id

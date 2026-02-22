@@ -272,6 +272,32 @@ class ChunkDetailResponse(BaseModel):
     source_path: Optional[str] = None
 
 
+class ChunkBatchItem(BaseModel):
+    """A single chunk detail element in a batch response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    chunk_id: str
+    chunk_text: str
+    page_number: Optional[int] = None
+    display_page: Optional[str] = None
+    header_path: str = ""
+    format: str = Field(
+        default="text",
+        description="Content format: 'pdf', 'markdown', or 'text'.",
+    )
+    source_path: Optional[str] = None
+
+
+class ChunkBatchResponse(BaseModel):
+    """Response body for ``GET /api/sources/{source_id}/chunks?ids=...``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunks: list[ChunkBatchItem]
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------

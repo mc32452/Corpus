@@ -62,7 +62,6 @@ export interface CitationPayload {
   highlight_text?: string;
 }
 
-/** Response from GET /api/sources/{source_id}/chunk/{chunk_id}. */
 export interface ChunkDetailResponse {
   source_id: string;
   chunk_id: string;
@@ -75,6 +74,21 @@ export interface ChunkDetailResponse {
   source_path?: string | null;
 }
 
+export interface ChunkBatchItem {
+  source_id: string;
+  chunk_id: string;
+  chunk_text: string;
+  page_number?: number | null;
+  display_page?: string | null;
+  header_path: string;
+  format: "pdf" | "markdown" | "text";
+  source_path?: string | null;
+}
+
+export interface ChunkBatchResponse {
+  chunks: ChunkBatchItem[];
+}
+
 export interface ApiError {
   error: {
     code: string;
@@ -84,20 +98,20 @@ export interface ApiError {
 
 export interface StreamEvent {
   event:
-    | "status"
-    | "intent"
-    | "sources"
-    | "citations"
-    | "token"
-    | "complete"
-    | "error";
+  | "status"
+  | "intent"
+  | "sources"
+  | "citations"
+  | "token"
+  | "complete"
+  | "error";
   data: Record<string, unknown>;
 }
 
 function getBackendApiBase(): string {
   const env =
     typeof process !== "undefined" &&
-    typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
+      typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
       ? process.env.NEXT_PUBLIC_BACKEND_URL
       : "";
   const base = env || "http://127.0.0.1:8000";
@@ -229,7 +243,7 @@ class SourceApiClient {
   private getDirectBackendUrl(path: string): string {
     const env =
       typeof process !== "undefined" &&
-      typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
+        typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
         ? process.env.NEXT_PUBLIC_BACKEND_URL
         : "";
     const base = env || "http://127.0.0.1:8000";
@@ -320,6 +334,21 @@ class SourceApiClient {
   ): Promise<ChunkDetailResponse> {
     const res = await fetch(
       `${this.baseUrl}/sources/${encodeURIComponent(sourceId)}/chunk/${encodeURIComponent(chunkId)}`
+    );
+    if (!res.ok) {
+      const err: ApiError = await res.json();
+      throw new Error(err.error.message);
+    }
+    return res.json();
+  }
+
+  async getChunks(
+    sourceId: string,
+    chunkIds: string[]
+  ): Promise<ChunkBatchResponse> {
+    if (!chunkIds.length) return { chunks: [] };
+    const res = await fetch(
+      `${this.baseUrl}/sources/${encodeURIComponent(sourceId)}/chunks?ids=${encodeURIComponent(chunkIds.join(","))}`
     );
     if (!res.ok) {
       const err: ApiError = await res.json();

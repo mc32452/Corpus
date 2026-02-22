@@ -2,6 +2,7 @@ import { ChatMarkdownRendererWithSmooth } from "@/components/assistant-ui/chat-m
 import { ModelSelector } from "@/components/assistant-ui/model-selector";
 import { ThinkingPanel } from "@/components/assistant-ui/thinking-panel";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
+import { MessageReferences } from "@/components/assistant-ui/message-references";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -341,6 +342,7 @@ const AssistantMessage: FC = () => {
             tools: { Fallback: ToolFallback },
           }}
         />
+        <MessageReferences />
         <MessageError />
       </div>
 

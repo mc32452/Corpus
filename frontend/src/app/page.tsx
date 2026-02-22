@@ -15,13 +15,29 @@
 
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import { AssistantRuntimeProvider } from "@assistant-ui/react";
+import { useEffect, useCallback, useRef, useState } from "react";
+import { AssistantRuntimeProvider, useAuiState } from "@assistant-ui/react";
 import { useChatRuntime, AssistantChatTransport } from "@assistant-ui/react-ai-sdk";
 import { Thread } from "@/components/assistant-ui/thread";
 import { SourcePanel } from "@/components/source-panel";
 import { useAppDispatch, useAppState } from "@/context/app-context";
 import { parseCustomEvent } from "@/lib/event-parser";
+
+function MessageIdTracker() {
+  const dispatch = useAppDispatch();
+  const lastAssistantMessageId = useAuiState((s) => {
+    const lastMsg = s.thread.messages[s.thread.messages.length - 1];
+    return lastMsg?.role === "assistant" ? lastMsg.id : null;
+  });
+
+  useEffect(() => {
+    if (lastAssistantMessageId) {
+      dispatch({ type: "SET_CURRENT_MESSAGE_ID", messageId: lastAssistantMessageId });
+    }
+  }, [lastAssistantMessageId, dispatch]);
+
+  return null;
+}
 
 /**
  * Full two-panel layout:
@@ -146,6 +162,7 @@ export default function Page() {
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
+      <MessageIdTracker />
       {/*
         h-dvh: full dynamic viewport height (handles iOS browser chrome correctly).
         overflow-hidden: prevents scroll bleed from child columns.

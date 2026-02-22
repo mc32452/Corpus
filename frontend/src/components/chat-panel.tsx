@@ -3,7 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { queryStreaming } from "@/lib/api-client";
 import { useAppDispatch, useAppState } from "@/context/app-context";
-import type { CitationEntry, CitationPayload } from "@/lib/api-client";
+import {
+  sourceApi,
+  type SourceInfo,
+  type CitationEntry,
+  type CitationPayload,
+} from "@/lib/api-client";
+import type { Citation } from "@/lib/event-parser";
 import { ChatMarkdown } from "@/components/chat-markdown";
 import { SpeechToTextButton } from "@/components/speech-to-text-button";
 
@@ -40,7 +46,7 @@ function formatTimestamp(ts: number): string {
     d.getMonth() === now.getMonth() &&
     d.getFullYear() === now.getFullYear();
   const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  return isToday ? `Today \u2022 ${time}` : `${d.toLocaleDateString()} \u2022 ${time}`;
+  return isToday ? `Today \u2022 ${time} ` : `${d.toLocaleDateString()} \u2022 ${time} `;
 }
 
 interface ChatPanelProps {
@@ -143,10 +149,10 @@ export function ChatPanel({
             prev.map((m) =>
               m.id === assistantId
                 ? {
-                    ...m,
-                    parts: [{ type: "text", text: streamingTextRef.current }],
-                    timestamp: Date.now(),
-                  }
+                  ...m,
+                  parts: [{ type: "text", text: streamingTextRef.current }],
+                  timestamp: Date.now(),
+                }
                 : m
             )
           );
@@ -221,10 +227,10 @@ export function ChatPanel({
                 prev.map((m) =>
                   m.id === assistantId
                     ? {
-                        ...m,
-                        parts: [{ type: "text", text: `Error: ${errorMessage}` }],
-                        citations: [],
-                      }
+                      ...m,
+                      parts: [{ type: "text", text: `Error: ${errorMessage} ` }],
+                      citations: [],
+                    }
                     : m
                 )
               );
@@ -241,11 +247,11 @@ export function ChatPanel({
                 prev.map((m) =>
                   m.id === assistantId
                     ? {
-                        ...m,
-                        parts: [{ type: "text", text: finalText }],
-                        citations: finalCitations,
-                        timestamp: Date.now(),
-                      }
+                      ...m,
+                      parts: [{ type: "text", text: finalText }],
+                      citations: finalCitations,
+                      timestamp: Date.now(),
+                    }
                     : m
                 )
               );
@@ -376,14 +382,13 @@ export function ChatPanel({
             <div key={message.id} className="space-y-1">
               {/* Message bubble */}
               <div
-                className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                className={`flex ${isUser ? "justify-end" : "justify-start"} `}
               >
                 <div
-                  className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-                    isUser
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-800/80 text-gray-100 border border-gray-700/50"
-                  }`}
+                  className={`max - w - [85 %] rounded - 2xl px - 4 py - 3 ${isUser
+                    ? "bg-blue-600 text-white"
+                    : "bg-gray-800/80 text-gray-100 border border-gray-700/50"
+                    } `}
                 >
                   {/* Citation strip for assistant */}
                   {!isUser && msgCitations.length > 0 && (
@@ -403,7 +408,7 @@ export function ChatPanel({
                               highlight_text: c.highlight_text,
                             })}
                             className="inline-flex items-center justify-center min-w-5 h-5 px-1.5 text-[10px] font-bold text-blue-400 hover:text-blue-300 bg-blue-500/20 hover:bg-blue-500/30 rounded-full cursor-pointer transition-colors"
-                            title={`View: ${c.source_id}`}
+                            title={`View: ${c.source_id} `}
                           >
                             {c.index}
                           </button>
@@ -421,6 +426,11 @@ export function ChatPanel({
                     ) : (
                       <ChatMarkdown
                         content={text}
+                        citations={msgCitations.map((c) => ({
+                          ...c,
+                          number: c.index,
+                          page: c.page_number
+                        })) as unknown as Citation[]}
                         className={isUser ? "text-white" : "text-gray-100"}
                       />
                     )}
@@ -547,11 +557,10 @@ export function ChatPanel({
         {errorMessage && (
           <div className="flex justify-center">
             <div
-              className={`px-4 py-2 rounded-lg text-sm ${
-                isLockBusy
-                  ? "bg-yellow-900/50 text-yellow-200 border border-yellow-800"
-                  : "bg-red-900/50 text-red-200 border border-red-800"
-              }`}
+              className={`px - 4 py - 2 rounded - lg text - sm ${isLockBusy
+                ? "bg-yellow-900/50 text-yellow-200 border border-yellow-800"
+                : "bg-red-900/50 text-red-200 border border-red-800"
+                } `}
             >
               {isLockBusy && (
                 <span className="font-medium mr-1">Server busy:</span>
