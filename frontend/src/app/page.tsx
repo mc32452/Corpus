@@ -255,18 +255,26 @@ export default function Page() {
         {/* ── Body: source panel + main + optional history ────────────── */}
         <div className="flex flex-1 min-h-0 overflow-hidden relative">
 
-          {/* Left: Source Panel — only in RAG mode */}
-          {chatMode === "rag" && (
-            !isPanelCollapsed ? (
-              <aside className="w-[30%] min-w-56 max-w-sm border-r shrink-0 overflow-hidden flex flex-col" style={{ borderRightColor: "#1e1e1e" }}>
-                <SourcePanel
-                  selectedSourceIds={selectedSourceIds}
-                  onSelectedSourceIdsChange={setSelectedSourceIds}
-                  onCollapse={() => setIsPanelCollapsed(true)}
-                />
-              </aside>
-            ) : (
-              <aside className="w-10 border-r shrink-0 flex flex-col items-center pt-3" style={{ borderRightColor: "#1e1e1e" }}>
+          {/* Left: Source Panel — always mounted, slides in/out via width+opacity */}
+          <aside
+            className="border-r shrink-0 overflow-hidden flex flex-col"
+            style={{
+              width:
+                chatMode !== "rag" ? "0"
+                : isPanelCollapsed ? "2.5rem"
+                : "min(30%, 24rem)",
+              minWidth:
+                chatMode !== "rag" ? "0"
+                : isPanelCollapsed ? "2.5rem"
+                : "14rem",
+              opacity: chatMode !== "rag" ? 0 : 1,
+              transition: "width 280ms cubic-bezier(0.4,0,0.2,1), min-width 280ms cubic-bezier(0.4,0,0.2,1), opacity 220ms ease",
+              borderRightColor: "#1e1e1e",
+              pointerEvents: chatMode !== "rag" ? "none" : "auto",
+            }}
+          >
+            {isPanelCollapsed ? (
+              <div className="flex flex-col items-center pt-3">
                 <button
                   onClick={() => setIsPanelCollapsed(false)}
                   className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-white/5 rounded transition-colors"
@@ -276,16 +284,36 @@ export default function Page() {
                     <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                   </svg>
                 </button>
-              </aside>
-            )
-          )}
+              </div>
+            ) : (
+              <SourcePanel
+                selectedSourceIds={selectedSourceIds}
+                onSelectedSourceIdsChange={setSelectedSourceIds}
+                onCollapse={() => setIsPanelCollapsed(true)}
+              />
+            )}
+          </aside>
 
-          {/* Centre: chat panels (both always mounted, toggled via CSS) */}
-          <main className="flex-1 min-w-0 h-full overflow-hidden">
-            <div className={chatMode === "rag" ? "h-full" : "hidden"}>
+          {/* Centre: chat panels — both always mounted, crossfade via opacity */}
+          <main className="flex-1 min-w-0 h-full overflow-hidden relative">
+            <div
+              className="absolute inset-0"
+              style={{
+                opacity: chatMode === "rag" ? 1 : 0,
+                pointerEvents: chatMode === "rag" ? "auto" : "none",
+                transition: "opacity 220ms ease",
+              }}
+            >
               <Thread />
             </div>
-            <div className={chatMode === "freeform" ? "h-full" : "hidden"}>
+            <div
+              className="absolute inset-0"
+              style={{
+                opacity: chatMode === "freeform" ? 1 : 0,
+                pointerEvents: chatMode === "freeform" ? "auto" : "none",
+                transition: "opacity 220ms ease",
+              }}
+            >
               <FreeformChatPanel
                 restoredSessionId={restoredSessionId}
                 restoredMessages={restoredMessages}
