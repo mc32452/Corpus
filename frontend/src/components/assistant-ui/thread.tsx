@@ -90,10 +90,10 @@ const ThreadWelcome: FC = () => {
     <div className="aui-thread-welcome-root mx-auto my-auto flex w-full max-w-(--thread-max-width) grow flex-col">
       <div className="aui-thread-welcome-center flex w-full grow flex-col items-center justify-center">
         <div className="aui-thread-welcome-message flex size-full flex-col justify-center px-4">
-          <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both font-semibold text-2xl duration-200">
+          <h1 className="aui-thread-welcome-message-inner font-semibold text-2xl">
             Hello there!
           </h1>
-          <p className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-muted-foreground text-xl delay-75 duration-200">
+          <p className="aui-thread-welcome-message-inner text-muted-foreground text-xl">
             How can I help you today?
           </p>
         </div>
@@ -117,7 +117,7 @@ const ThreadSuggestions: FC = () => {
 
 const ThreadSuggestionItem: FC = () => {
   return (
-    <div className="aui-thread-welcome-suggestion-display fade-in slide-in-from-bottom-2 @md:nth-[n+3]:block nth-[n+3]:hidden animate-in fill-mode-both duration-200">
+    <div className="aui-thread-welcome-suggestion-display @md:nth-[n+3]:block nth-[n+3]:hidden">
       <SuggestionPrimitive.Trigger send asChild>
         <Button
           variant="ghost"
@@ -259,6 +259,17 @@ const Composer: FC = () => {
   const aui = useAui();
   const isEmpty = useAuiState((s) => s.composer.isEmpty);
   const isRunning = useAuiState((s) => s.thread.isRunning);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    // Reset scrollTop so the placeholder/text is never clipped on initial render
+    el.scrollTop = 0;
+    // Also trigger a synthetic input event so any auto-resize logic recalculates height
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, []);
+
   return (
     <ComposerPrimitive.Root
       className="aui-composer-root group/composer relative flex w-full flex-col"
@@ -269,8 +280,9 @@ const Composer: FC = () => {
       <div className="aui-composer-attachment-dropzone flex w-full items-center gap-2 rounded-full ring-1 ring-[#2e2e2e] ring-inset bg-[#1a1a1a] px-4 py-1 outline-none transition-shadow focus-within:ring-[#444444]">
         {/* Text input — grows to fill space */}
         <ComposerPrimitive.Input
+          ref={inputRef}
           placeholder="What do you want to know?"
-          className="aui-composer-input max-h-32 flex-1 resize-none bg-transparent py-2 text-sm text-white outline-none placeholder:text-[#555555] focus-visible:ring-0"
+          className="aui-composer-input max-h-32 flex-1 resize-none overflow-hidden bg-transparent py-2 text-sm text-white outline-none placeholder:text-[#555555] focus-visible:ring-0"
           rows={1}
           autoFocus
           aria-label="Message input"

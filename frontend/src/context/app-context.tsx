@@ -65,6 +65,8 @@ export interface AppState {
   currentAssistantMessageId: string | null;
   /** User-selected intent override; "auto" means automatic classification */
   intentOverride: string;
+  /** Active chat mode: "rag" for document-QA, "freeform" for non-RAG chat */
+  chatMode: "rag" | "freeform";
 }
 
 const initialState: AppState = {
@@ -79,6 +81,7 @@ const initialState: AppState = {
   _stepCounter: 0,
   currentAssistantMessageId: null,
   intentOverride: "auto",
+  chatMode: "rag",
 };
 
 // ---------------------------------------------------------------------------
@@ -109,7 +112,8 @@ export type AppAction =
   | { type: "SET_CURRENT_MESSAGE_ID"; messageId: string }
   | { type: "SET_ACTIVE_CITATION"; citation: Citation | null }
   | { type: "ADD_THINKING_STEP"; message: string }
-  | { type: "SET_INTENT_OVERRIDE"; intentOverride: string };
+  | { type: "SET_INTENT_OVERRIDE"; intentOverride: string }
+  | { type: "SET_CHAT_MODE"; mode: "rag" | "freeform" };
 
 // ---------------------------------------------------------------------------
 // Reducer
@@ -183,6 +187,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
     }
     case "SET_INTENT_OVERRIDE":
       return { ...state, intentOverride: action.intentOverride };
+    case "SET_CHAT_MODE":
+      return { ...state, chatMode: action.mode };
     default:
       return state;
   }

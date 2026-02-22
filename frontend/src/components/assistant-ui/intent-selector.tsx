@@ -172,11 +172,11 @@ const IntentSelectorImpl = ({
         aria-label="Select response mode"
       >
         {isAuto ? (
-          <span>Auto</span>
+          <span className="font-medium">Auto</span>
         ) : (
           <span className="flex items-center gap-1.5">
             <span className="size-1.5 rounded-full bg-blue-400 shrink-0" />
-            <span>{currentOption.name}</span>
+            <span className="font-medium">{currentOption.name}</span>
           </span>
         )}
       </SelectTrigger>

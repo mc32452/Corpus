@@ -16,6 +16,7 @@ Architecture
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import uuid
@@ -26,6 +27,7 @@ from typing import AsyncGenerator, Optional
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from .api_schemas import (
     ChatRequest,
@@ -518,6 +520,130 @@ async def chat(request: Request, chat_request: ChatRequest):
     return StreamingResponse(
         guarded_stream(),
         headers=STREAM_HEADERS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Freeform chat  (non-RAG conversational mode)
+# ---------------------------------------------------------------------------
+
+
+class FreeformMessage(BaseModel):
+    role: str  # "user" | "assistant" | "system"
+    content: str
+
+
+class FreeformChatRequest(BaseModel):
+    messages: list[FreeformMessage]
+    model: str = "regular"  # "regular" | "deep-research"
+
+
+_FREEFORM_SYSTEM = (
+    "You are a knowledgeable and helpful research assistant. "
+    "Answer questions clearly and concisely. "
+    "You may draw on general knowledge. "
+    "When uncertain, say so rather than guessing."
+)
+
+
+async def _freeform_stream_generator(
+    request: Request,
+    freeform_request: FreeformChatRequest,
+    stop_event: threading.Event,
+) -> AsyncGenerator[str, None]:
+    """Stream freeform chat tokens as plain SSE events (no RAG retrieval)."""
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    # Build message list: inject system message then conversation history.
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _FREEFORM_SYSTEM},
+    ]
+    for m in freeform_request.messages:
+        if m.role in ("user", "assistant"):
+            messages.append({"role": m.role, "content": m.content})
+
+    def _producer() -> None:
+        try:
+            request_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
+            engine = _get_engine(request_mode)
+            gen = engine._ensure_generator()
+            for token in gen.generate_chat_stream(
+                messages,
+                should_stop=lambda: stop_event.is_set(),
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, token)
+        except Exception as exc:
+            logger.exception("freeform producer error: %s", exc)
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+    producer_task = loop.run_in_executor(None, _producer)
+
+    try:
+        while True:
+            if await request.is_disconnected():
+                stop_event.set()
+                return
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=8.0)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                err_json = json.dumps({"error": str(item)})
+                yield f"event: error\ndata: {err_json}\n\n"
+                return
+            # item is a token string
+            token_json = json.dumps({"text": item})
+            yield f"event: token\ndata: {token_json}\n\n"
+    except asyncio.CancelledError:
+        stop_event.set()
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(producer_task, timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    yield "event: complete\ndata: {}\n\n"
+
+
+@app.post("/api/freeform/chat")
+async def freeform_chat(request: Request, freeform_request: FreeformChatRequest):
+    """Stream a freeform (non-RAG) chat response as plain SSE token events.
+
+    The SSE stream uses:
+      event: token  / data: {"text": "..."}   — one per generated token
+      event: complete / data: {}               — stream finished
+      event: error  / data: {"error": "..."}  — on failure
+    """
+    stop_event = threading.Event()
+
+    async def guarded_stream() -> AsyncGenerator[bytes, None]:
+        gen = _freeform_stream_generator(request, freeform_request, stop_event)
+        try:
+            async for chunk in gen:
+                if await request.is_disconnected():
+                    stop_event.set()
+                    return
+                yield chunk.encode("utf-8")
+        except asyncio.CancelledError:
+            stop_event.set()
+        finally:
+            stop_event.set()
+
+    return StreamingResponse(
+        guarded_stream(),
+        headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

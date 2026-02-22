@@ -1,16 +1,12 @@
 // ─── Two-panel chat layout ───────────────────────────────────────────────────
-// SourcePanel (left) + assistant-ui Thread (right).
+// SourcePanel (left) + dual-mode right panel (RAG Thread or Free Chat).
 // CitationViewerModal overlays when activeCitation is set in AppContext.
 //
-// Layout notes:
-//   Thread requires h-dvh on the parent and h-full on its direct container
-//   so that the input bar anchors to the bottom via the Thread's internal
-//   flex layout.  Parent must be overflow-hidden to prevent scroll bleed.
+// Dual-mode approach:
+//   Both <Thread> and <FreeformChatPanel> are always mounted.
+//   Visibility is toggled with Tailwind `hidden` so neither panel loses state
+//   when the user flips between modes.
 //
-// Busy/running state is read via useThread((t) => t.isRunning) from
-// @assistant-ui/react — AppContext does NOT track busy state.
-//
-// Endpoint: /api/chat is proxied by next.config.ts → http://127.0.0.1:8000/api/chat
 // ──────────────────────────────────────────────────────────────────────────────
 
 "use client";
@@ -20,8 +16,12 @@ import { AssistantRuntimeProvider, useAuiState } from "@assistant-ui/react";
 import { useChatRuntime, AssistantChatTransport } from "@assistant-ui/react-ai-sdk";
 import { Thread } from "@/components/assistant-ui/thread";
 import { SourcePanel } from "@/components/source-panel";
+import { FreeformChatPanel } from "@/components/freeform-chat-panel";
+import { HistoryPanel } from "@/components/history-panel";
 import { useAppDispatch, useAppState } from "@/context/app-context";
 import { parseCustomEvent } from "@/lib/event-parser";
+import type { ChatSession } from "@/lib/session-store";
+import type { FreeChatMessage } from "@/lib/session-store";
 
 function MessageIdTracker() {
   const dispatch = useAppDispatch();
@@ -53,13 +53,35 @@ function MessageIdTracker() {
  */
 export default function Page() {
   const dispatch = useAppDispatch();
-  const { activeCitation, intentOverride } = useAppState();
+  const { activeCitation, intentOverride, chatMode } = useAppState();
 
   // Source panel collapse state
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
 
   // Source IDs selected in the panel (passed down for UI checkbox state)
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
+
+  // History panel
+  const [showHistory, setShowHistory] = useState(false);
+
+  // Restored freeform session state (passed to FreeformChatPanel)
+  const [restoredSessionId, setRestoredSessionId] = useState<string | null>(null);
+  const [restoredMessages, setRestoredMessages] = useState<FreeChatMessage[] | null>(null);
+
+  /** Handle session restore from history panel */
+  const handleRestoreSession = useCallback(
+    (session: ChatSession) => {
+      if (session.mode === "freeform") {
+        setRestoredSessionId(session.id);
+        setRestoredMessages(session.messages);
+        dispatch({ type: "SET_CHAT_MODE", mode: "freeform" });
+      } else {
+        // RAG sessions: just switch to RAG mode
+        dispatch({ type: "SET_CHAT_MODE", mode: "rag" });
+      }
+    },
+    [dispatch],
+  );
 
   /**
    * Tracks whether we have already dispatched QUERY_STARTED for the current
@@ -175,41 +197,109 @@ export default function Page() {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <MessageIdTracker />
-      {/*
-        h-dvh: full dynamic viewport height (handles iOS browser chrome correctly).
-        overflow-hidden: prevents scroll bleed from child columns.
-        relative: establishes stacking context for the CitationViewerModal overlay.
-      */}
-      <div className="flex h-dvh bg-background text-foreground overflow-hidden relative">
+      <div className="flex flex-col h-dvh bg-background text-foreground overflow-hidden">
 
-        {/* Left: Source Panel — 30% width, independently scrollable */}
-        {!isPanelCollapsed ? (
-          <aside className="w-[30%] min-w-60 max-w-sm border-r shrink-0 overflow-hidden flex flex-col" style={{ borderRightColor: "#1e1e1e" }}>
-            <SourcePanel
-              selectedSourceIds={selectedSourceIds}
-              onSelectedSourceIdsChange={setSelectedSourceIds}
-              onCollapse={() => setIsPanelCollapsed(true)}
-            />
-          </aside>
-        ) : (
-          /* Collapsed state: thin strip with expand button */
-          <aside className="w-10 border-r shrink-0 flex flex-col items-center pt-3" style={{ borderRightColor: "#1e1e1e" }}>
-            <button
-              onClick={() => setIsPanelCollapsed(false)}
-              className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-white/5 rounded transition-colors"
-              title="Expand sources panel"
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-              </svg>
-            </button>
-          </aside>
-        )}
+        {/* ── Top bar: mode tabs + history button ─────────────────────── */}
+        <header className="flex items-center gap-2 px-4 py-2 border-b shrink-0" style={{ borderBottomColor: "#1e1e1e" }}>
+          {/* Mode tabs */}
+          <button
+            onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "rag" })}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+              chatMode === "rag"
+                ? "bg-[#242424] text-gray-100 border border-[#333]"
+                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+            }`}
+          >
+            {/* Document icon */}
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            RAG Mode
+          </button>
 
-        {/* Right: assistant-ui Thread — fills remaining width, h-full for input bar anchor */}
-        <main className="flex-1 min-w-0 h-full">
-          <Thread />
-        </main>
+          <button
+            onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "freeform" })}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+              chatMode === "freeform"
+                ? "bg-[#242424] text-gray-100 border border-[#333]"
+                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+            }`}
+          >
+            {/* Chat bubble icon */}
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+            </svg>
+            Non-RAG Mode
+          </button>
+
+          {/* Spacer */}
+          <div className="flex-1" />
+
+          {/* History button */}
+          <button
+            onClick={() => setShowHistory((v) => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+              showHistory
+                ? "bg-[#242424] text-gray-100 border border-[#333]"
+                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+            }`}
+            title="Chat history"
+          >
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Chat History
+          </button>
+        </header>
+
+        {/* ── Body: source panel + main + optional history ────────────── */}
+        <div className="flex flex-1 min-h-0 overflow-hidden relative">
+
+          {/* Left: Source Panel — only in RAG mode */}
+          {chatMode === "rag" && (
+            !isPanelCollapsed ? (
+              <aside className="w-[30%] min-w-56 max-w-sm border-r shrink-0 overflow-hidden flex flex-col" style={{ borderRightColor: "#1e1e1e" }}>
+                <SourcePanel
+                  selectedSourceIds={selectedSourceIds}
+                  onSelectedSourceIdsChange={setSelectedSourceIds}
+                  onCollapse={() => setIsPanelCollapsed(true)}
+                />
+              </aside>
+            ) : (
+              <aside className="w-10 border-r shrink-0 flex flex-col items-center pt-3" style={{ borderRightColor: "#1e1e1e" }}>
+                <button
+                  onClick={() => setIsPanelCollapsed(false)}
+                  className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-white/5 rounded transition-colors"
+                  title="Expand sources panel"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </aside>
+            )
+          )}
+
+          {/* Centre: chat panels (both always mounted, toggled via CSS) */}
+          <main className="flex-1 min-w-0 h-full overflow-hidden">
+            <div className={chatMode === "rag" ? "h-full" : "hidden"}>
+              <Thread />
+            </div>
+            <div className={chatMode === "freeform" ? "h-full" : "hidden"}>
+              <FreeformChatPanel
+                restoredSessionId={restoredSessionId}
+                restoredMessages={restoredMessages}
+              />
+            </div>
+          </main>
+
+          {/* Right: History panel — inlined, no backdrop */}
+          <HistoryPanel
+            open={showHistory}
+            onClose={() => setShowHistory(false)}
+            onRestore={handleRestoreSession}
+          />
+        </div>
       </div>
     </AssistantRuntimeProvider>
   );
