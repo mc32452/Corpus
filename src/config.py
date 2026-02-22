@@ -69,25 +69,31 @@ class ResolvedRetrievalParams:
 INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
     # FACTUAL: stricter threshold (1.3×) + min_docs=1 so a single high-confidence
     # fact is not padded with low-quality backfill chunks.
-    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.7, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.3, reranker_min_docs=1),
+    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.85, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.3, reranker_min_docs=1),
     "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final_scale=1.0),
-    "OVERVIEW":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.0),
-    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final_scale=1.0),
+    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.2),
     "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
     "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
-    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.25),
-    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=0.8, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.2),
+    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.25, reranker_threshold_scale=0.85),
+    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=1.1, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.2),
+    "EXTRACT":    IntentRetrievalOverrides(top_k_dense_scale=0.9, top_k_final_scale=1.0, reranker_threshold_scale=1.2, reranker_min_docs=1),
+    "TIMELINE":   IntentRetrievalOverrides(top_k_dense_scale=1.4, top_k_fused_scale=1.2, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "HOW_TO":     IntentRetrievalOverrides(top_k_dense_scale=1.1, top_k_final_scale=1.2),
+    "QUOTE_EVIDENCE": IntentRetrievalOverrides(top_k_dense_scale=0.9, top_k_fused_scale=0.7, top_k_final_scale=0.8, reranker_threshold_scale=1.35, reranker_min_docs=1),
 }
 
 INTENT_GENERATION_PARAMS: dict[str, IntentGenerationParams] = {
     "FACTUAL":    IntentGenerationParams(temperature=0.1, top_p=0.2),
     "SUMMARIZE":  IntentGenerationParams(temperature=0.3, top_p=0.6),
-    "OVERVIEW":   IntentGenerationParams(temperature=0.3, top_p=0.6),
     "EXPLAIN":    IntentGenerationParams(temperature=0.4, top_p=0.7),
     "ANALYZE":    IntentGenerationParams(temperature=0.4, top_p=0.7),
     "COMPARE":    IntentGenerationParams(temperature=0.35, top_p=0.65),
     "CRITIQUE":   IntentGenerationParams(temperature=0.45, top_p=0.75),
     "COLLECTION": IntentGenerationParams(temperature=0.2, top_p=0.4),
+    "EXTRACT":    IntentGenerationParams(temperature=0.15, top_p=0.3),
+    "TIMELINE":   IntentGenerationParams(temperature=0.2, top_p=0.4),
+    "HOW_TO":     IntentGenerationParams(temperature=0.3, top_p=0.6),
+    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.1, top_p=0.2),
 }
 
 
@@ -115,8 +121,8 @@ def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedR
 
 
 def resolve_generation_params(intent: str) -> IntentGenerationParams:
-    """Return generation params for intent. Falls back to OVERVIEW if unrecognized."""
-    return INTENT_GENERATION_PARAMS.get(intent.upper(), INTENT_GENERATION_PARAMS["OVERVIEW"])
+    """Return generation params for intent. Falls back to SUMMARIZE if unrecognized."""
+    return INTENT_GENERATION_PARAMS.get(intent.upper(), INTENT_GENERATION_PARAMS["SUMMARIZE"])
 
 
 def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:

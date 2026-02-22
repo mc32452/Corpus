@@ -39,29 +39,16 @@ CITATION REQUIREMENTS (MANDATORY):
 # ---------------------------------------------------------------------------
 
 INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
-    Intent.OVERVIEW: {
-        "task": (
-            "Provide a brief, high-level description of this document's type and purpose. "
-            "Do NOT describe detailed findings, specific arguments, or examples."
-        ),
-        "format": (
-            "Your first sentence MUST state what type of document this is and its primary purpose. "
-            "Write 2-3 sentences total (maximum 60 words). "
-            "Do NOT use bullet points."
-        ),
-        "tone": "Neutral and concise.",
-    },
-    
     Intent.SUMMARIZE: {
         "task": (
             "Extract the main claims and findings from the context. "
             "Merge overlapping points. Report only what the document states."
         ),
         "format": (
-            "Start with one sentence (20-30 words) identifying the document. "
-            "Then list 3-5 key points as bullet points. "
-            "Each bullet should be one direct sentence (15-25 words) capturing one core idea. "
-            "Do NOT add commentary or interpretation."
+            "List 3-5 key points as bullet points. "
+            "Each bullet should be one direct sentence (15-35 words) capturing one core idea, "
+            "followed immediately by its inline citation [N] — citations are mandatory, not commentary. "
+            "Do NOT add interpretation or evaluation beyond what the source states."
         ),
         "tone": "Academic but accessible.",
     },
@@ -70,7 +57,9 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
         "task": (
             "Explain the content as if teaching someone curious but with no background in this field. "
             "Use everyday language. Avoid all jargon and technical terms. "
-            "Do NOT introduce facts, definitions, or topics not present in the context."
+            "Do NOT introduce facts, definitions, or topics not present in the context. "
+            "If the source material is already non-technical, focus on clarifying the structure "
+            "of the argument and its practical implications rather than simplifying vocabulary."
         ),
         "format": (
             "Write 3-5 short paragraphs (3-5 sentences each, maximum 80 words per paragraph). "
@@ -183,6 +172,8 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
             "Answer the user's question directly and concisely using ONLY the provided context. "
             "Extract the specific fact, name, date, or detail the question asks for. "
             "If the answer is explicitly stated, quote or paraphrase the relevant passage. "
+            "If the answer requires combining facts from multiple passages, do so explicitly "
+            "and cite each passage used. "
             "Do NOT provide analysis, background, or tangential information."
         ),
         "format": (
@@ -199,20 +190,117 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
         "task": (
             "Describe the documents available in this collection based on the provided summaries. "
             "Identify the topics, themes, and scope of the corpus as a whole. "
+            "Mention document types (e.g., article, report, book chapter, memo) where apparent. "
+            "Note any date ranges visible in the material. "
+            "Flag any obvious gaps in corpus coverage (e.g., missing perspectives, periods, or formats). "
             "Highlight how the documents relate to each other, if applicable."
         ),
         "format": (
             "Write 3-5 short paragraphs (60-80 words each). "
             "\n\n"
             "Structure:\n"
-            "• Opening paragraph: Describe the overall scope and focus of the collection.\n"
+            "• Opening paragraph: Describe the overall scope and focus of the collection, including document types and date ranges where apparent.\n"
             "• Middle paragraphs (1-3): Briefly describe each major document or topic cluster. "
             "One paragraph per document or theme.\n"
-            "• Closing paragraph: Note common themes or connections between documents.\n"
+            "• Closing paragraph: Note common themes or connections between documents, and flag any notable gaps in coverage.\n"
             "\n"
             "Do NOT use bullet points. Write in prose."
         ),
         "tone": "Informative and concise.",
+    },
+
+    Intent.EXTRACT: {
+        "task": (
+            "Identify what type of entities the user is requesting (names, dates, figures, "
+            "definitions, locations, events, etc.). "
+            "Exhaustively extract every matching instance from the provided context. "
+            "Do NOT paraphrase or interpret — report what is in the text. "
+            "Do NOT omit instances even if they seem minor."
+        ),
+        "format": (
+            "Output a clean, structured list or table. "
+            "\n\n"
+            "If extracting a single entity type: use a simple numbered or bulleted list. "
+            "Each entry = one item on its own line. No extra prose around the list. "
+            "\n\n"
+            "If extracting multiple entity types: use a small table or grouped sub-lists, "
+            "one section per entity type. Label each section clearly. "
+            "\n\n"
+            "Begin directly with the list or table — no preamble. "
+            "After the list, add a single line: \"Total: N items found.\" "
+            "If no matching entities are found, state: \"No [entity type] found in the provided context.\""
+        ),
+        "tone": "Precise and exhaustive.",
+    },
+
+    Intent.TIMELINE: {
+        "task": (
+            "Identify all events and dates mentioned in the context. "
+            "Arrange them in chronological order. "
+            "Note any causal links between events where the text makes them explicit. "
+            "Flag any gaps in the chronology where the sequence is unclear or discontinuous. "
+            "Do NOT infer dates not present in the context."
+        ),
+        "format": (
+            "Present events as a chronological list. "
+            "\n\n"
+            "Each entry should follow this format: "
+            "  [DATE / PERIOD] — [Event description (1-2 sentences max)]. "
+            "Use '→' to indicate a direct causal link to the next event when the text supports it. "
+            "\n\n"
+            "If a date is approximate or a range, indicate this clearly (e.g., 'c. 1850', '1840s–1860s'). "
+            "After the timeline, add a brief note (1-2 sentences) on any significant gaps or missing dates. "
+            "Begin directly with the first item — no preamble."
+        ),
+        "tone": "Factual and sequential.",
+    },
+
+    Intent.HOW_TO: {
+        "task": (
+            "Identify the process, procedure, or set of steps described in the source material "
+            "that the user is asking about. "
+            "Present the steps in the order they appear in or are implied by the text. "
+            "Focus on the process itself — not on conceptual background or theory. "
+            "This intent is distinct from EXPLAIN: do not simply simplify vocabulary; "
+            "focus on sequence and actionable steps."
+        ),
+        "format": (
+            "Present the procedure as a numbered step-by-step list. "
+            "\n\n"
+            "Each step: [Step N]: [Clear, imperative action statement]. "
+            "After the action statement, add 1-2 sentences explaining what happens in that step "
+            "and why it matters (based strictly on the source material). "
+            "\n\n"
+            "If the source describes sub-steps or stages within a main step, use indented bullet points. "
+            "Begin directly with Step 1 — no preamble. "
+            "Close with a single sentence summarising the outcome of the complete procedure."
+        ),
+        "tone": "Clear, practical, and procedural.",
+    },
+
+    Intent.QUOTE_EVIDENCE: {
+        "task": (
+            "Identify the claim, argument, or question the user wants evidence for. "
+            "Find direct quotes from the context that support or illuminate it. "
+            "Minimise paraphrase — let the text speak for itself. "
+            "Organise quotes by relevance to the user's query, most relevant first. "
+            "Do NOT fabricate or modify quotes."
+        ),
+        "format": (
+            "Present each piece of evidence as a block quote, followed by a one-sentence "
+            "explanation of how it supports the user's query. "
+            "\n\n"
+            "Format each entry as:\n"
+            "  > \"[Exact quote from the source.]\"\n"
+            "  [One sentence: why this quote is relevant to the query.]\n"
+            "\n"
+            "Separate entries with a blank line. "
+            "Begin directly with the first quote — no preamble. "
+            "If more than 5 quotes are found, include only the 5 most directly relevant ones. "
+            "If no relevant quotes can be found in the context, state: "
+            "\"No direct quotes supporting this claim were found in the provided context.\""
+        ),
+        "tone": "Precise and textually grounded.",
     },
 }
 
@@ -246,9 +334,9 @@ def _prepare_config(
     extra_instructions: Optional[str],
     mode: Optional[str] = None
 ) -> tuple[dict[str, str], str, str]:
-    intent = intent or Intent.OVERVIEW
+    intent = intent or Intent.SUMMARIZE
     instructions = _get_intent_instructions(mode)
-    cfg = instructions.get(intent, instructions[Intent.OVERVIEW]).copy()
+    cfg = instructions.get(intent, instructions[Intent.SUMMARIZE]).copy()
     extra_block = (
         f"\nAdditional constraints: {extra_instructions.strip()}"
         if extra_instructions and extra_instructions.strip()

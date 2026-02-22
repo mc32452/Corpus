@@ -1,5 +1,6 @@
 import { ChatMarkdownRendererWithSmooth } from "@/components/assistant-ui/chat-markdown-renderer";
 import { ModelSelector } from "@/components/assistant-ui/model-selector";
+import { IntentSelector } from "@/components/assistant-ui/intent-selector";
 import { ThinkingPanel } from "@/components/assistant-ui/thinking-panel";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
 import { MessageReferences } from "@/components/assistant-ui/message-references";
@@ -287,6 +288,13 @@ const Composer: FC = () => {
         <ModelSelector
           models={MODES}
           defaultValue="regular"
+          variant="ghost"
+          size="sm"
+          contentClassName="border-[#2e2e2e] bg-[#1a1a1a]"
+        />
+
+        {/* Intent selector — always visible, respects Auto default */}
+        <IntentSelector
           variant="ghost"
           size="sm"
           contentClassName="border-[#2e2e2e] bg-[#1a1a1a]"

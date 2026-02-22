@@ -628,16 +628,29 @@ class RagEngine:
             intent_map = {
                 "overview": Intent.OVERVIEW,
                 "summarize": Intent.SUMMARIZE,
+                "summarise": Intent.SUMMARIZE,
                 "explain": Intent.EXPLAIN,
                 "analyze": Intent.ANALYZE,
                 "compare": Intent.COMPARE,
                 "critique": Intent.CRITIQUE,
                 "factual": Intent.FACTUAL,
                 "collection": Intent.COLLECTION,
+                "extract": Intent.EXTRACT,
+                "timeline": Intent.TIMELINE,
+                "how_to": Intent.HOW_TO,
+                "quote_evidence": Intent.QUOTE_EVIDENCE,
             }
-            return IntentResult(
-                intent=intent_map[intent_override], confidence=1.0, method="manual"
-            )
+            normalized_override = intent_override.strip().lower()
+            manual_intent = intent_map.get(normalized_override)
+            if manual_intent is None:
+                logger.warning(
+                    "Unknown intent_override='%s'; falling back to classifier",
+                    intent_override,
+                )
+            else:
+                return IntentResult(
+                    intent=manual_intent, confidence=1.0, method="manual"
+                )
 
         def _run() -> IntentResult:
             llm_fallback_enabled = (
@@ -1000,7 +1013,16 @@ class RagEngine:
         )
 
         # -- intent classification + parameter resolution ------------------
-        yield StatusEvent(status="Classifying intent...")
+        if intent_override and intent_override != "auto":
+            normalized_override = intent_override.strip().lower()
+            display_override = (
+                "summarise"
+                if normalized_override in {"summarize", "summarise"}
+                else normalized_override
+            )
+            yield StatusEvent(status=f"Using intent: {display_override.replace('_', ' ').title()}...")
+        else:
+            yield StatusEvent(status="Classifying intent...")
         classified = self._step_classify(
             query_text, source_id, intent_override, no_generate=False
         )

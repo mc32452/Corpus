@@ -63,6 +63,8 @@ export interface AppState {
   _stepCounter: number;
   /** The message ID of the assistant response currently generating */
   currentAssistantMessageId: string | null;
+  /** User-selected intent override; "auto" means automatic classification */
+  intentOverride: string;
 }
 
 const initialState: AppState = {
@@ -76,6 +78,7 @@ const initialState: AppState = {
   thinkingSteps: [],
   _stepCounter: 0,
   currentAssistantMessageId: null,
+  intentOverride: "auto",
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +108,8 @@ export type AppAction =
   | { type: "SET_CITATIONS"; citations: Citation[] }
   | { type: "SET_CURRENT_MESSAGE_ID"; messageId: string }
   | { type: "SET_ACTIVE_CITATION"; citation: Citation | null }
-  | { type: "ADD_THINKING_STEP"; message: string };
+  | { type: "ADD_THINKING_STEP"; message: string }
+  | { type: "SET_INTENT_OVERRIDE"; intentOverride: string };
 
 // ---------------------------------------------------------------------------
 // Reducer
@@ -177,6 +181,8 @@ function appReducer(state: AppState, action: AppAction): AppState {
         thinkingSteps: [...state.thinkingSteps, { id, message: action.message }],
       };
     }
+    case "SET_INTENT_OVERRIDE":
+      return { ...state, intentOverride: action.intentOverride };
     default:
       return state;
   }

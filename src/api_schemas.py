@@ -139,6 +139,10 @@ class QueryRequest(BaseModel):
         description="Whether to include citation mapping events",
     )
     stream: bool = Field(default=False, description="Enable SSE streaming response")
+    intent_override: Optional[str] = Field(
+        default=None,
+        description="Optional intent override; 'auto' or None uses automatic classification",
+    )
 
 
 class QueryResponse(BaseModel):

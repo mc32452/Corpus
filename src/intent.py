@@ -34,6 +34,10 @@ class Intent(Enum):
     CRITIQUE = "critique"
     FACTUAL = "factual"
     COLLECTION = "collection"
+    EXTRACT = "extract"
+    TIMELINE = "timeline"
+    HOW_TO = "how_to"
+    QUOTE_EVIDENCE = "quote_evidence"
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,10 @@ _INTENT_MAP: dict[str, Intent] = {
     "critique": Intent.CRITIQUE,
     "factual": Intent.FACTUAL,
     "collection": Intent.COLLECTION,
+    "extract": Intent.EXTRACT,
+    "timeline": Intent.TIMELINE,
+    "how_to": Intent.HOW_TO,
+    "quote_evidence": Intent.QUOTE_EVIDENCE,
 }
 
 
@@ -200,6 +208,57 @@ _INTENT_PATTERNS: dict[Intent, list[re.Pattern]] = {
         re.compile(r"\bbullet\s*points?\b", re.IGNORECASE),
         re.compile(r"\blist\s+(the\s+)?(main|key)\b", re.IGNORECASE),
     ],
+    # ---- EXTRACT: structured data extraction (entities, dates, figures) ----
+    Intent.EXTRACT: [
+        re.compile(r"\bextract\s+(all|every|the|any)?\s*(names?|dates?|years?|figures?|numbers?|entities|data|definitions?|terms?)\b", re.IGNORECASE),
+        re.compile(r"\blist\s+(all\s+)?(the\s+)?(names?|dates?|years?|figures?|numbers?|entities|terms?|authors?|titles?|places?|locations?)\b", re.IGNORECASE),
+        re.compile(r"\bgive\s+me\s+(all\s+)?(the\s+)?(names?|dates?|years?|figures?|numbers?|entities|terms?)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(are|were|is)\s+(all\s+)?(the\s+)?(names?|dates?|figures?|numbers?|entities|terms?|places?)\b", re.IGNORECASE),
+        re.compile(r"\bformat\b.{0,30}\bas\s+(a\s+)?(table|list|structured)\b", re.IGNORECASE),
+        re.compile(r"\btabular\s+format\b", re.IGNORECASE),
+        re.compile(r"\bpull\s+(out|together)\s+(all\s+)?(the\s+)?(data|entities|names?|dates?|figures?)\b", re.IGNORECASE),
+        re.compile(r"\bcatalog\b.{0,30}\b(names?|dates?|entities|terms?)\b", re.IGNORECASE),
+        re.compile(r"\bcompile\s+(a\s+)?(list|table)\b", re.IGNORECASE),
+    ],
+    # ---- TIMELINE: chronological ordering of events ----
+    Intent.TIMELINE: [
+        re.compile(r"\btimeline\b", re.IGNORECASE),
+        re.compile(r"\bchronolog(y|ical|ically)\b", re.IGNORECASE),
+        re.compile(r"\bin\s+(chronological|date|time)\s+order\b", re.IGNORECASE),
+        re.compile(r"\bordered?\s+by\s+(date|time|year|when)\b", re.IGNORECASE),
+        re.compile(r"\bsequence\s+of\s+(events?|steps?|actions?)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(events?|things?\s+)?(happened|occurred)\s+(and\s+)?when\b", re.IGNORECASE),
+        re.compile(r"\bhistory\s+of\s+events?\b", re.IGNORECASE),
+        re.compile(r"\bwhen\s+did\b.{0,40}\b(and|also|then|next|follow)\b", re.IGNORECASE),
+        re.compile(r"\blist\s+(all\s+)?events?\s+(in|with)\s+(order|dates?|years?)\b", re.IGNORECASE),
+        re.compile(r"\btrace\s+(the\s+)?(history|development|progression|sequence)\b", re.IGNORECASE),
+    ],
+    # ---- HOW_TO: procedural / step-by-step instructions ----
+    Intent.HOW_TO: [
+        re.compile(r"\bhow\s+(do|does|did|can|to)\b.{0,30}\b(step|procedure|process|method|approach|technique)\b", re.IGNORECASE),
+        re.compile(r"\bsteps?\s+(to|for|in)\b", re.IGNORECASE),
+        re.compile(r"\bstep.by.step\b", re.IGNORECASE),
+        re.compile(r"\bprocedure\s+for\b", re.IGNORECASE),
+        re.compile(r"\bhow\s+to\b", re.IGNORECASE),
+        re.compile(r"\binstructions?\s+(for|to|on)\b", re.IGNORECASE),
+        re.compile(r"\bmethod\s+(for|to)\b", re.IGNORECASE),
+        re.compile(r"\bprocess\s+(of|for)\b.{0,20}\b(making|doing|creating|applying|using|performing)\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(are|were)\s+the\s+steps?\b", re.IGNORECASE),
+        re.compile(r"\bwalk\s+(me\s+)?through\b", re.IGNORECASE),
+    ],
+    # ---- QUOTE_EVIDENCE: direct textual evidence / quotes ----
+    Intent.QUOTE_EVIDENCE: [
+        re.compile(r"\b(exact\s+)?(quote|quotes|quotation|quoted)\b", re.IGNORECASE),
+        re.compile(r"\bverbatim\b", re.IGNORECASE),
+        re.compile(r"\bword\s*-?\s*for\s*-?\s*word\b", re.IGNORECASE),
+        re.compile(r"\bdirect\s+(passage|evidence|support|quote|citation)\b", re.IGNORECASE),
+        re.compile(r"\btextual\s+evidence\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+does\s+the\s+(text|document|author|passage|source)\s+say\s+exactly\b", re.IGNORECASE),
+        re.compile(r"\bshow\s+me\s+(the\s+)?exact\b.{0,20}\b(words?|text|passage|lines?)\b", re.IGNORECASE),
+        re.compile(r"\bfind\s+(me\s+)?(a\s+)?(quote|passage|excerpt)\b", re.IGNORECASE),
+        re.compile(r"\bevidence\s+(of|for|that|supporting)\b", re.IGNORECASE),
+        re.compile(r"\bsupport(ing|s|ed)?\s+(this\s+)?(claim|argument|point|statement|view|position)\b", re.IGNORECASE),
+    ],
 }
 
 _HEURISTIC_CONFIDENCE = {"strong_match": 0.85, "single_match": 0.70, "weak_match": 0.50}
@@ -219,6 +278,7 @@ _LOW_INFO_COMMON_WORDS = {
     "what", "why", "how", "who", "when", "where", "which", "explain", "summarize",
     "compare", "analyze", "critique", "document", "docs", "paper", "text", "about",
     "mean", "help", "understand", "list", "show", "tell", "overview", "details",
+    "extract", "timeline", "quote", "steps", "instructions", "procedure",
 }
 
 _INTENT_NORMALIZATION_LEXICON = {
@@ -284,9 +344,16 @@ _COMMAND_VERB_INTENTS: dict[re.Pattern, Intent] = {
     re.compile(r"^\s*summari[sz]e\b", re.IGNORECASE): Intent.SUMMARIZE,
     re.compile(r"^\s*explain\b", re.IGNORECASE): Intent.EXPLAIN,
     re.compile(r"^\s*analy[sz]e\b", re.IGNORECASE): Intent.ANALYZE,
+    re.compile(r"^\s*trace\s+(the\s+)?(history|development|progression|sequence|evolution)\b", re.IGNORECASE): Intent.TIMELINE,
     re.compile(r"^\s*trace\b", re.IGNORECASE): Intent.ANALYZE,
-    re.compile(r"^\s*extract\b", re.IGNORECASE): Intent.FACTUAL,
+    re.compile(r"^\s*extract\b", re.IGNORECASE): Intent.EXTRACT,
     re.compile(r"^\s*identify\b", re.IGNORECASE): Intent.FACTUAL,
+    re.compile(r"^\s*list\s+(all\s+)?(the\s+)?(names?|dates?|years?|figures?|entities|terms?)\b", re.IGNORECASE): Intent.EXTRACT,
+    re.compile(r"^\s*create\s+(a\s+)?timeline\b", re.IGNORECASE): Intent.TIMELINE,
+    re.compile(r"^\s*show\s+(me\s+)?the\s+timeline\b", re.IGNORECASE): Intent.TIMELINE,
+    re.compile(r"^\s*how\s+to\b", re.IGNORECASE): Intent.HOW_TO,
+    re.compile(r"^\s*quote\b", re.IGNORECASE): Intent.QUOTE_EVIDENCE,
+    re.compile(r"^\s*find\s+(me\s+)?(a\s+)?quote\b", re.IGNORECASE): Intent.QUOTE_EVIDENCE,
 }
 
 _COMPARATIVE_STRUCTURES: list[re.Pattern] = [
@@ -326,6 +393,40 @@ _SUMMARIZATION_STRUCTURES: list[re.Pattern] = [
     re.compile(r"\boverview\s+of\b", re.IGNORECASE),
 ]
 
+_EXTRACT_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\bextract\b.{0,30}\b(entities|names?|dates?|years?|figures?|numbers?|definitions?|terms?|data)\b", re.IGNORECASE),
+    re.compile(r"\blist\b.{0,20}\b(all|every)\b.{0,20}\b(names?|dates?|years?|figures?|entities|terms?)\b", re.IGNORECASE),
+    re.compile(r"\bformat\b.{0,30}\bas\s+(a\s+)?(table|structured\s+list)\b", re.IGNORECASE),
+    re.compile(r"\btabular\b", re.IGNORECASE),
+    re.compile(r"\bpull\s+out\b", re.IGNORECASE),
+    re.compile(r"\bcompile\s+(a\s+)?(list|table|inventory)\b", re.IGNORECASE),
+]
+
+_TIMELINE_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\btimeline\b", re.IGNORECASE),
+    re.compile(r"\bchronolog", re.IGNORECASE),
+    re.compile(r"\bin\s+(chronological|date|time)\s+order\b", re.IGNORECASE),
+    re.compile(r"\bsequence\s+of\s+events?\b", re.IGNORECASE),
+]
+
+_HOW_TO_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\bhow\s+to\b", re.IGNORECASE),
+    re.compile(r"\bstep.by.step\b", re.IGNORECASE),
+    re.compile(r"\bsteps?\s+(to|for|in)\b", re.IGNORECASE),
+    re.compile(r"\bwalk\s+(me\s+)?through\b", re.IGNORECASE),
+    re.compile(r"\binstructions?\s+(for|to|on)\b", re.IGNORECASE),
+]
+
+_QUOTE_EVIDENCE_STRUCTURES: list[re.Pattern] = [
+    re.compile(r"\b(exact\s+)?quote\b", re.IGNORECASE),
+    re.compile(r"\bverbatim\b", re.IGNORECASE),
+    re.compile(r"\btextual\s+evidence\b", re.IGNORECASE),
+    re.compile(r"\bdirect\s+(passage|evidence|support)\b", re.IGNORECASE),
+    re.compile(r"\bsupporting\s+(this\s+)?(claim|argument|point)\b", re.IGNORECASE),
+    re.compile(r"\bsay\s+exactly\b", re.IGNORECASE),
+    re.compile(r"\bword\s*-?\s*for\s*-?\s*word\b", re.IGNORECASE),
+]
+
 
 # ── Heuristic helpers ─────────────────────────────────────────────────────────
 
@@ -356,6 +457,18 @@ def _apply_structural_intent_signals(query: str, scores: dict[Intent, int]) -> N
 
     if any(pattern.search(normalized) for pattern in _SUMMARIZATION_STRUCTURES):
         scores[Intent.SUMMARIZE] += 2
+
+    if any(pattern.search(normalized) for pattern in _EXTRACT_STRUCTURES):
+        scores[Intent.EXTRACT] += 3
+
+    if any(pattern.search(normalized) for pattern in _TIMELINE_STRUCTURES):
+        scores[Intent.TIMELINE] += 3
+
+    if any(pattern.search(normalized) for pattern in _HOW_TO_STRUCTURES):
+        scores[Intent.HOW_TO] += 2
+
+    if any(pattern.search(normalized) for pattern in _QUOTE_EVIDENCE_STRUCTURES):
+        scores[Intent.QUOTE_EVIDENCE] += 3
 
     if _is_definition_style_query(normalized):
         scores[Intent.FACTUAL] += 2
@@ -529,6 +642,15 @@ def _classify_heuristic(query: str) -> IntentResult:
 
     # ---- Tie-break rules ----
 
+    # New dedicated intents (EXTRACT, TIMELINE, HOW_TO, QUOTE_EVIDENCE) take
+    # priority over all old tie-break rules when they have the highest score.
+    _dedicated_intents = (Intent.EXTRACT, Intent.TIMELINE, Intent.HOW_TO, Intent.QUOTE_EVIDENCE)
+    _dedicated_best_score = max(scores[i] for i in _dedicated_intents)
+    _dedicated_wins = _dedicated_best_score > 0 and _dedicated_best_score >= max(
+        scores[Intent.COLLECTION], scores[Intent.FACTUAL],
+        scores[Intent.SUMMARIZE], scores[Intent.ANALYZE],
+    )
+
     # COMPARE/CRITIQUE wins over weak ANALYZE evidence.
     if best_intent == Intent.ANALYZE and (
         scores[Intent.ANALYZE] <= 1
@@ -542,15 +664,22 @@ def _classify_heuristic(query: str) -> IntentResult:
             best_score = scores[Intent.CRITIQUE]
 
     # COLLECTION wins ties with SUMMARIZE ("Summarize all documents").
-    if Intent.COLLECTION in matching_intents and Intent.SUMMARIZE in matching_intents:
+    # Guard: do not apply if a dedicated extraction/procedural intent has won.
+    if (
+        not _dedicated_wins
+        and Intent.COLLECTION in matching_intents
+        and Intent.SUMMARIZE in matching_intents
+    ):
         if scores[Intent.COLLECTION] >= scores[Intent.SUMMARIZE]:
             best_intent = Intent.COLLECTION
             best_score = scores[Intent.COLLECTION]
 
     # COLLECTION wins ties with FACTUAL for document-selection queries
     # ("which document is about X" should be COLLECTION, not FACTUAL).
+    # Guard: do not apply if a dedicated extraction/procedural intent has won.
     if (
-        Intent.COLLECTION in matching_intents
+        not _dedicated_wins
+        and Intent.COLLECTION in matching_intents
         and Intent.FACTUAL in matching_intents
         and scores[Intent.COLLECTION] >= scores[Intent.FACTUAL]
     ):
@@ -648,11 +777,15 @@ Categories:
 - analyze: User wants to understand how or why something works, or wants analysis of themes, patterns, causes, or mechanisms (default for "how does X" and "why does X" questions)
 - factual: User wants a direct factual answer extracted from the text (who, what, when, where, which, how many)
 - collection: User wants to know what documents are available or wants an overview of all documents in the corpus
+- extract: User wants specific structured data pulled out — names, dates, figures, definitions, entities — formatted as a list or table
+- timeline: User wants events ordered chronologically; query uses words like "timeline", "chronological", "sequence of events", "when did X happen then Y"
+- how_to: User wants step-by-step procedural instructions describing a process from the source material; query uses "how to", "steps to", "instructions for", "walk me through"
+- quote_evidence: User wants direct verbatim quotes or textual evidence supporting a claim; query uses "quote", "verbatim", "word for word", "direct evidence", "supporting this claim"
 
 User query: "{query}"
 
 Respond with ONLY a JSON object in this exact format:
-{{"intent": "<overview|summarize|explain|compare|critique|analyze|factual|collection>", "confidence": <0.0-1.0>}}"""
+{{"intent": "<overview|summarize|explain|compare|critique|analyze|factual|collection|extract|timeline|how_to|quote_evidence>", "confidence": <0.0-1.0>}}"""
 
 
 def _parse_llm_response(response: str) -> Optional[tuple[Intent, float]]:

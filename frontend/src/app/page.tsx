@@ -53,7 +53,7 @@ function MessageIdTracker() {
  */
 export default function Page() {
   const dispatch = useAppDispatch();
-  const { activeCitation } = useAppState();
+  const { activeCitation, intentOverride } = useAppState();
 
   // Source panel collapse state
   const [isPanelCollapsed, setIsPanelCollapsed] = useState(false);
@@ -97,7 +97,8 @@ export default function Page() {
         dispatch({ type: "SET_STATUS", status: event.status });
         if (
           event.status !== "Building prompt..." &&
-          event.status !== "Generating answer..."
+          event.status !== "Generating answer..." &&
+          !event.status.startsWith("Using intent:")
         ) {
           dispatch({ type: "ADD_THINKING_STEP", message: event.status });
         }
@@ -109,9 +110,17 @@ export default function Page() {
           confidence: event.confidence,
           method: event.method,
         });
-        const intentLabel = event.intent.charAt(0).toUpperCase() + event.intent.slice(1);
+        const intentLabel = event.intent
+          .split("_")
+          .map((w: string) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(" ")
+          .replace("Summarize", "Summarise")
+          .replace("summarize", "summarise");
         const pct = Math.round(event.confidence * 100);
-        dispatch({ type: "ADD_THINKING_STEP", message: `Intent identified: ${intentLabel} (${pct}% confidence)` });
+        const intentMsg = event.method === "manual"
+          ? `Intent: ${intentLabel}`
+          : `Intent identified: ${intentLabel} (${pct}% confidence)`;
+        dispatch({ type: "ADD_THINKING_STEP", message: intentMsg });
         break;
       }
       case "sources":
@@ -146,6 +155,8 @@ export default function Page() {
   // and merged into every request.  The backend ChatRequest.data field reads it.
   //   - citations_enabled: always true so the backend injects citation prompt rules
   //   - source_ids: the user-selected source filter (empty array = all sources)
+  //   - intent_override: "auto" means automatic classification; otherwise uses the
+  //     user-selected intent mode from the IntentSelector in the Composer
   const runtime = useChatRuntime({
     transport: new AssistantChatTransport({
       api: "/api/chat",
@@ -153,6 +164,7 @@ export default function Page() {
         data: {
           citations_enabled: true,
           source_ids: selectedSourceIds,
+          intent_override: intentOverride,
         },
       },
     }),

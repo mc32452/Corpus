@@ -374,6 +374,7 @@ async def _chat_stream_generator(
     source_id = None
     citations_enabled = None
     request_mode = "regular"
+    intent_override = None
     if chat_request.data:
         # Support both source_ids (plural, from frontend) and source_id (singular, legacy).
         # The engine only supports single source_id filtering; if exactly one source
@@ -385,12 +386,20 @@ async def _chat_stream_generator(
             source_id = chat_request.data.get("source_id")
         if "citations_enabled" in chat_request.data:
             citations_enabled = bool(chat_request.data["citations_enabled"])
+        # Intent override: "auto" or None means use automatic classification
+        raw_intent = chat_request.data.get("intent_override")
+        if raw_intent and raw_intent != "auto":
+            intent_override = str(raw_intent)
 
     # Extract mode from AI SDK config.modelName (sent by the ModelSelector component)
     frontend_config = (chat_request.model_extra or {}).get("config") or {}
     frontend_model_name = frontend_config.get("modelName", "regular")
     request_mode = _FRONTEND_MODE_MAP.get(frontend_model_name, "regular")
-    logger.info("Chat request: frontend model=%r → backend mode=%r", frontend_model_name, request_mode)
+    # Intent override from modelContext (per-request, reliable) takes priority over body.data.
+    mc_intent = frontend_config.get("intentOverride")
+    if mc_intent and mc_intent != "auto":
+        intent_override = str(mc_intent)
+    logger.info("Chat request: frontend model=%r → backend mode=%r, intent_override=%r", frontend_model_name, request_mode, intent_override)
 
     # --- Producer: runs in thread, pushes events to queue ---
     def _producer() -> None:
@@ -402,6 +411,7 @@ async def _chat_stream_generator(
                 query_text,
                 source_id=source_id,
                 citations_enabled=citations_enabled,
+                intent_override=intent_override,
                 should_stop=lambda: stop_event.is_set(),
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -527,10 +537,14 @@ async def _query_stream_generator(
     def _producer() -> None:
         try:
             engine = _get_engine()
+            _intent_override = query_request.intent_override
+            if _intent_override == "auto":
+                _intent_override = None
             for event in engine.query_events(
                 query_request.query,
                 source_id=source_id,
                 citations_enabled=query_request.citations_enabled,
+                intent_override=_intent_override,
                 should_stop=lambda: stop_event.is_set(),
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -596,11 +610,15 @@ async def query_endpoint(request: Request, query_request: QueryRequest):
         source_id = query_request.source_ids[0]
 
     if not query_request.stream:
+        intent_override = query_request.intent_override
+        if intent_override == "auto":
+            intent_override = None
         result = await asyncio.to_thread(
             _get_engine().query,
             query_request.query,
             source_id=source_id,
             citations_enabled=query_request.citations_enabled,
+            intent_override=intent_override,
         )
         return QueryResponse(
             answer=result.answer,
