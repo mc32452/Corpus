@@ -10,9 +10,26 @@ import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 export function MessageReferences() {
     const messageId = useAuiState((s) => s.message.id);
     const isRunning = useAuiState((s) => s.message.status?.type === "running");
+    // Extract message text to determine which citation numbers were actually used
+    const messageParts = useAuiState((s) => s.message.content);
     const { citationsByMessage } = useAppState();
     const dispatch = useAppDispatch();
     const citations = citationsByMessage[messageId] || [];
+
+    // Build a set of citation numbers that appear in the answer text (e.g. [1], [2])
+    const citedNumbers = useMemo(() => {
+        const nums = new Set<number>();
+        const text = (messageParts ?? [])
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            .filter((p: any) => p.type === "text")
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            .map((p: any) => p.text ?? "")
+            .join("");
+        for (const m of text.matchAll(/\[(\d+)\]/g)) {
+            nums.add(parseInt(m[1], 10));
+        }
+        return nums;
+    }, [messageParts]);
 
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
@@ -104,7 +121,9 @@ export function MessageReferences() {
                                         {group.displayName}
                                     </div>
                                     <div className="flex items-center gap-1.5 flex-wrap mt-1">
-                                        {group.citations.map((cit, idx) => (
+                                        {group.citations.map((cit, idx) => {
+                                            const isUsed = citedNumbers.size === 0 || citedNumbers.has(cit.index);
+                                            return (
                                             <div key={cit.index} className="flex items-center gap-1.5 whitespace-nowrap">
                                                 <button
                                                     onClick={() => {
@@ -113,8 +132,12 @@ export function MessageReferences() {
                                                             dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
                                                         }
                                                     }}
-                                                    className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1 text-[11px] font-bold text-black rounded-full cursor-pointer transition-colors bg-white/90 hover:bg-white"
-                                                    title={`View inline citation [${cit.index}]`}
+                                                    className={`inline-flex items-center justify-center min-w-[20px] h-[20px] px-1 text-[11px] font-bold rounded-full cursor-pointer transition-colors ${
+                                                        isUsed
+                                                            ? "text-black bg-green-400/90 hover:bg-green-400"
+                                                            : "text-white bg-red-500/80 hover:bg-red-500"
+                                                    }`}
+                                                    title={isUsed ? `Cited in answer — view passage [${cit.index}]` : `Retrieved but not cited — view passage [${cit.index}]`}
                                                 >
                                                     [{cit.index}]
                                                 </button>
@@ -125,7 +148,8 @@ export function MessageReferences() {
                                                     <span className="text-muted-foreground/30 text-xs mx-0.5">&middot;</span>
                                                 )}
                                             </div>
-                                        ))}
+                                            );
+                                        })}
                                     </div>
                                 </div>
 
@@ -161,7 +185,19 @@ export function MessageReferences() {
                                                                 {text.length > 500 ? (
                                                                     <>
                                                                         {text.substring(0, 500)}...
-                                                                        <span className="ml-1 text-xs text-blue-400 opacity-80">(Continues in raw passage)</span>
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => {
+                                                                                const matchingCitation = citations.find((c) => c.number === cit.index);
+                                                                                if (matchingCitation) {
+                                                                                    dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
+                                                                                }
+                                                                            }}
+                                                                            className="ml-1 text-xs text-blue-400 hover:text-blue-300 underline underline-offset-2 cursor-pointer transition-colors"
+                                                                            title="Open full passage in document viewer"
+                                                                        >
+                                                                            (Continues in raw passage)
+                                                                        </button>
                                                                     </>
                                                                 ) : (
                                                                     text
