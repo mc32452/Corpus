@@ -193,7 +193,6 @@ function ReasoningContent({
       {...props}
     >
       {children}
-      <ReasoningFade />
     </CollapsibleContent>
   );
 }

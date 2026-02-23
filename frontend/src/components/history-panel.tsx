@@ -89,7 +89,7 @@ export function HistoryPanel({ open, onClose, onRestore }: HistoryPanelProps) {
   if (!open) return null;
 
   return (
-    <aside className="flex flex-col w-72 shrink-0 border-l border-[#1e1e1e] bg-background overflow-hidden">
+    <aside className="flex flex-col w-72 shrink-0 border-l border-[#1e1e1e] bg-background/70 backdrop-blur-md overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e1e] shrink-0">
           <h2 className="text-sm font-semibold text-foreground tracking-wide">

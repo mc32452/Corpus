@@ -43,7 +43,7 @@ import { type FC, useCallback, useEffect, useRef, useState } from "react";
 export const Thread: FC = () => {
   return (
     <ThreadPrimitive.Root
-      className="aui-root aui-thread-root @container flex h-full flex-col bg-background"
+      className="aui-root aui-thread-root @container flex h-full flex-col"
       style={{
         ["--thread-max-width" as string]: "45rem",
       }}
@@ -64,7 +64,7 @@ export const Thread: FC = () => {
           }}
         />
 
-        <ThreadPrimitive.ViewportFooter className="aui-thread-viewport-footer sticky bottom-0 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col gap-3 overflow-visible bg-background pb-4 pt-3 md:pb-6">
+        <ThreadPrimitive.ViewportFooter className="aui-thread-viewport-footer sticky bottom-0 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col gap-3 overflow-visible bg-transparent pb-4 pt-3 md:pb-6">
           <ThreadScrollToBottom />
           <Composer />
         </ThreadPrimitive.ViewportFooter>
@@ -283,7 +283,7 @@ const Composer: FC = () => {
       data-running={isRunning}
     >
       {/* Single-row pill */}
-      <div className="aui-composer-attachment-dropzone flex w-full items-center gap-2 rounded-full ring-1 ring-[#2e2e2e] ring-inset bg-[#1a1a1a] px-4 py-1 outline-none transition-shadow focus-within:ring-[#444444]">
+      <div className="aui-composer-attachment-dropzone flex w-full items-center gap-2 rounded-full ring-1 ring-white/10 ring-inset bg-white/8 backdrop-blur-xl px-4 py-1 outline-none transition-shadow focus-within:ring-white/20">
         {/* Text input — grows to fill space */}
         <ComposerPrimitive.Input
           ref={inputRef}
@@ -355,22 +355,40 @@ const MessageError: FC = () => {
 };
 
 const AssistantMessage: FC = () => {
+  // compute the current accumulated text so we know when to show the bubble
+  const messageText = useAuiState((s) =>
+    s.message.parts.reduce((acc: string, part) => {
+      if (part.type !== "text") return acc;
+      if (!("text" in part) || typeof (part as { text?: unknown }).text !== "string") return acc;
+      return acc + (part as { text: string }).text;
+    }, ""),
+  );
+
   return (
     <MessagePrimitive.Root
       className="aui-assistant-message-root fade-in slide-in-from-bottom-1 relative mx-auto w-full max-w-(--thread-max-width) animate-in py-4 duration-150"
       data-role="assistant"
     >
-      <div className="aui-assistant-message-content wrap-break-word px-2 text-foreground text-base leading-[1.65]">
-        <ThinkingPanel />
-        <MessagePrimitive.Parts
-          components={{
-            Text: ChatMarkdownRendererWithSmooth,
-            tools: { Fallback: ToolFallback },
+      <ThinkingPanel />
+
+      {/* only render the bubble once text begins to arrive */}
+      {messageText.length > 0 && (
+        <div
+          className="aui-assistant-message-content wrap-break-word px-4 py-3 text-foreground text-base leading-[1.65] bg-white/10 backdrop-blur-lg"
+          style={{
+            borderRadius: "18px 18px 18px 4px",
           }}
-        />
-        <MessageReferences />
-        <MessageError />
-      </div>
+        >
+          <MessagePrimitive.Parts
+            components={{
+              Text: ChatMarkdownRendererWithSmooth,
+              tools: { Fallback: ToolFallback },
+            }}
+          />
+          <MessageReferences />
+          <MessageError />
+        </div>
+      )}
 
       <div className="aui-assistant-message-footer mt-1 ml-2 flex">
         <BranchPicker />
@@ -558,9 +576,8 @@ const UserMessage: FC = () => {
     >
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div
-          className="aui-user-message-content wrap-break-word px-4 py-3 text-white"
+          className="aui-user-message-content wrap-break-word px-4 py-3 text-white text-base leading-[1.65] bg-white/10 backdrop-blur-lg"
           style={{
-            background: "#2a2a2a",
             borderRadius: "18px 18px 4px 18px",
           }}
         >

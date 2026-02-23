@@ -2,6 +2,7 @@
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppProvider } from "@/context/app-context";
+import { ThemeProvider } from "@/context/theme-context";
 import type { ReactNode } from "react";
 
 /**
@@ -12,8 +13,10 @@ import type { ReactNode } from "react";
  */
 export function Providers({ children }: { children: ReactNode }) {
   return (
-    <AppProvider>
-      <TooltipProvider>{children}</TooltipProvider>
-    </AppProvider>
+    <ThemeProvider>
+      <AppProvider>
+        <TooltipProvider>{children}</TooltipProvider>
+      </AppProvider>
+    </ThemeProvider>
   );
 }

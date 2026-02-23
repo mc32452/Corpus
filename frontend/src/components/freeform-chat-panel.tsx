@@ -493,7 +493,7 @@ export function FreeformChatPanel({
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div
-      className="@container flex h-full flex-col bg-background"
+      className="@container flex h-full flex-col"
       style={{ ["--thread-max-width" as string]: "45rem" }}
     >
       {/* Scrollable viewport */}
@@ -589,7 +589,7 @@ export function FreeformChatPanel({
         )}
 
         {/* Sticky footer with composer */}
-        <div className="sticky bottom-0 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col gap-3 overflow-visible bg-background pb-4 pt-3 md:pb-6">
+        <div className="sticky bottom-0 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col gap-3 overflow-visible bg-transparent pb-4 pt-3 md:pb-6">
           {messages.length > 0 && (
             <div className="flex justify-center">
               <button
@@ -604,7 +604,7 @@ export function FreeformChatPanel({
 
           {/* Composer pill — identical to RAG Thread */}
           <form onSubmit={onSubmit}>
-            <div className="flex w-full items-center gap-2 rounded-full ring-1 ring-[#2e2e2e] ring-inset bg-[#1a1a1a] px-4 py-1 outline-none transition-shadow focus-within:ring-[#444444]">
+            <div className="flex w-full items-center gap-2 rounded-full ring-1 ring-white/10 ring-inset bg-white/8 backdrop-blur-xl px-4 py-1 outline-none transition-shadow focus-within:ring-white/20">
               {/* Textarea */}
               <textarea
                 ref={textareaRef}
