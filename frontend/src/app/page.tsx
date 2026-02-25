@@ -29,6 +29,8 @@ import { RainBackground } from "@/components/ui/rain";
 import { MeshGradientBackground } from "@/components/ui/mesh-gradient";
 import { BackgroundPaths } from "@/components/ui/paths";
 import { StarfieldBackground } from "@/components/ui/starfield";
+import { ParticleBackground } from "@/components/ui/particles";
+import { Leva } from "leva";
 import { useTheme, type BackgroundTheme } from "@/context/theme-context";
 
 function MessageIdTracker() {
@@ -109,6 +111,7 @@ export default function Page() {
     { id: "mesh",      label: "Mesh Gradient" },
     { id: "paths",     label: "Paths" },
     { id: "starfield", label: "Starfield" },
+    { id: "particles", label: "Particles" },
   ];
 
   // Source panel collapse state
@@ -249,114 +252,119 @@ export default function Page() {
       {theme === "mesh"      && <MeshGradientBackground className="absolute inset-0" />}
       {theme === "paths"     && <BackgroundPaths className="absolute inset-0" />}
       {theme === "starfield" && <StarfieldBackground className="absolute inset-0" />}
+      {theme === "particles" && <ParticleBackground className="absolute inset-0" />}
+      {/* hidden leva panel for particle controls */}
+      <Leva hidden />
 
         {/* ── Top bar: mode tabs + history button ─────────────────────── */}
-        <header className="relative flex items-center gap-2 px-4 py-2 border-b shrink-0 bg-background" style={{ borderBottomColor: "#1e1e1e" }}>
-          {/* Mode tabs */}
-          <button
-            onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "rag" })}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              chatMode === "rag"
-                ? "bg-[#242424] text-gray-100 border border-[#333]"
-                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
-            }`}
-          >
-            {/* Document icon */}
-            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-            </svg>
-            RAG Mode
-          </button>
-
-          <button
-            onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "freeform" })}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              chatMode === "freeform"
-                ? "bg-[#242424] text-gray-100 border border-[#333]"
-                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
-            }`}
-          >
-            {/* Chat bubble icon */}
-            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
-            </svg>
-            Non-RAG Mode
-          </button>
-
-          {/* Spacer */}
-          <div className="flex-1" />
-
-          {/* New Chat button */}
-          <button
-            onClick={handleNewChat}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
-            title="New chat"
-          >
-            <Plus className="w-3.5 h-3.5 shrink-0" />
-            New Chat
-          </button>
-
-          {/* Theme picker */}
-          <div className="relative">
+        <header className="relative flex items-center gap-2 px-0 py-2 justify-between w-full bg-transparent border-none shrink-0">
+          <div className="flex items-center gap-2">
+            {/* Mode tabs */}
             <button
-              onClick={() => setThemeOpen((v) => !v)}
+              onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "rag" })}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                themeOpen
+                chatMode === "rag"
                   ? "bg-[#242424] text-gray-100 border border-[#333]"
                   : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
               }`}
-              title="Background theme"
             >
+              {/* Document icon */}
               <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16l4-4m0 0l4-4m-4 4h12" />
-                <circle cx="12" cy="12" r="9" strokeLinecap="round" strokeLinejoin="round" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
-              Theme
+              RAG Mode
             </button>
-            {themeOpen && (
-              <>
-                {/* Backdrop */}
-                <div className="fixed inset-0 z-40" onClick={() => setThemeOpen(false)} />
-                <div className="absolute right-0 top-full z-50 mt-1 min-w-40 rounded-md border border-[#2a2a2a] bg-[#181818] py-1 shadow-xl">
-                  {THEMES.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => { setTheme(t.id); setThemeOpen(false); }}
-                      className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
-                        theme === t.id
-                          ? "text-gray-100 bg-[#242424]"
-                          : "text-gray-400 hover:text-gray-200 hover:bg-[#222222]"
-                      }`}
-                    >
-                      {theme === t.id && (
-                        <svg className="w-3 h-3 shrink-0 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                        </svg>
-                      )}
-                      {theme !== t.id && <span className="w-3 h-3 shrink-0" />}
-                      {t.label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
+
+            <button
+              onClick={() => dispatch({ type: "SET_CHAT_MODE", mode: "freeform" })}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                chatMode === "freeform"
+                  ? "bg-[#242424] text-gray-100 border border-[#333]"
+                  : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+              }`}
+            >
+              {/* Chat bubble icon */}
+              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+              Non-RAG Mode
+            </button>
           </div>
 
-          {/* History button */}
-          <button
-            onClick={() => setShowHistory((v) => !v)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              showHistory
-                ? "bg-[#242424] text-gray-100 border border-[#333]"
-                : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
-            }`}
-            title="Chat history"
-          >
-            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            Chat History
-          </button>
+          <div className="flex items-center gap-2">
+            {/* New Chat button */}
+            <button
+              onClick={handleNewChat}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+              title="New chat"
+            >
+              <Plus className="w-3.5 h-3.5 shrink-0" />
+              New Chat
+            </button>
+
+            {/* Theme picker */}
+            <div className="relative">
+              <button
+                onClick={() => setThemeOpen((v) => !v)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  themeOpen
+                    ? "bg-[#242424] text-gray-100 border border-[#333]"
+                    : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+                }`}
+                title="Background theme"
+              >
+                <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16l4-4m0 0l4-4m-4 4h12" />
+                  <circle cx="12" cy="12" r="9" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                Theme
+              </button>
+              {themeOpen && (
+                <>
+                  {/* Backdrop */}
+                  <div className="fixed inset-0 z-40" onClick={() => setThemeOpen(false)} />
+                  <div className="absolute right-0 top-full z-50 mt-1 min-w-40 rounded-md border border-[#2a2a2a] bg-[#181818] py-1 shadow-xl">
+                    {THEMES.map((t) => (
+                      <button
+                        key={t.id}
+                        onClick={() => { setTheme(t.id); setThemeOpen(false); }}
+                        className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                          theme === t.id
+                            ? "text-gray-100 bg-[#242424]"
+                            : "text-gray-400 hover:text-gray-200 hover:bg-[#222222]"
+                        }`}
+                      >
+                        {theme === t.id && (
+                          <svg className="w-3 h-3 shrink-0 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                          </svg>
+                        )}
+                        {theme !== t.id && <span className="w-3 h-3 shrink-0" />}
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+
+            </div>
+
+            {/* History button */}
+            <button
+              onClick={() => setShowHistory((v) => !v)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                showHistory
+                  ? "bg-[#242424] text-gray-100 border border-[#333]"
+                  : "text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+              }`}
+              title="Chat history"
+            >
+              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Chat History
+            </button>
+          </div>
         </header>
 
         {/* ── Body: source panel + main + optional history ────────────── */}

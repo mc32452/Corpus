@@ -164,6 +164,21 @@ mark.citation-highlight {
   scroll-margin: 120px;
 }
 
+/* ─── Particle background fillscreen container ─────────────────────────────
+   (#webgl container is inserted by <ParticleBackground /> above) */
+#webgl {
+  top: 0;
+  left: 0;
+  position: fixed;
+  height: 100svh;
+  width: 100%;
+}
+
+#webgl canvas {
+  width: 100%;
+  height: 100%;
+}
+
 /* ─── Thread viewport footer separator ──────────────────────────────────────── */
 .aui-thread-viewport-footer {
   border-top: 0;

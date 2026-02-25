@@ -1,5 +1,8 @@
 .DS_Store
 
+# ignore the temporary example project used for new-particle-background work
+/new background/
+
 *.jsonl
 *.json
 !data/lance/schema_version.json

@@ -2,7 +2,7 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
 
-export type BackgroundTheme = "none" | "beams" | "meteors" | "rain" | "mesh" | "paths" | "starfield";
+export type BackgroundTheme = "none" | "beams" | "meteors" | "rain" | "mesh" | "paths" | "starfield" | "particles";
 
 const STORAGE_KEY = "dh-background-theme";
 
