@@ -78,31 +78,42 @@ def retrieval_engine(tmp_storage, mock_embedder, mock_reranker):
 
 class TestHybridSearch:
     def test_hybrid_returns_results(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine._hybrid_search("Chomsky theory", top_k=5)
+        results = retrieval_engine._hybrid_search_decoupled(
+            embedding_query="Chomsky theory", bm25_query="Chomsky theory", top_k=5,
+        )
         assert len(results) > 0
         assert all("id" in r for r in results)
 
     def test_hybrid_top_k_limit(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine._hybrid_search("language acquisition", top_k=2)
+        results = retrieval_engine._hybrid_search_decoupled(
+            embedding_query="language acquisition", bm25_query="language acquisition", top_k=2,
+        )
         assert len(results) <= 2
 
     def test_hybrid_deterministic(self, retrieval_engine: RetrievalEngine):
-        r1 = retrieval_engine._hybrid_search("epistemology knowledge", top_k=5)
-        r2 = retrieval_engine._hybrid_search("epistemology knowledge", top_k=5)
+        r1 = retrieval_engine._hybrid_search_decoupled(
+            embedding_query="epistemology knowledge", bm25_query="epistemology knowledge", top_k=5,
+        )
+        r2 = retrieval_engine._hybrid_search_decoupled(
+            embedding_query="epistemology knowledge", bm25_query="epistemology knowledge", top_k=5,
+        )
         assert [r["id"] for r in r1] == [r["id"] for r in r2]
 
     def test_hybrid_empty_query_raises(self, retrieval_engine: RetrievalEngine):
         with pytest.raises(ValueError):
-            retrieval_engine._hybrid_search("", top_k=5)
+            retrieval_engine._hybrid_search_decoupled(
+                embedding_query="", bm25_query="", top_k=5,
+            )
 
     def test_hybrid_whitespace_query_raises(self, retrieval_engine: RetrievalEngine):
         with pytest.raises(ValueError):
-            retrieval_engine._hybrid_search("   ", top_k=5)
+            retrieval_engine._hybrid_search_decoupled(
+                embedding_query="   ", bm25_query="   ", top_k=5,
+            )
 
     def test_hybrid_source_filter_applies(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine._hybrid_search(
-            "language",
-            top_k=10,
+        results = retrieval_engine._hybrid_search_decoupled(
+            embedding_query="language", bm25_query="language", top_k=10,
             source_id="test_doc_linguistics",
         )
         assert len(results) > 0
@@ -541,14 +552,16 @@ class TestFullSearch:
             assert metrics.timing.hybrid_search_ms >= 0
             assert metrics.timing.sparse_search_ms >= 0
 
-    def test_search_no_duplicate_parents(self, retrieval_engine: RetrievalEngine):
-        """Final results should not contain duplicate parent_ids."""
+    def test_search_max_two_children_per_parent(self, retrieval_engine: RetrievalEngine):
+        """Final results should have at most 2 children per parent_id (max_children_per_parent=2)."""
+        from collections import Counter
         results = retrieval_engine.search("Chomsky language")
         parent_ids = [
             r.metadata.get("parent_id") for r in results
             if r.metadata.get("parent_id")
         ]
-        assert len(parent_ids) == len(set(parent_ids))
+        counts = Counter(parent_ids)
+        assert all(c <= 2 for c in counts.values()), f"Parent counts exceed 2: {counts}"
 
     def test_search_deterministic(self, retrieval_engine: RetrievalEngine):
         """Same query should produce same results."""
@@ -583,7 +596,9 @@ class TestRetrievalLatency:
     def test_hybrid_search_latency(self, retrieval_engine: RetrievalEngine):
         for q in ["Chomsky theory", "epistemology knowledge", "ethics"]:
             with Timer("hybrid_search", query=q) as t:
-                retrieval_engine._hybrid_search(q, top_k=10)
+                retrieval_engine._hybrid_search_decoupled(
+                    embedding_query=q, bm25_query=q, top_k=10,
+                )
             logger.info(f"hybrid_search '{q}': {t.result.elapsed_ms:.2f}ms")
 
     def test_rerank_latency_by_batch_size(self, retrieval_engine: RetrievalEngine):

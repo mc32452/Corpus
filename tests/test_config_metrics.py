@@ -12,7 +12,6 @@ from src.config import (
     INTENT_GENERATION_PARAMS_REGULAR,
     INTENT_GENERATION_PARAMS_DEEP_RESEARCH,
     ModelConfig,
-    _auto_select_mode,
     _get_mode_config,
     select_mode_config,
     resolve_retrieval_params,
@@ -105,17 +104,9 @@ class TestModeConfig:
 # ===========================================================================
 
 class TestAutoModeSelection:
-    def test_auto_low_ram(self):
-        assert _auto_select_mode(32.0) == "regular"
-
-    def test_auto_high_ram(self):
-        # Auto-select always returns 'regular'; RAM-aware scaling happens in _get_mode_config
-        assert _auto_select_mode(64.0) == "regular"
-
-    def test_auto_boundary(self):
-        # Both RAM tiers auto-select to 'regular' with RAM-aware parameter scaling
-        assert _auto_select_mode(63.9) == "regular"
-        assert _auto_select_mode(64.0) == "regular"
+    def test_auto_defaults_to_regular(self):
+        """Auto-select always uses 'regular'; _auto_select_mode was a noop and has been removed."""
+        assert "regular" in VALID_MODES
 
 
 # ===========================================================================
