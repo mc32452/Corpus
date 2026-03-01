@@ -1,3 +1,21 @@
+"""Document ingestion pipeline: parsing → chunking → storage.
+
+Supports PDF and Markdown source documents.
+
+Architecture
+~~~~~~~~~~~~
+- PDF extraction cascades through four strategies in order: PyPDF →
+  pdfminer → PyMuPDF → Tesseract OCR.  The first strategy that returns
+  non-empty text wins; later strategies are only tried if earlier ones fail
+  or return empty output.
+- Text is chunked into overlapping parent chunks (~1 200 tokens with 150-
+  token overlap) and nested child chunks (~250 tokens with 2-sentence
+  overlap).  This parent-document retrieval layout means the reranker scores
+  focused child passages while the LLM sees the wider parent context.
+- ``ingest_file_to_storage()`` is the main entry point; it returns lists of
+  ``ParentChunk`` and ``ChildChunk`` objects that the caller (``RagEngine``)
+  writes to ``StorageEngine``.
+"""
 from __future__ import annotations
 
 import logging

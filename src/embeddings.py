@@ -1,3 +1,21 @@
+"""MLX-native embedding model wrapper.
+
+Implements a SentenceTransformer-compatible ``encode()`` API over
+``mlx_lm.load()`` for local Apple Silicon inference.
+
+Architecture
+~~~~~~~~~~~~
+- ``MlxEmbeddingModel`` is a thin stateful wrapper: it lazy-loads the model
+  on first ``encode()`` call and keeps it resident for the lifetime of the
+  engine.
+- Tokenisation uses the HuggingFace tokenizer bundled with the MLX repo;
+  padding and truncation are handled in ``_tokenize_batch()`` to produce
+  the fixed-shape arrays MLX needs.
+- Pooling is mean-pooling over non-padding tokens followed by L2
+  normalisation when ``normalize_embeddings=True``.
+- Used by ``RetrievalEngine`` to encode queries at search time.  Document
+  vectors are produced during ingest via ``StorageEngine.add_chunks()``.
+"""
 from __future__ import annotations
 
 import logging

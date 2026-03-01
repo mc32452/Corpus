@@ -1,3 +1,20 @@
+"""LanceDB storage engine for chunks, parents, and source summaries.
+
+Architecture
+~~~~~~~~~~~~
+- Three LanceDB tables: ``child_chunks`` (dense vectors + FTS text index),
+  ``parent_chunks`` (text only, no vectors), ``source_summaries`` (source
+  metadata and file paths).
+- FTS index rebuild is controlled by a policy (``immediate``, ``deferred``,
+  ``batch``) to trade ingest throughput against query-time freshness.  The
+  ``_fts_dirty`` flag tracks whether a rebuild is pending so hybrid_search
+  can trigger one lazily before the first query after a write.
+- SQL escaping is done manually via ``_escape_sql_literal()`` rather than
+  parameterised queries because the LanceDB Python API does not expose
+  parameterised WHERE clauses at this version.
+- Single-process, single-user design — no connection pooling or row-level
+  locking.  Concurrent writes from multiple processes would corrupt the index.
+"""
 from __future__ import annotations
 
 import logging

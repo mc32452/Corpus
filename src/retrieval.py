@@ -1,3 +1,20 @@
+"""Hybrid retrieval engine: vector + BM25 search → reranking → filtering → expansion.
+
+Architecture
+~~~~~~~~~~~~
+- The pipeline is broken into discrete stage methods so each step can be
+  timed, tested, and overridden independently:
+    1. ``_stage_hybrid_search()``   — LanceDB native hybrid search + query embed
+    2. ``_stage_rerank()``          — Jina reranker v3 listwise scoring
+    3. ``_stage_threshold_filter()``— adaptive score threshold + safety floor
+    4. ``_stage_budget_expand()``   — deduplication and top-k trimming
+    5. ``_stage_context_expand()``  — fetch parent chunk text for LLM context
+- ``_hybrid_search_decoupled()`` is the lower-level method that separates the
+  embedding query from the BM25 query, allowing the caller to pre-compute the
+  query vector and pass it in to avoid redundant encoding.
+- Sub-threshold policy (how many below-threshold results to retain) varies by
+  intent and query type to balance precision against recall.
+"""
 from __future__ import annotations
 
 import heapq

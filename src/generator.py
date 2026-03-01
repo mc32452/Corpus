@@ -1,3 +1,21 @@
+"""MLX-LM text generator with streaming, KVCache warming, and thinking-mode support.
+
+Architecture
+~~~~~~~~~~~~
+- ``MlxGenerator`` is the sole LLM interface.  It is loaded once per
+  ``RagEngine`` instance and kept resident (or speculatively preloaded during
+  retrieval to hide load latency).
+- ``stream_chat_with_thinking()`` exposes the Qwen3 ``<think>`` block lifecycle
+  to the API layer, yielding ``{"type": "thinking"|"answer", "text": str}``
+  dicts.  ``generate_chat_stream()`` strips thinking blocks and yields plain
+  str tokens.
+- Both streaming paths share ``_stream_tokens()``, which handles the
+  ``<think>`` / ``</think>`` boundary, stop-token truncation, and the visible
+  token cap that prevents runaway thinking budgets.
+- ``enforce_token_budget()`` is a standalone greedy packer used by
+  ``RagEngine`` to fit retrieval results into the context window before
+  generation.
+"""
 from __future__ import annotations
 
 import logging

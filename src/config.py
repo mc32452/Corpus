@@ -1,3 +1,23 @@
+"""Mode-aware configuration for the RAG pipeline.
+
+Provides model IDs, retrieval budgets, and per-intent generation parameters
+for all supported hardware tiers.
+
+Architecture
+~~~~~~~~~~~~
+- ``ModelConfig`` is a frozen dataclass holding a complete model stack and
+  retrieval knobs for a given mode/RAM tier.  All downstream code reads from
+  it; nothing mutates it after construction.
+- ``select_mode_config()`` picks the right ``ModelConfig`` at engine startup
+  via ``CLI > RAG_MODE env var > auto`` precedence.  RAM is detected once and
+  cached.
+- ``resolve_retrieval_params()`` applies per-intent scale factors on top of
+  the base mode values so retrieval depth varies by query type without
+  duplicating config tables.
+- ``resolve_generation_params()`` returns per-intent sampling params (temp,
+  top_p, thinking on/off).  Deep-research mode inherits regular params and
+  overrides only the analytical intents.
+"""
 from __future__ import annotations
 
 import logging
