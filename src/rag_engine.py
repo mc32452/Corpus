@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import threading
-import time as _time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,8 +49,6 @@ from .latency import LatencyProfiler
 from .metrics import (
     BudgetMetrics,
     RetrievalMetrics,
-    format_metrics_summary,
-    log_metrics,
 )
 from .citation_verification import compute_highlight_texts
 from .retrieval import (

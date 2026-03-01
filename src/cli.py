@@ -9,10 +9,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import textwrap
 from typing import Optional
 
-from .config import CITATIONS_ENABLED_DEFAULT
 from .metrics import format_metrics_summary, log_metrics
 from .rag_engine import RagEngine, RagEngineConfig
 

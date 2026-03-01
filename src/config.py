@@ -117,9 +117,6 @@ INTENT_GENERATION_PARAMS_DEEP_RESEARCH: dict[str, IntentGenerationParams] = {
     "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
 }
 
-# Backward-compatible alias
-INTENT_GENERATION_PARAMS = INTENT_GENERATION_PARAMS_REGULAR
-
 
 def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedRetrievalParams:
     """Apply intent-specific scale factors to base mode config values.
