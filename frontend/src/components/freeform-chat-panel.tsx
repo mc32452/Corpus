@@ -51,6 +51,49 @@ const MODELS = [
 const BACKEND_BASE = getBackendBase();
 
 // ---------------------------------------------------------------------------
+// SSE parsing
+// ---------------------------------------------------------------------------
+
+/** Parse a single SSE text block into {event, data}. */
+function parseSSEBlock(text: string): { event: string; data: string } | null {
+  const lines = text.split(/\r?\n/);
+  let evt = "message";
+  let dat = "";
+  for (const l of lines) {
+    if (l.startsWith("event:")) evt = l.slice(6).trim();
+    else if (l.startsWith("data:")) dat = l.slice(5).trimStart();
+  }
+  if (!dat) return null;
+  return { event: evt, data: dat };
+}
+
+/** Yield parsed SSE events from a ReadableStream body. */
+async function* parseSSEStream(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<{ event: string; data: string }, void, unknown> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) {
+      if (!block.trim()) continue;
+      const p = parseSSEBlock(block);
+      if (p) yield p;
+    }
+  }
+  if (buffer.trim()) {
+    const p = parseSSEBlock(buffer.trim());
+    if (p) yield p;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
 
@@ -77,38 +120,7 @@ async function* freeformStreaming(
     throw new Error(`Freeform chat failed: HTTP ${res.status}`);
   }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  const parseBlock = (text: string): { event: string; data: string } | null => {
-    const lines = text.split(/\r?\n/);
-    let evt = "message";
-    let dat = "";
-    for (const l of lines) {
-      if (l.startsWith("event:")) evt = l.slice(6).trim();
-      else if (l.startsWith("data:")) dat = l.slice(5).trimStart();
-    }
-    if (!dat) return null;
-    return { event: evt, data: dat };
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? "";
-    for (const block of blocks) {
-      if (!block.trim()) continue;
-      const p = parseBlock(block);
-      if (p) yield p;
-    }
-  }
-  if (buffer.trim()) {
-    const p = parseBlock(buffer.trim());
-    if (p) yield p;
-  }
+  yield* parseSSEStream(res.body);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,36 +155,16 @@ async function generateTitleFromConversation(
 
     if (!res.ok || !res.body) return "";
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
     let fullText = "";
-    let finished = false;
 
-    while (!finished) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const blocks = buffer.split(/\r?\n\r?\n/);
-      buffer = blocks.pop() ?? "";
-      for (const block of blocks) {
-        if (!block.trim()) continue;
-        const lines = block.split(/\r?\n/);
-        let evt = "message";
-        let dat = "";
-        for (const l of lines) {
-          if (l.startsWith("event:")) evt = l.slice(6).trim();
-          else if (l.startsWith("data:")) dat = l.slice(5).trimStart();
-        }
-        if (evt === "token" && dat) {
-          try {
-            const parsed = JSON.parse(dat);
-            if (typeof parsed.text === "string") fullText += parsed.text;
-          } catch { /* skip */ }
-        } else if (evt === "done") {
-          finished = true;
-          break;
-        }
+    for await (const { event, data } of parseSSEStream(res.body)) {
+      if (event === "token" && data) {
+        try {
+          const parsed = JSON.parse(data);
+          if (typeof parsed.text === "string") fullText += parsed.text;
+        } catch { /* skip */ }
+      } else if (event === "done") {
+        break;
       }
     }
 

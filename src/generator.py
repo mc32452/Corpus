@@ -578,135 +578,13 @@ class MlxGenerator:
         except ImportError:
             raise RuntimeError("mlx-lm stream_generate is not available for thinking mode.")
 
-        yield from self._stream_tokens_thinking(
+        yield from self._stream_tokens(
             prompt, effective_max_tokens, effective_temp, effective_top_p,
             top_k, min_p,
             repetition_penalty, presence_penalty, stop_tokens, prompt_tokens,
             should_stop=should_stop,
+            enable_thinking=True,
             visible_cap=visible_cap,
-        )
-
-    def _stream_tokens_thinking(
-        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
-        top_k: int, min_p: float,
-        repetition_penalty: Optional[float], presence_penalty: Optional[float],
-        stop_tokens: list[str],
-        prompt_tokens: int,
-        *,
-        should_stop: Optional[callable] = None,
-        visible_cap: Optional[int] = None,
-    ):
-        """Yield thinking/answer classified dicts from mlx-lm stream_generate.
-
-        The chat template pre-injects ``<think>`` at the prompt tail, so the
-        stream starts already inside the think block (``in_think`` starts True).
-        """
-        from mlx_lm.generate import stream_generate
-
-        generate_kwargs = self._build_generation_kwargs(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-        )
-
-        stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
-        max_stop_len = max((len(t) for t in stop_tokens), default=0)
-        answer_boundary_guard = max(max_stop_len - 1, 0)
-        think_boundary_guard = len(self._thinking_close_tag) - 1
-
-        start_time = time.perf_counter()
-        accumulated = ""
-        in_think = True  # chat template pre-injects <think> into prompt tail
-        token_count = 0
-        visible_count = 0
-
-        for response in stream_generate(**generate_kwargs):
-            if should_stop is not None and should_stop():
-                logger.info("Thinking stream stopped by callback")
-                break
-
-            accumulated += response.text
-            token_count += 1
-
-            while accumulated:
-                if in_think:
-                    close_idx = accumulated.find(self._thinking_close_tag)
-                    if close_idx == -1:
-                        # Still inside think; emit all but the closing-tag boundary guard
-                        safe = len(accumulated) - think_boundary_guard
-                        if safe > 0:
-                            yield {"type": "thinking", "text": accumulated[:safe]}
-                            accumulated = accumulated[safe:]
-                        break
-                    else:
-                        if close_idx > 0:
-                            yield {"type": "thinking", "text": accumulated[:close_idx]}
-                        accumulated = accumulated[close_idx + len(self._thinking_close_tag):]
-                        in_think = False
-                        # continue scanning for answer text
-                else:
-                    stop_match = stop_pattern.search(accumulated) if stop_pattern else None
-                    if stop_match:
-                        content = accumulated[:stop_match.start()]
-                        if content:
-                            yield {"type": "answer", "text": content}
-                            visible_count += len(content)
-                        logger.info(
-                            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d "
-                            "visible_tokens=%d time_s=%.2f (stop token)",
-                            self._model_id, prompt_tokens, token_count, visible_count,
-                            time.perf_counter() - start_time,
-                        )
-                        return
-                    safe = len(accumulated) - answer_boundary_guard
-                    if safe > 0:
-                        emit_text = accumulated[:safe]
-                        yield {"type": "answer", "text": emit_text}
-                        visible_count += len(emit_text)
-                        accumulated = accumulated[safe:]
-                    elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
-                        yield {"type": "answer", "text": accumulated}
-                        visible_count += len(accumulated)
-                        accumulated = ""
-
-                    # Enforce visible token cap (approximate — character-based)
-                    if visible_cap is not None and visible_count >= visible_cap * 4:
-                        logger.info(
-                            "Visible token cap reached (%d chars ≈ %d tokens)",
-                            visible_count, visible_cap,
-                        )
-                        # Flush remainder as-is and stop
-                        return
-
-                    break
-
-        # Flush remainder
-        if accumulated:
-            stop_match = stop_pattern.search(accumulated) if stop_pattern else None
-            if stop_match:
-                accumulated = accumulated[:stop_match.start()]
-            if accumulated:
-                chunk_type = "answer" if not in_think else "thinking"
-                yield {"type": chunk_type, "text": accumulated}
-                if chunk_type == "answer":
-                    visible_count += len(accumulated)
-
-        # Handle zero-visible-token edge case
-        if visible_count == 0 and token_count > 0:
-            logger.warning(
-                "Thinking budget exhausted: %d tokens generated but no visible answer produced",
-                token_count,
-            )
-            yield {"type": "error", "text": "THINKING_BUDGET_EXHAUSTED"}
-
-        logger.info(
-            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d visible_chars=%d time_s=%.2f",
-            self._model_id, prompt_tokens, token_count, visible_count, time.perf_counter() - start_time,
         )
 
     def _stream_tokens(
@@ -717,110 +595,164 @@ class MlxGenerator:
         prompt_tokens: int,
         *,
         should_stop: Optional[callable] = None,
+        enable_thinking: bool = False,
+        visible_cap: Optional[int] = None,
     ):
-        """Yield individual tokens from mlx-lm stream_generate.
+        """Yield token chunks from mlx-lm ``stream_generate``.
 
-        Handles stop-token detection and thinking-block removal on the fly.
+        When *enable_thinking* is True the generator yields dicts::
+
+            {"type": "thinking", "text": str}
+            {"type": "answer",   "text": str}
+            {"type": "error",    "text": str}   (thinking budget exhaustion)
+
+        When *enable_thinking* is False it yields **plain str** tokens
+        (thinking blocks stripped silently).
         """
         from mlx_lm.generate import stream_generate
 
         generate_kwargs = self._build_generation_kwargs(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
+            prompt=prompt, max_tokens=max_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k, min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
         )
 
         stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
-        max_stop_len = max((len(token) for token in stop_tokens), default=0)
-        boundary_guard = max(
+        max_stop_len = max((len(t) for t in stop_tokens), default=0)
+        think_close_guard = len(self._thinking_close_tag) - 1
+        think_open_guard = len(self._thinking_open_tag) - 1
+        answer_guard = max(
             max_stop_len - 1,
-            len(self._thinking_open_tag) - 1,
-            len(self._thinking_close_tag) - 1,
+            0 if enable_thinking else max(think_open_guard, think_close_guard),
             0,
         )
-        hidden_tail_guard = max(STREAM_TAIL_GUARD_CHARS, boundary_guard + 2)
+        hidden_tail_guard = max(STREAM_TAIL_GUARD_CHARS, answer_guard + 2)
 
         start_time = time.perf_counter()
         accumulated = ""
-        in_thinking_block = False
+        in_think = enable_thinking  # thinking mode starts inside <think>
         token_count = 0
-        stopped_on_stop_token = False
+        visible_count = 0
+
+        def _emit_answer(text: str):
+            nonlocal visible_count
+            visible_count += len(text)
 
         for response in stream_generate(**generate_kwargs):
-            # Check cooperative cancellation
             if should_stop is not None and should_stop():
-                logger.info("Generation stopped by should_stop callback")
+                logger.info("Stream stopped by callback")
                 break
 
-            token = response.text
-            accumulated += token
+            accumulated += response.text
             token_count += 1
 
-            if in_thinking_block:
-                close_pos = accumulated.find(self._thinking_close_tag)
-                if close_pos == -1:
-                    if len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
-                        accumulated = accumulated[-hidden_tail_guard:]
-                    continue
-
-                accumulated = accumulated[close_pos + len(self._thinking_close_tag):]
-                in_thinking_block = False
-
-            open_pos = accumulated.find(self._thinking_open_tag)
-            if open_pos != -1:
-                visible_prefix = accumulated[:open_pos]
-                if visible_prefix:
-                    yield visible_prefix
-
-                accumulated = accumulated[open_pos + len(self._thinking_open_tag):]
-                in_thinking_block = True
-
-                close_pos = accumulated.find(self._thinking_close_tag)
-                if close_pos != -1:
-                    accumulated = accumulated[close_pos + len(self._thinking_close_tag):]
-                    in_thinking_block = False
+            while accumulated:
+                if in_think:
+                    close_idx = accumulated.find(self._thinking_close_tag)
+                    if close_idx == -1:
+                        if enable_thinking:
+                            safe = len(accumulated) - think_close_guard
+                            if safe > 0:
+                                yield {"type": "thinking", "text": accumulated[:safe]}
+                                accumulated = accumulated[safe:]
+                        elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
+                            accumulated = accumulated[-hidden_tail_guard:]
+                        break
+                    else:
+                        if enable_thinking and close_idx > 0:
+                            yield {"type": "thinking", "text": accumulated[:close_idx]}
+                        accumulated = accumulated[close_idx + len(self._thinking_close_tag):]
+                        in_think = False
                 else:
-                    continue
+                    # Non-thinking mode: detect <think> re-entry
+                    if not enable_thinking:
+                        open_pos = accumulated.find(self._thinking_open_tag)
+                        if open_pos != -1:
+                            if open_pos > 0:
+                                yield accumulated[:open_pos]
+                                _emit_answer(accumulated[:open_pos])
+                            accumulated = accumulated[open_pos + len(self._thinking_open_tag):]
+                            in_think = True
+                            continue
 
-            stop_match = stop_pattern.search(accumulated) if stop_pattern is not None else None
-            if stop_match is not None:
-                full_content = accumulated[:stop_match.start()]
-                if full_content:
-                    yield full_content
-                stopped_on_stop_token = True
-                break
+                    stop_match = stop_pattern.search(accumulated) if stop_pattern else None
+                    if stop_match:
+                        content = accumulated[:stop_match.start()]
+                        if content:
+                            if enable_thinking:
+                                yield {"type": "answer", "text": content}
+                            else:
+                                yield content
+                            _emit_answer(content)
+                        logger.info(
+                            "LLM stream | model=%s prompt_tokens=%d output_tokens=%d "
+                            "visible_chars=%d time_s=%.2f (stop token)",
+                            self._model_id, prompt_tokens, token_count, visible_count,
+                            time.perf_counter() - start_time,
+                        )
+                        return
 
-            if not in_thinking_block:
-                safe_emit_len = len(accumulated) - boundary_guard
-                if safe_emit_len > 0:
-                    emit_text = accumulated[:safe_emit_len]
-                    if emit_text:
-                        yield emit_text
-                    accumulated = accumulated[safe_emit_len:]
-                elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
-                    emit_text = accumulated[:-boundary_guard] if boundary_guard > 0 else accumulated
-                    if emit_text:
-                        yield emit_text
-                    accumulated = accumulated[-boundary_guard:] if boundary_guard > 0 else ""
+                    safe = len(accumulated) - answer_guard
+                    if safe > 0:
+                        emit_text = accumulated[:safe]
+                        if enable_thinking:
+                            yield {"type": "answer", "text": emit_text}
+                        elif emit_text:
+                            yield emit_text
+                        _emit_answer(emit_text)
+                        accumulated = accumulated[safe:]
+                    elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
+                        if enable_thinking:
+                            yield {"type": "answer", "text": accumulated}
+                            _emit_answer(accumulated)
+                            accumulated = ""
+                        else:
+                            emit = accumulated[:-answer_guard] if answer_guard > 0 else accumulated
+                            if emit:
+                                yield emit
+                            _emit_answer(emit or "")
+                            accumulated = accumulated[-answer_guard:] if answer_guard > 0 else ""
 
-        if not in_thinking_block and accumulated:
-            final_content = accumulated
-            stop_match = stop_pattern.search(final_content) if stop_pattern is not None else None
-            if stop_match is not None:
-                final_content = final_content[:stop_match.start()]
-            if final_content:
-                yield final_content
+                    if enable_thinking and visible_cap is not None and visible_count >= visible_cap * 4:
+                        logger.info(
+                            "Visible token cap reached (%d chars ≈ %d tokens)",
+                            visible_count, visible_cap,
+                        )
+                        return
 
-        elapsed_s = time.perf_counter() - start_time
+                    break
+
+        # Flush remainder
+        if accumulated and not in_think:
+            stop_match = stop_pattern.search(accumulated) if stop_pattern else None
+            if stop_match:
+                accumulated = accumulated[:stop_match.start()]
+            if accumulated:
+                if enable_thinking:
+                    yield {"type": "answer", "text": accumulated}
+                else:
+                    yield accumulated
+                _emit_answer(accumulated)
+        elif accumulated and in_think and enable_thinking:
+            stop_match = stop_pattern.search(accumulated) if stop_pattern else None
+            if stop_match:
+                accumulated = accumulated[:stop_match.start()]
+            if accumulated:
+                yield {"type": "thinking", "text": accumulated}
+
+        if enable_thinking and visible_count == 0 and token_count > 0:
+            logger.warning(
+                "Thinking budget exhausted: %d tokens generated but no visible answer produced",
+                token_count,
+            )
+            yield {"type": "error", "text": "THINKING_BUDGET_EXHAUSTED"}
+
         logger.info(
-            "LLM streaming generation | model=%s prompt_tokens=%d output_tokens=%d "
-            "time_s=%.2f stopped_on_stop_token=%s",
-            self._model_id, prompt_tokens, token_count, elapsed_s, stopped_on_stop_token,
+            "LLM stream | model=%s prompt_tokens=%d output_tokens=%d "
+            "visible_chars=%d time_s=%.2f",
+            self._model_id, prompt_tokens, token_count, visible_count,
+            time.perf_counter() - start_time,
         )
 
     def _apply_chat_template(self, messages: list[dict[str, str]], *, enable_thinking: bool = False) -> str:
