@@ -9,10 +9,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import textwrap
 from typing import Optional
 
-from .config import CITATIONS_ENABLED_DEFAULT
 from .metrics import format_metrics_summary, log_metrics
 from .rag_engine import RagEngine, RagEngineConfig
 
@@ -183,11 +181,6 @@ def run() -> None:
         type=float,
         default=0.6,
         help="Minimum intent classification confidence (default: 0.6)",
-    )
-    query_parser.add_argument(
-        "--llm-fallback",
-        action="store_true",
-        help="Deprecated flag. LLM fallback is now default.",
     )
     query_parser.add_argument(
         "--no-llm-fallback",

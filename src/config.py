@@ -1,9 +1,29 @@
+"""Mode-aware configuration for the RAG pipeline.
+
+Provides model IDs, retrieval budgets, and per-intent generation parameters
+for all supported hardware tiers.
+
+Architecture
+~~~~~~~~~~~~
+- ``ModelConfig`` is a frozen dataclass holding a complete model stack and
+  retrieval knobs for a given mode/RAM tier.  All downstream code reads from
+  it; nothing mutates it after construction.
+- ``select_mode_config()`` picks the right ``ModelConfig`` at engine startup
+  via ``CLI > RAG_MODE env var > auto`` precedence.  RAM is detected once and
+  cached.
+- ``resolve_retrieval_params()`` applies per-intent scale factors on top of
+  the base mode values so retrieval depth varies by query type without
+  duplicating config tables.
+- ``resolve_generation_params()`` returns per-intent sampling params (temp,
+  top_p, thinking on/off).  Deep-research mode inherits regular params and
+  overrides only the analytical intents.
+"""
 from __future__ import annotations
 
 import logging
 import os
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -103,22 +123,13 @@ INTENT_GENERATION_PARAMS_REGULAR: dict[str, IntentGenerationParams] = {
 }
 
 INTENT_GENERATION_PARAMS_DEEP_RESEARCH: dict[str, IntentGenerationParams] = {
-    "FACTUAL":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
-    "SUMMARIZE":      IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
-    "EXPLAIN":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
-    "ANALYZE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
-    "COMPARE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
-    "CRITIQUE":       IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
-    "COLLECTION":     IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
-    "OVERVIEW":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
-    "EXTRACT":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
-    "TIMELINE":       IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.0, repetition_penalty=1.0, enable_thinking=False),
-    "HOW_TO":         IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
-    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+    **INTENT_GENERATION_PARAMS_REGULAR,
+    # Deep research overrides: higher temperature + thinking enabled
+    "EXPLAIN":  _dc_replace(INTENT_GENERATION_PARAMS_REGULAR["EXPLAIN"],  temperature=1.0, top_p=0.95, enable_thinking=True),
+    "ANALYZE":  _dc_replace(INTENT_GENERATION_PARAMS_REGULAR["ANALYZE"],  temperature=1.0, top_p=0.95, enable_thinking=True),
+    "COMPARE":  _dc_replace(INTENT_GENERATION_PARAMS_REGULAR["COMPARE"],  temperature=1.0, top_p=0.95, enable_thinking=True),
+    "CRITIQUE": _dc_replace(INTENT_GENERATION_PARAMS_REGULAR["CRITIQUE"], temperature=1.0, top_p=0.95, enable_thinking=True),
 }
-
-# Backward-compatible alias
-INTENT_GENERATION_PARAMS = INTENT_GENERATION_PARAMS_REGULAR
 
 
 def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedRetrievalParams:
@@ -304,12 +315,6 @@ def get_system_ram_gb() -> float:
     return _detect_ram_gb()
 
 
-def _auto_select_mode(ram_gb: float) -> str:
-    # Both tiers (32GB and 64GB+) use 'regular' mode; RAM-aware config branching
-    # happens inside _get_mode_config() to provide different parameters
-    return "regular"
-
-
 def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
     """Select configuration based on mode with CLI > env var > auto precedence."""
     # Detect system RAM
@@ -320,7 +325,7 @@ def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
     source = "cli" if manual_mode else "env" if os.getenv("RAG_MODE") else "auto"
     
     if not mode:
-        mode = _auto_select_mode(ram_gb)
+        mode = "regular"
         source = "auto"
         logger.info(f"Auto-selected mode '{mode}' based on {ram_gb:.0f}GB detected RAM")
 
@@ -345,7 +350,6 @@ def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
             f"Set RAG_MODE env var or use --mode flag."
         )
     
-    # Get RAM-aware configuration
     config = _get_mode_config(mode, ram_gb)
     
     logger.info(

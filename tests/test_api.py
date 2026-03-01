@@ -52,7 +52,7 @@ class MockRagEngine:
         self._fail_during_generation = fail_during_generation
         self.query_count = 0
 
-    def query_events(self, query_text, *, source_id=None, citations_enabled=None, should_stop=None):
+    def query_events(self, query_text, *, source_id=None, intent_override=None, citations_enabled=None, should_stop=None, enable_thinking=None):
         """Yield mock query events."""
         self.query_count += 1
         _stop = should_stop or (lambda: False)

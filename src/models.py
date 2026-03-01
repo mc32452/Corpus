@@ -1,3 +1,20 @@
+"""Pydantic domain models for document storage.
+
+These models represent the LanceDB schema and are intentionally separate
+from the HTTP boundary models in ``api_schemas.py`` — domain models describe
+stored entities; API schemas describe what clients send and receive.
+
+Architecture
+~~~~~~~~~~~~
+- ``Metadata`` is shared by both chunk types and carries source provenance
+  (source_id, page numbers, header path, parent linkage).
+- ``ParentChunk`` holds the wider ~1 200-token passage used for LLM context;
+  ``ChildChunk`` holds the ~250-token passage used for dense/sparse retrieval
+  and reranking.  Each child's ``metadata.parent_id`` links back to its
+  parent, enabling context expansion after retrieval.
+- All models are ``frozen=True`` (immutable after construction) to prevent
+  accidental mutation inside the pipeline.
+"""
 from __future__ import annotations
 
 import uuid

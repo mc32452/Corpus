@@ -33,23 +33,6 @@ export function formatFileSize(bytes?: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-export function getBase64Size(data: string): number {
-  if (!data) return 0;
-  const normalized = data.includes(",") ? data.split(",")[1] : data;
-  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
-  return Math.floor((normalized.length * 3) / 4) - padding;
-}
-
-export function getMimeTypeIcon(mimeType?: string) {
-  if (!mimeType) return FileIcon;
-  if (mimeType.startsWith("image/")) return ImageIcon;
-  if (mimeType === "application/pdf") return FileTextIcon;
-  if (mimeType === "application/json") return BracesIcon;
-  if (mimeType.startsWith("text/")) return FileTextIcon;
-  if (mimeType.startsWith("audio/")) return MusicIcon;
-  if (mimeType.startsWith("video/")) return VideoIcon;
-  return FileIcon;
-}
 
 type FileRootProps = HTMLAttributes<HTMLDivElement> & {
   variant?: FileVariant;

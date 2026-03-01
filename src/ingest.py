@@ -1,3 +1,21 @@
+"""Document ingestion pipeline: parsing → chunking → storage.
+
+Supports PDF and Markdown source documents.
+
+Architecture
+~~~~~~~~~~~~
+- PDF extraction cascades through four strategies in order: PyPDF →
+  pdfminer → PyMuPDF → Tesseract OCR.  The first strategy that returns
+  non-empty text wins; later strategies are only tried if earlier ones fail
+  or return empty output.
+- Text is chunked into overlapping parent chunks (~1 200 tokens with 150-
+  token overlap) and nested child chunks (~250 tokens with 2-sentence
+  overlap).  This parent-document retrieval layout means the reranker scores
+  focused child passages while the LLM sees the wider parent context.
+- ``ingest_file_to_storage()`` is the main entry point; it returns lists of
+  ``ParentChunk`` and ``ChildChunk`` objects that the caller (``RagEngine``)
+  writes to ``StorageEngine``.
+"""
 from __future__ import annotations
 
 import logging
@@ -13,7 +31,6 @@ from .storage import StorageEngine
 
 logger = logging.getLogger(__name__)
 
-# Maximum characters of parent text to feed into summary generation.
 _SUMMARY_CONTEXT_CHAR_LIMIT = 12_000
 
 
@@ -351,6 +368,88 @@ def _chunk_pages(
     return parents, children
 
 
+def _extract_pypdf(reader, **_kw) -> list[_PageData]:
+    """Strategy 1: pypdf per-page extraction."""
+    pages: list[_PageData] = []
+    for index, page in enumerate(reader.pages, start=1):
+        page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
+        if not page_text:
+            continue
+        page_label: Optional[str] = None
+        try:
+            if hasattr(page, "get_label"):
+                page_label = page.get_label()
+        except Exception:
+            pass
+        display_page = page_label if page_label else str(index)
+        pages.append(_PageData(page_text, index, page_label, display_page))
+    return pages
+
+
+def _extract_pdfminer(path: Path, **_kw) -> list[_PageData]:
+    """Strategy 2: pdfminer whole-document fallback."""
+    try:
+        from pdfminer.high_level import extract_text
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pdfminer.six is required for fallback PDF extraction.") from exc
+    fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
+    if fallback_text:
+        return [_PageData(fallback_text, None, None, None)]
+    return []
+
+
+def _extract_pymupdf(path: Path, **_kw) -> list[_PageData]:
+    """Strategy 3: PyMuPDF per-page fallback."""
+    try:
+        import fitz
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("PyMuPDF is required for additional PDF extraction fallback.") from exc
+    doc = fitz.open(str(path))
+    pages: list[_PageData] = []
+    for index in range(doc.page_count):
+        page = doc.load_page(index)
+        page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
+        if not page_text:
+            continue
+        page_label: Optional[str] = None
+        try:
+            if hasattr(page, "get_label"):
+                page_label = page.get_label()
+        except Exception:
+            pass
+        page_number = index + 1
+        display_page = page_label if page_label else str(page_number)
+        pages.append(_PageData(page_text, page_number, page_label, display_page))
+    return pages
+
+
+def _extract_ocr(reader, path: Path, **_kw) -> list[_PageData]:
+    """Strategy 4: OCR fallback (pytesseract)."""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("pytesseract and pdf2image are required for OCR PDF extraction.") from exc
+    pages: list[_PageData] = []
+    page_count = len(reader.pages)
+    for index in range(1, page_count + 1):
+        page_images = convert_from_path(str(path), first_page=index, last_page=index)
+        if not page_images:
+            continue
+        page_text = clean_ocr_artifacts(
+            (pytesseract.image_to_string(page_images[0]) or "").strip()
+        )
+        del page_images
+        if not page_text:
+            continue
+        pages.append(_PageData(page_text, index, None, str(index)))
+    return pages
+
+
+# Ordered extraction strategies for PDF ingestion
+_PDF_STRATEGIES = [_extract_pypdf, _extract_pdfminer, _extract_pymupdf, _extract_ocr]
+
+
 def ingest_pdf(
     file_path: str | Path,
     *,
@@ -373,111 +472,14 @@ def ingest_pdf(
     if not reader.pages:
         raise ValueError("PDF file has no pages.")
 
-    parents: list[ParentChunk] = []
-    children: list[ChildChunk] = []
-
-    # ---------- Strategy 1: pypdf per-page extraction ----------
-    pages: list[_PageData] = []
-    for index, page in enumerate(reader.pages, start=1):
-        page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
-        if not page_text:
-            continue
-
-        page_label: Optional[str] = None
-        try:
-            if hasattr(page, 'get_label'):
-                page_label = page.get_label()
-        except Exception:
-            pass
-
-        display_page = page_label if page_label else str(index)
-        pages.append(_PageData(page_text, index, page_label, display_page))
-
-    if pages:
-        parents, children = _chunk_pages(pages, source_id)
-
-    # ---------- Strategy 2: pdfminer whole-document fallback ----------
-    if not parents:
-        try:
-            from pdfminer.high_level import extract_text
-        except Exception as exc:  # pragma: no cover - dependency runtime
-            raise RuntimeError(
-                "pdfminer.six is required for fallback PDF extraction."
-            ) from exc
-
-        fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
-        if fallback_text:
-            pages = [_PageData(fallback_text, None, None, None)]
-            parents, children = _chunk_pages(pages, source_id)
-
-    # ---------- Strategy 3: PyMuPDF per-page fallback ----------
-    if not parents:
-        try:
-            import fitz  # PyMuPDF
-        except Exception as exc:  # pragma: no cover - dependency runtime
-            raise RuntimeError(
-                "PyMuPDF is required for additional PDF extraction fallback."
-            ) from exc
-
-        doc = fitz.open(str(path))
-        pages = []
-        for index in range(doc.page_count):
-            page = doc.load_page(index)
-            page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
-            if not page_text:
-                continue
-
-            page_label: Optional[str] = None
-            try:
-                if hasattr(page, 'get_label'):
-                    page_label = page.get_label()
-            except Exception:
-                pass
-
-            page_number = index + 1
-            display_page = page_label if page_label else str(page_number)
-            pages.append(_PageData(page_text, page_number, page_label, display_page))
-
+    for strategy in _PDF_STRATEGIES:
+        pages = strategy(reader=reader, path=path)
         if pages:
             parents, children = _chunk_pages(pages, source_id)
+            if parents:
+                return parents, children
 
-    # ---------- Strategy 4: OCR fallback (pytesseract) ----------
-    if not parents:
-        try:
-            from pdf2image import convert_from_path
-            import pytesseract
-        except Exception as exc:  # pragma: no cover - dependency runtime
-            raise RuntimeError(
-                "pytesseract and pdf2image are required for OCR PDF extraction."
-            ) from exc
-
-        # Process pages one at a time to avoid loading all rasterized
-        # images into memory simultaneously.  A 200-page PDF at 300 DPI
-        # can consume 4-6 GB when fully rasterized, risking OOM on 32 GB
-        # Apple Silicon machines.
-        pages = []
-        page_count = len(reader.pages)
-        for index in range(1, page_count + 1):
-            page_images = convert_from_path(
-                str(path), first_page=index, last_page=index,
-            )
-            if not page_images:
-                continue
-            page_text = clean_ocr_artifacts(
-                (pytesseract.image_to_string(page_images[0]) or "").strip()
-            )
-            del page_images  # release rasterized image immediately
-            if not page_text:
-                continue
-            pages.append(_PageData(page_text, index, None, str(index)))
-
-        if pages:
-            parents, children = _chunk_pages(pages, source_id)
-
-    if not parents:
-        raise ValueError(
-            "No extractable text found in PDF, even after OCR."
-        )
+    raise ValueError("No extractable text found in PDF, even after OCR.")
     if not children:
         raise ValueError("No child chunks produced from PDF content.")
 

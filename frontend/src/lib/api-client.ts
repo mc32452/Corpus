@@ -98,182 +98,6 @@ export interface ApiError {
   };
 }
 
-export type StreamEvent = {
-  event: "status" | "intent" | "sources" | "citations" | "token" | "error" | "complete";
-  data: Record<string, unknown>;
-};
-
-export interface QueryStreamingOptions {
-  sourceIds?: string[];
-  citationsEnabled?: boolean;
-  mode?: string;
-  signal?: AbortSignal;
-}
-
-/**
- * Legacy stream helper used by ChatPanel.
- *
- * Consumes the AI SDK UI message stream from `/api/query` and maps it into
- * simple event records (`status`, `intent`, `sources`, `citations`, `token`,
- * `error`, `complete`) expected by the legacy chat renderer.
- */
-export async function* queryStreaming(
-  query: string,
-  options: QueryStreamingOptions = {}
-): AsyncGenerator<StreamEvent, void, unknown> {
-  const res = await fetch("/api/query", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query,
-      source_ids: options.sourceIds,
-      citations_enabled: options.citationsEnabled ?? true,
-      stream: true,
-      mode: options.mode,
-    }),
-    signal: options.signal,
-  });
-
-  if (!res.ok || !res.body) {
-    let message = `Query failed: HTTP ${res.status}`;
-    try {
-      const body = (await res.json()) as ApiError;
-      if (body?.error?.message) message = body.error.message;
-    } catch {
-      try {
-        const text = await res.text();
-        if (text) message = text;
-      } catch {
-        // keep fallback message
-      }
-    }
-    throw new Error(message);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  const parseBlock = (block: string): string | null => {
-    const lines = block.split(/\r?\n/);
-    const dataLines: string[] = [];
-    for (const line of lines) {
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trimStart());
-      }
-    }
-    if (!dataLines.length) return null;
-    return dataLines.join("\n");
-  };
-
-  const mapPayload = (payload: unknown): StreamEvent[] => {
-    if (payload === "[DONE]") {
-      return [{ event: "complete", data: {} }];
-    }
-    if (!payload || typeof payload !== "object") return [];
-
-    const frame = payload as Record<string, unknown>;
-    const type = frame.type;
-    if (typeof type !== "string") return [];
-
-    switch (type) {
-      case "text-delta": {
-        const text = typeof frame.delta === "string" ? frame.delta : "";
-        return text ? [{ event: "token", data: { text } }] : [];
-      }
-      case "data-status": {
-        const data = (frame.data ?? {}) as Record<string, unknown>;
-        const status = typeof data.status === "string" ? data.status : "Working...";
-        return [{ event: "status", data: { message: status } }];
-      }
-      case "data-intent": {
-        const data = (frame.data ?? {}) as Record<string, unknown>;
-        return [{
-          event: "intent",
-          data: {
-            intent: data.intent,
-            confidence: data.confidence,
-            method: data.method,
-          },
-        }];
-      }
-      case "data-sources": {
-        const data = (frame.data ?? {}) as Record<string, unknown>;
-        const sourceIds = Array.isArray(data.sourceIds)
-          ? data.sourceIds.filter((x): x is string => typeof x === "string")
-          : [];
-        return [{ event: "sources", data: { source_ids: sourceIds } }];
-      }
-      case "data-citations": {
-        const data = (frame.data ?? {}) as Record<string, unknown>;
-        const citations = Array.isArray(data.citations) ? data.citations : [];
-        return [{ event: "citations", data: { citations } }];
-      }
-      case "data-error": {
-        const data = (frame.data ?? {}) as Record<string, unknown>;
-        const err = (data.error ?? {}) as Record<string, unknown>;
-        const message = typeof err.message === "string" ? err.message : "Streaming error";
-        return [{ event: "error", data: { error: message, code: err.code } }];
-      }
-      case "error": {
-        const message = typeof frame.error === "string" ? frame.error : "Streaming error";
-        return [{ event: "error", data: { error: message } }];
-      }
-      case "finish": {
-        return [{ event: "complete", data: {} }];
-      }
-      default:
-        return [];
-    }
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? "";
-
-    for (const block of blocks) {
-      const rawData = parseBlock(block);
-      if (!rawData) continue;
-
-      if (rawData === "[DONE]") {
-        yield { event: "complete", data: {} };
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(rawData) as unknown;
-        const mapped = mapPayload(parsed);
-        for (const evt of mapped) {
-          yield evt;
-        }
-      } catch {
-        // ignore malformed frames and keep streaming
-      }
-    }
-  }
-
-  if (buffer.trim()) {
-    const rawData = parseBlock(buffer.trim());
-    if (rawData === "[DONE]") {
-      yield { event: "complete", data: {} };
-    } else if (rawData) {
-      try {
-        const parsed = JSON.parse(rawData) as unknown;
-        const mapped = mapPayload(parsed);
-        for (const evt of mapped) {
-          yield evt;
-        }
-      } catch {
-        // ignore malformed trailing frame
-      }
-    }
-  }
-}
-
 class SourceApiClient {
   private baseUrl: string;
 
@@ -417,3 +241,89 @@ class SourceApiClient {
 }
 
 export const sourceApi = new SourceApiClient();
+
+// ---------------------------------------------------------------------------
+// QueryStreaming — legacy SSE-based RAG query streaming
+// ---------------------------------------------------------------------------
+
+export interface StreamEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+export interface QueryStreamOptions {
+  sourceIds?: string[];
+  citationsEnabled?: boolean;
+  signal?: AbortSignal;
+}
+
+/**
+ * Stream a RAG query as plain SSE events from /api/query.
+ *
+ * Yields objects with `event` (string) and `data` (parsed JSON object) for
+ * each SSE block received. Recognised event names include: "status",
+ * "intent", "sources", "citations", "token", "error", "complete".
+ */
+export async function* queryStreaming(
+  query: string,
+  options: QueryStreamOptions = {},
+): AsyncGenerator<StreamEvent, void, unknown> {
+  const { sourceIds, citationsEnabled = true, signal } = options;
+
+  const res = await fetch("/api/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      stream: true,
+      source_ids: sourceIds ?? [],
+      citations_enabled: citationsEnabled,
+    }),
+    signal,
+  });
+
+  if (!res.ok || !res.body) {
+    yield { event: "error", data: { error: `HTTP ${res.status}` } };
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  function* parseBuffer(buf: string): Generator<StreamEvent> {
+    const blocks = buf.split(/\r?\n\r?\n/);
+    for (const block of blocks) {
+      if (!block.trim() || block.trimStart().startsWith(":")) continue;
+      const lines = block.split(/\r?\n/);
+      let evt = "message";
+      let dat = "";
+      for (const line of lines) {
+        if (line.startsWith("event:")) evt = line.slice(6).trim();
+        else if (line.startsWith("data:")) dat = line.slice(5).trimStart();
+      }
+      if (!dat) continue;
+      let parsed: Record<string, unknown>;
+      try { parsed = JSON.parse(dat) as Record<string, unknown>; } catch { parsed = {}; }
+      yield { event: evt, data: parsed };
+    }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      const rejoined = blocks.join("\n\n");
+      yield* parseBuffer(rejoined);
+    }
+    // Flush remaining buffer
+    if (buffer.trim()) {
+      yield* parseBuffer(buffer);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}

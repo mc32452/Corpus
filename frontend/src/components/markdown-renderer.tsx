@@ -97,35 +97,15 @@ export function MarkdownRenderer({ content, highlight }: MarkdownRendererProps) 
     >
       <ReactMarkdown
         components={{
-          h1: ({ children, ...props }) => (
-            <h1 id={slugify(String(children))} {...props}>
-              {children}
-            </h1>
-          ),
-          h2: ({ children, ...props }) => (
-            <h2 id={slugify(String(children))} {...props}>
-              {children}
-            </h2>
-          ),
-          h3: ({ children, ...props }) => (
-            <h3 id={slugify(String(children))} {...props}>
-              {children}
-            </h3>
-          ),
-          h4: ({ children, ...props }) => (
-            <h4 id={slugify(String(children))} {...props}>
-              {children}
-            </h4>
-          ),
-          h5: ({ children, ...props }) => (
-            <h5 id={slugify(String(children))} {...props}>
-              {children}
-            </h5>
-          ),
-          h6: ({ children, ...props }) => (
-            <h6 id={slugify(String(children))} {...props}>
-              {children}
-            </h6>
+          ...Object.fromEntries(
+            (["h1", "h2", "h3", "h4", "h5", "h6"] as const).map((Tag) => [
+              Tag,
+              ({ children, ...props }: React.ComponentProps<typeof Tag>) => (
+                <Tag id={slugify(String(children))} {...props}>
+                  {children}
+                </Tag>
+              ),
+            ]),
           ),
         }}
       >

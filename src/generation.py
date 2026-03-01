@@ -1,3 +1,19 @@
+"""Prompt construction for the RAG query pipeline.
+
+Builds the ``messages`` list passed to ``MlxGenerator`` for every query type.
+
+Architecture
+~~~~~~~~~~~~
+- One ``build_messages()`` function is the single entry point for the query
+  pipeline; it selects system message, citation rules, and intent-specific
+  instructions then formats them into a chat-template-ready list.
+- Intent instructions live in ``INTENT_INSTRUCTIONS_REGULAR`` and
+  ``INTENT_INSTRUCTIONS_DEEP_RESEARCH`` — keyed dicts of ``task``,
+  ``format``, and ``tone`` strings merged at call time.
+- The ingest summary prompt (``build_ingest_summary_messages()``) is
+  intentionally separate: no citation rules, different style goal, called
+  only from ``RagEngine.ingest()``.
+"""
 from __future__ import annotations
 
 import logging
