@@ -54,6 +54,7 @@ from .query_events import (
     SourcesEvent,
     StatusEvent,
     TextTokenEvent,
+    ThinkingTokenEvent,
 )
 from .stream_protocol import (
     annotation_error,
@@ -67,6 +68,9 @@ from .stream_protocol import (
     encode_finish_message,
     encode_finish_step,
     encode_message_start,
+    encode_reasoning_delta,
+    encode_reasoning_end,
+    encode_reasoning_start,
     encode_text_delta,
     encode_text_end,
     encode_text_start,
@@ -102,7 +106,7 @@ _engine_loaded: bool = False
 # Map frontend model IDs (from assistant-ui ModelSelector) to backend mode strings
 _FRONTEND_MODE_MAP: dict[str, str] = {
     "regular": "regular",
-    "deep-research": "power-deep-research",
+    "deep-research": "deep-research",
 }
 
 
@@ -236,7 +240,13 @@ async def validation_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
-    return HealthResponse(status="ok", engine_loaded=_engine_loaded)
+    from .config import get_system_ram_gb
+
+    return HealthResponse(
+        status="ok",
+        engine_loaded=_engine_loaded,
+        system_ram_gb=round(get_system_ram_gb(), 1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +411,20 @@ async def _chat_stream_generator(
     mc_intent = frontend_config.get("intentOverride")
     if mc_intent and mc_intent != "auto":
         intent_override = str(mc_intent)
-    logger.info("Chat request: frontend model=%r → backend mode=%r, intent_override=%r", frontend_model_name, request_mode, intent_override)
+
+    # Extract enable_thinking from frontend config (tri-state: None=auto, True=on, False=off)
+    raw_enable_thinking = frontend_config.get("enableThinking")
+    if raw_enable_thinking is None:
+        # Also check body.data for legacy support
+        if chat_request.data:
+            raw_enable_thinking = chat_request.data.get("enable_thinking")
+    enable_thinking: Optional[bool] = None
+    if raw_enable_thinking is True:
+        enable_thinking = True
+    elif raw_enable_thinking is False:
+        enable_thinking = False
+
+    logger.info("Chat request: frontend model=%r → backend mode=%r, intent_override=%r, enable_thinking=%r", frontend_model_name, request_mode, intent_override, enable_thinking)
 
     # --- Producer: runs in thread, pushes events to queue ---
     def _producer() -> None:
@@ -415,6 +438,7 @@ async def _chat_stream_generator(
                 citations_enabled=citations_enabled,
                 intent_override=intent_override,
                 should_stop=lambda: stop_event.is_set(),
+                enable_thinking=enable_thinking,
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
@@ -436,9 +460,11 @@ async def _chat_stream_generator(
     first_event = True
     keepalive_interval = 8.0
 
-    # Track the text block state (AI SDK v6 text-start / text-delta / text-end lifecycle)
+    # Track streaming block state (AI SDK v6 text-start/delta/end and reasoning-start/delta/end)
     text_id = "text-0"
+    reasoning_id = "reasoning-0"
     in_text_block = False
+    in_reasoning_block = False
 
     try:
         while True:
@@ -453,14 +479,27 @@ async def _chat_stream_generator(
                 logger.info("Chat consumer: first event from producer (stream connected)")
                 first_event = False
 
-            if isinstance(event, TextTokenEvent):
-                # Open the text block on the first token
+            if isinstance(event, ThinkingTokenEvent):
+                # Open reasoning block on first thinking token
+                if not in_reasoning_block:
+                    yield encode_reasoning_start(reasoning_id)
+                    in_reasoning_block = True
+                yield encode_reasoning_delta(event.token, reasoning_id)
+            elif isinstance(event, TextTokenEvent):
+                # Close reasoning block when answer tokens begin
+                if in_reasoning_block:
+                    yield encode_reasoning_end(reasoning_id)
+                    in_reasoning_block = False
+                # Open text block on first answer token
                 if not in_text_block:
                     yield encode_text_start(text_id)
                     in_text_block = True
                 yield encode_text_delta(event.token, text_id)
             else:
-                # Close the text block before any non-text event (citations, finish, etc.)
+                # Close any open blocks before non-streaming events (citations, finish, etc.)
+                if in_reasoning_block:
+                    yield encode_reasoning_end(reasoning_id)
+                    in_reasoning_block = False
                 if in_text_block:
                     yield encode_text_end(text_id)
                     in_text_block = False
@@ -473,6 +512,9 @@ async def _chat_stream_generator(
         logger.info("Chat stream consumer cancelled")
     except Exception as exc:
         logger.exception("Chat stream consumer error: %s", exc)
+        if in_reasoning_block:
+            yield encode_reasoning_end(reasoning_id)
+            in_reasoning_block = False
         if in_text_block:
             yield encode_text_end(text_id)
             in_text_block = False
@@ -536,7 +578,7 @@ class FreeformMessage(BaseModel):
 class FreeformChatRequest(BaseModel):
     messages: list[FreeformMessage]
     model: str = "regular"  # "regular" | "deep-research"
-    enable_thinking: bool = False  # only effective for the 35B model (Qwen3.5)
+    enable_thinking: Optional[bool] = None  # tri-state: None=auto, True=on, False=off
 
 
 _FREEFORM_SYSTEM = (
@@ -569,7 +611,9 @@ async def _freeform_stream_generator(
             request_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
             engine = _get_engine(request_mode)
             gen = engine._ensure_generator()
-            if freeform_request.enable_thinking:
+            # Resolve thinking: explicit True/False from user, or default off for freeform
+            use_thinking = freeform_request.enable_thinking if freeform_request.enable_thinking is not None else False
+            if use_thinking:
                 for event in gen.stream_chat_with_thinking(
                     messages,
                     should_stop=lambda: stop_event.is_set(),
@@ -697,7 +741,9 @@ async def _query_stream_generator(
     producer_task = loop.run_in_executor(None, _producer)
 
     text_id = "text-0"
+    reasoning_id = "reasoning-0"
     in_text_block = False
+    in_reasoning_block = False
 
     # Unique ID per response — a hardcoded constant causes a collision on the second message.
     yield encode_message_start(f"msg-{uuid.uuid4()}")
@@ -710,17 +756,30 @@ async def _query_stream_generator(
 
             event = await queue.get()
             if event is _SENTINEL:
-                # Close any open text block before ending
+                # Close any open blocks before ending
+                if in_reasoning_block:
+                    yield encode_reasoning_end(reasoning_id)
                 if in_text_block:
                     yield encode_text_end(text_id)
                 break
 
-            if isinstance(event, TextTokenEvent):
+            if isinstance(event, ThinkingTokenEvent):
+                if not in_reasoning_block:
+                    yield encode_reasoning_start(reasoning_id)
+                    in_reasoning_block = True
+                yield encode_reasoning_delta(event.token, reasoning_id)
+            elif isinstance(event, TextTokenEvent):
+                if in_reasoning_block:
+                    yield encode_reasoning_end(reasoning_id)
+                    in_reasoning_block = False
                 if not in_text_block:
                     yield encode_text_start(text_id)
                     in_text_block = True
                 yield encode_text_delta(event.token, text_id)
             else:
+                if in_reasoning_block:
+                    yield encode_reasoning_end(reasoning_id)
+                    in_reasoning_block = False
                 if in_text_block:
                     yield encode_text_end(text_id)
                     in_text_block = False

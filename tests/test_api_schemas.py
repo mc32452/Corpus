@@ -307,4 +307,6 @@ class TestHealthResponse:
     def test_serialization(self) -> None:
         resp = HealthResponse(engine_loaded=True)
         data = json.loads(resp.model_dump_json())
-        assert data == {"status": "ok", "engine_loaded": True}
+        assert data["status"] == "ok"
+        assert data["engine_loaded"] is True
+        assert "system_ram_gb" in data  # optional field, may be None

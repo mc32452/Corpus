@@ -69,6 +69,7 @@ from .query_events import (
     SourcesEvent,
     StatusEvent,
     TextTokenEvent,
+    ThinkingTokenEvent,
 )
 from .storage import StorageConfig, StorageEngine
 
@@ -903,6 +904,12 @@ class RagEngine:
         gen_config = GenerationConfig(
             max_tokens=self._generation_max_tokens,
             context_window=config.context_window,
+            temperature=classified.generation_params.temperature,
+            top_p=classified.generation_params.top_p,
+            top_k=classified.generation_params.top_k,
+            min_p=classified.generation_params.min_p,
+            presence_penalty=classified.generation_params.presence_penalty,
+            repetition_penalty=classified.generation_params.repetition_penalty if classified.generation_params.repetition_penalty != 1.0 else None,
         )
 
         self._on_status("Generating answer...")
@@ -910,8 +917,6 @@ class RagEngine:
             raw_answer = generator.generate_chat(
                 messages,
                 config=gen_config,
-                temperature=classified.generation_params.temperature,
-                top_p=classified.generation_params.top_p,
             )
 
         _gen_tokens = count_tokens(raw_answer, generator.tokenizer)
@@ -953,6 +958,7 @@ class RagEngine:
         intent_override: Optional[str] = None,
         citations_enabled: Optional[bool] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        enable_thinking: Optional[bool] = None,
     ) -> Iterable[QueryEvent]:
         """Execute the RAG pipeline yielding structured events.
 
@@ -975,6 +981,9 @@ class RagEngine:
         should_stop : callable | None
             Called periodically; if it returns True, generation is
             aborted and a ``STREAM_CANCELLED`` error event is yielded.
+        enable_thinking : bool | None
+            Tri-state thinking override: ``True`` = user forced on,
+            ``False`` = user forced off, ``None`` = auto/intent-driven.
         """
         _stop = should_stop or (lambda: False)
 
@@ -985,6 +994,7 @@ class RagEngine:
                 intent_override=intent_override,
                 citations_enabled=citations_enabled,
                 should_stop=_stop,
+                enable_thinking=enable_thinking,
             )
         except Exception as exc:
             logger.exception("query_events error: %s", exc)
@@ -1006,6 +1016,7 @@ class RagEngine:
         intent_override: Optional[str],
         citations_enabled: Optional[bool],
         should_stop: Callable[[], bool],
+        enable_thinking: Optional[bool] = None,
     ) -> Iterable[QueryEvent]:
         """Internal implementation of query_events (unwrapped from error handling)."""
         logger.info("query_events_impl: started")
@@ -1197,28 +1208,94 @@ class RagEngine:
         )
 
         # -- generate with streaming tokens --------------------------------
+        gen_params = classified.generation_params
+
+        # Apply user thinking override (tri-state)
+        if enable_thinking is True:
+            # User forced thinking on — switch to thinking-mode sampling
+            from dataclasses import replace as _dc_replace
+            gen_params = _dc_replace(gen_params, enable_thinking=True, temperature=1.0, top_p=0.95)
+        elif enable_thinking is False:
+            # User forced thinking off — ensure non-thinking sampling
+            from dataclasses import replace as _dc_replace
+            gen_params = _dc_replace(gen_params, enable_thinking=False)
+        # else: None = auto, use intent-resolved value
+
+        # RAM gate: disable thinking if insufficient RAM
+        if gen_params.enable_thinking and self._system_ram_gb > 0 and self._system_ram_gb < 48:
+            logger.info(
+                "Thinking mode disabled: requires 48GB+ RAM (detected %.0fGB)",
+                self._system_ram_gb,
+            )
+            from dataclasses import replace as _dc_replace
+            gen_params = _dc_replace(gen_params, enable_thinking=False)
+
+        # Determine token budgets based on thinking state and RAM tier
+        if gen_params.enable_thinking:
+            if self._system_ram_gb >= 64:
+                max_internal = 20480
+                max_visible = 4096
+            else:
+                max_internal = 16384
+                max_visible = 2048
+        else:
+            max_internal = self._generation_max_tokens
+            max_visible = self._generation_max_tokens
+
         gen_config = GenerationConfig(
-            max_tokens=self._generation_max_tokens,
+            max_tokens=max_visible,
+            max_internal_tokens=max_internal if gen_params.enable_thinking else None,
             context_window=config.context_window,
+            temperature=gen_params.temperature,
+            top_p=gen_params.top_p,
+            top_k=gen_params.top_k,
+            min_p=gen_params.min_p,
+            presence_penalty=gen_params.presence_penalty,
+            repetition_penalty=gen_params.repetition_penalty if gen_params.repetition_penalty != 1.0 else None,
         )
         yield StatusEvent(status="Generating answer...")
         token_count = 0
         answer_tokens: list[str] = []
 
-        for token in generator.generate_chat_stream(
-            messages,
-            config=gen_config,
-            should_stop=should_stop,
-            temperature=classified.generation_params.temperature,
-            top_p=classified.generation_params.top_p,
-        ):
-            if should_stop():
-                yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
+        if gen_params.enable_thinking:
+            thinking_budget_exhausted = False
+            for event in generator.stream_chat_with_thinking(
+                messages,
+                config=gen_config,
+                should_stop=should_stop,
+            ):
+                if should_stop():
+                    yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
+                    yield FinishEvent(finish_reason="error")
+                    return
+                token_count += 1
+                if event["type"] == "answer":
+                    answer_tokens.append(event["text"])
+                    yield TextTokenEvent(token=event["text"])
+                elif event["type"] == "thinking":
+                    yield ThinkingTokenEvent(token=event["text"])
+                elif event["type"] == "error" and event.get("text") == "THINKING_BUDGET_EXHAUSTED":
+                    thinking_budget_exhausted = True
+            if thinking_budget_exhausted:
+                yield ErrorEvent(
+                    code="THINKING_BUDGET_EXHAUSTED",
+                    message="The model's reasoning phase consumed the entire token budget. Please try a simpler question or disable thinking mode.",
+                )
                 yield FinishEvent(finish_reason="error")
                 return
-            token_count += 1
-            answer_tokens.append(token)
-            yield TextTokenEvent(token=token)
+        else:
+            for token in generator.generate_chat_stream(
+                messages,
+                config=gen_config,
+                should_stop=should_stop,
+            ):
+                if should_stop():
+                    yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
+                    yield FinishEvent(finish_reason="error")
+                    return
+                token_count += 1
+                answer_tokens.append(token)
+                yield TextTokenEvent(token=token)
 
         # -- post-hoc citation highlight verification ----------------------
         if cite and packed.citation_list and packed.packed_retrieval_results:
@@ -1243,10 +1320,11 @@ class RagEngine:
                 logger.warning("Citation verification failed (non-fatal): %s", exc)
 
         logger.info(
-            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | tokens_generated=%d",
+            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | thinking=%s | tokens_generated=%d",
             intent_result.intent.value,
-            classified.generation_params.temperature,
-            classified.generation_params.top_p,
+            gen_params.temperature,
+            gen_params.top_p,
+            gen_params.enable_thinking,
             token_count,
         )
 
@@ -1292,7 +1370,7 @@ class RagEngine:
         )
 
         retrieval_params = resolve_retrieval_params(config, intent_result.intent.value)
-        generation_params = resolve_generation_params(intent_result.intent.value)
+        generation_params = resolve_generation_params(intent_result.intent.value, config.mode)
 
         logger.info(
             "INTENT_CLASSIFIED | intent=%s | confidence=%.2f | method=%s | mode=%s",

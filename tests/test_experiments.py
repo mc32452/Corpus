@@ -692,7 +692,7 @@ class TestExp5BudgetUtilisation:
         results = {"experiment": "budget_utilisation", "hardware": HARDWARE.as_dict()}
 
         mode_results = {}
-        for mode in ["regular", "power-deep-research"]:
+        for mode in ["regular", "deep-research"]:
             config = _get_mode_config(mode, 32.0)
             budget = config.retrieval_budget
 

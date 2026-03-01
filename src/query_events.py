@@ -42,6 +42,18 @@ class TextTokenEvent:
 
 
 @dataclass(frozen=True)
+class ThinkingTokenEvent:
+    """A single thinking/reasoning token from LLM generation.
+
+    Emitted only when thinking mode is active.  These tokens appear before
+    any ``TextTokenEvent`` and represent the model\'s internal reasoning chain.
+    The API layer streams them as AI SDK ``reasoning-*`` parts.
+    """
+
+    token: str
+
+
+@dataclass(frozen=True)
 class ErrorEvent:
     """An error that occurred during pipeline execution."""
 
@@ -77,6 +89,7 @@ QueryEvent = Union[
     IntentEvent,
     SourcesEvent,
     TextTokenEvent,
+    ThinkingTokenEvent,
     CitationListEvent,
     ErrorEvent,
     FinishEvent,

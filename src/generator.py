@@ -14,9 +14,13 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class GenerationConfig:
     max_tokens: Optional[int] = None
+    max_internal_tokens: Optional[int] = None  # total cap (thinking + answer)
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     stop_tokens: Optional[list[str]] = None
     context_window: Optional[int] = None
 
@@ -159,13 +163,23 @@ class MlxGenerator:
         self,
         prompt: str,
         config: Optional[GenerationConfig],
-    ) -> tuple[int, float, float, Optional[float], list[str], int]:
+    ) -> tuple[int, float, float, int, float, Optional[float], Optional[float], list[str], int]:
+        """Resolve generation parameters from config and model-size defaults.
+
+        Returns
+        -------
+        tuple of (max_tokens, temperature, top_p, top_k, min_p,
+                  repetition_penalty, presence_penalty, stop_tokens, prompt_tokens)
+        """
         cfg = config or GenerationConfig()
         model_size = self._infer_model_size_b(self._model_id)
         max_tokens = cfg.max_tokens
         repetition_penalty = cfg.repetition_penalty
+        presence_penalty = cfg.presence_penalty
         temperature = cfg.temperature
         top_p = cfg.top_p
+        top_k = cfg.top_k if cfg.top_k is not None else 0
+        min_p = cfg.min_p if cfg.min_p is not None else 0.0
 
         if model_size is not None:
             if model_size < 30:
@@ -198,7 +212,7 @@ class MlxGenerator:
                 ctx_limit // 1000,
             )
 
-        return final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens
+        return final_max_tokens, temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens
 
     def _build_generation_kwargs(
         self,
@@ -207,16 +221,23 @@ class MlxGenerator:
         max_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int = 0,
+        min_p: float = 0.0,
         repetition_penalty: Optional[float],
+        presence_penalty: Optional[float] = None,
     ) -> dict[str, Any]:
         from mlx_lm.generate import make_sampler
 
-        sampler = make_sampler(temp=temperature, top_p=top_p)
+        sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
         logits_processors = []
         if repetition_penalty is not None:
             processor = self._build_repetition_penalty_processor(repetition_penalty)
             if processor is not None:
                 logits_processors.append(processor)
+        if presence_penalty is not None and presence_penalty > 0:
+            pp_processor = self._build_presence_penalty_processor(presence_penalty)
+            if pp_processor is not None:
+                logits_processors.append(pp_processor)
 
         generate_kwargs: dict[str, Any] = dict(
             model=self._model,
@@ -240,7 +261,10 @@ class MlxGenerator:
         max_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int,
+        min_p: float,
         repetition_penalty: Optional[float],
+        presence_penalty: Optional[float],
         stop_tokens: list[str],
         prompt_tokens: int,
     ) -> str:
@@ -249,7 +273,10 @@ class MlxGenerator:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
         )
 
         try:
@@ -384,11 +411,38 @@ class MlxGenerator:
         )
         return _processor
 
+    @staticmethod
+    def _build_presence_penalty_processor(penalty: float):
+        """Build a presence penalty logits processor.
+
+        Subtracts a fixed `penalty` value from the logit of any token that has
+        already appeared in the generated sequence (binary — appeared or didn't,
+        no frequency scaling).  This differs from repetition penalty which
+        multiplies by count.
+        """
+        if penalty <= 0:
+            return None
+
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return None
+
+        def _processor(tokens, logits):
+            if len(tokens) == 0:
+                return logits
+            unique_ids = mx.array(list(set(tokens)), dtype=mx.int32)
+            logits[:, unique_ids] -= penalty
+            return logits
+
+        logger.debug("Using presence_penalty=%.2f", penalty)
+        return _processor
+
     def generate(self, prompt: str, *, config: Optional[GenerationConfig] = None) -> str:
         if not prompt.strip():
             raise ValueError("prompt must be a non-empty string.")
 
-        final_max_tokens, temperature, top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        final_max_tokens, temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
         return self._generate_full_text(
@@ -396,7 +450,10 @@ class MlxGenerator:
             final_max_tokens,
             temperature,
             top_p,
+            top_k,
+            min_p,
             repetition_penalty,
+            presence_penalty,
             stop_tokens,
             prompt_tokens,
         )
@@ -406,24 +463,24 @@ class MlxGenerator:
         messages: list[dict[str, str]],
         *,
         config: Optional[GenerationConfig] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
     ) -> str:
+        """Non-streaming chat generation. All sampling params come from config."""
         if not messages:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
-        prompt = self._apply_chat_template(messages)
-        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        prompt = self._apply_chat_template(messages, enable_thinking=False)
+        final_max_tokens, temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
-        effective_temp = temperature if temperature is not None else resolved_temperature
-        effective_top_p = top_p if top_p is not None else resolved_top_p
         output = self._generate_full_text(
             prompt,
             final_max_tokens,
-            effective_temp,
-            effective_top_p,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
             repetition_penalty,
+            presence_penalty,
             stop_tokens,
             prompt_tokens,
         )
@@ -435,58 +492,41 @@ class MlxGenerator:
         *,
         config: Optional[GenerationConfig] = None,
         should_stop: Optional[callable] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
     ):
         """Streaming version of generate_chat that yields individual tokens.
 
-        Parameters
-        ----------
-        messages : list[dict[str, str]]
-            Chat messages (same format as generate_chat).
-        config : GenerationConfig | None
-            Generation parameters.
-        should_stop : callable | None
-            If provided, called periodically; returning True aborts generation.
-        temperature : float | None
-            When provided, overrides the model-size adaptive default.
-        top_p : float | None
-            When provided, overrides the model-size adaptive default.
+        All sampling parameters (temperature, top_p, top_k, min_p,
+        presence_penalty, repetition_penalty) are resolved from
+        ``GenerationConfig``.  Callers should set them there.
 
         Yields
         ------
         str
             Individual text tokens as they are generated.
-
-        Note
-        ----
-        Output sanitisation (stop-token truncation, thinking-block removal)
-        is applied incrementally.  The caller receives clean tokens and does
-        NOT need to post-process.
         """
         if not messages:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
-        prompt = self._apply_chat_template(messages)
-        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        prompt = self._apply_chat_template(messages, enable_thinking=False)
+        final_max_tokens, temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
-        effective_temp = temperature if temperature is not None else resolved_temperature
-        effective_top_p = top_p if top_p is not None else resolved_top_p
 
         try:
             from mlx_lm.generate import stream_generate
 
             yield from self._stream_tokens(
-                prompt, final_max_tokens, effective_temp, effective_top_p,
-                repetition_penalty, stop_tokens, prompt_tokens,
+                prompt, final_max_tokens, temperature, top_p,
+                top_k, min_p,
+                repetition_penalty, presence_penalty, stop_tokens, prompt_tokens,
                 should_stop=should_stop,
             )
         except ImportError:
             # Fallback: generate full output, yield as single token
             output = self._generate_full_text(
-                prompt, final_max_tokens, effective_temp, effective_top_p,
-                repetition_penalty, stop_tokens, prompt_tokens,
+                prompt, final_max_tokens, temperature, top_p,
+                top_k, min_p,
+                repetition_penalty, presence_penalty, stop_tokens, prompt_tokens,
             )
             output = self._strip_thinking_blocks(output)
             if output:
@@ -498,10 +538,10 @@ class MlxGenerator:
         *,
         config: Optional[GenerationConfig] = None,
         should_stop: Optional[callable] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
     ):
         """Stream chat with the model's reasoning chain exposed.
+
+        All sampling parameters are resolved from ``GenerationConfig``.
 
         Yields dicts::
             {"type": "thinking", "text": str}  — inside <think> block
@@ -516,13 +556,22 @@ class MlxGenerator:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
         prompt = self._apply_chat_template(messages, enable_thinking=True)
-        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+        final_max_tokens, resolved_temperature, resolved_top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
-        # Thinking mode: floor temperature and token budget to sensible minimums
-        effective_temp = max(temperature if temperature is not None else resolved_temperature, 0.6)
-        effective_top_p = max(top_p if top_p is not None else resolved_top_p, 0.9)
-        effective_max_tokens = max(final_max_tokens, 8192)
+        cfg = config or GenerationConfig()
+        # Thinking mode: use max_internal_tokens as the total cap (thinking + answer)
+        # Fall back to RAM-tier defaults if not set
+        if cfg.max_internal_tokens is not None:
+            effective_max_tokens = cfg.max_internal_tokens
+        else:
+            effective_max_tokens = max(final_max_tokens, 16384)
+        # Visible cap: max_tokens from config, or sensible default
+        visible_cap = cfg.max_tokens if cfg.max_tokens is not None else 2048
+
+        # Floor temperature and min budget to sensible minimums for thinking mode
+        effective_temp = max(resolved_temperature, 0.6)
+        effective_top_p = max(resolved_top_p, 0.9)
 
         try:
             from mlx_lm.generate import stream_generate  # noqa: F401 – confirm available
@@ -531,16 +580,21 @@ class MlxGenerator:
 
         yield from self._stream_tokens_thinking(
             prompt, effective_max_tokens, effective_temp, effective_top_p,
-            repetition_penalty, stop_tokens, prompt_tokens,
+            top_k, min_p,
+            repetition_penalty, presence_penalty, stop_tokens, prompt_tokens,
             should_stop=should_stop,
+            visible_cap=visible_cap,
         )
 
     def _stream_tokens_thinking(
         self, prompt: str, max_tokens: int, temperature: float, top_p: float,
-        repetition_penalty: Optional[float], stop_tokens: list[str],
+        top_k: int, min_p: float,
+        repetition_penalty: Optional[float], presence_penalty: Optional[float],
+        stop_tokens: list[str],
         prompt_tokens: int,
         *,
         should_stop: Optional[callable] = None,
+        visible_cap: Optional[int] = None,
     ):
         """Yield thinking/answer classified dicts from mlx-lm stream_generate.
 
@@ -554,7 +608,10 @@ class MlxGenerator:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
         )
 
         stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
@@ -566,6 +623,7 @@ class MlxGenerator:
         accumulated = ""
         in_think = True  # chat template pre-injects <think> into prompt tail
         token_count = 0
+        visible_count = 0
 
         for response in stream_generate(**generate_kwargs):
             if should_stop is not None and should_stop():
@@ -597,21 +655,34 @@ class MlxGenerator:
                         content = accumulated[:stop_match.start()]
                         if content:
                             yield {"type": "answer", "text": content}
+                            visible_count += len(content)
                         logger.info(
                             "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d "
-                            "time_s=%.2f (stop token)",
-                            self._model_id, prompt_tokens, token_count,
+                            "visible_tokens=%d time_s=%.2f (stop token)",
+                            self._model_id, prompt_tokens, token_count, visible_count,
                             time.perf_counter() - start_time,
                         )
                         return
                     safe = len(accumulated) - answer_boundary_guard
                     if safe > 0:
-                        yield {"type": "answer", "text": accumulated[:safe]}
+                        emit_text = accumulated[:safe]
+                        yield {"type": "answer", "text": emit_text}
+                        visible_count += len(emit_text)
                         accumulated = accumulated[safe:]
                     elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
                         yield {"type": "answer", "text": accumulated}
+                        visible_count += len(accumulated)
                         accumulated = ""
                     break
+
+                    # Enforce visible token cap (approximate — character-based)
+                    if visible_cap is not None and visible_count >= visible_cap * 4:
+                        logger.info(
+                            "Visible token cap reached (%d chars ≈ %d tokens)",
+                            visible_count, visible_cap,
+                        )
+                        # Flush remainder as-is and stop
+                        return
 
         # Flush remainder
         if accumulated:
@@ -619,16 +690,29 @@ class MlxGenerator:
             if stop_match:
                 accumulated = accumulated[:stop_match.start()]
             if accumulated:
-                yield {"type": "answer" if not in_think else "thinking", "text": accumulated}
+                chunk_type = "answer" if not in_think else "thinking"
+                yield {"type": chunk_type, "text": accumulated}
+                if chunk_type == "answer":
+                    visible_count += len(accumulated)
+
+        # Handle zero-visible-token edge case
+        if visible_count == 0 and token_count > 0:
+            logger.warning(
+                "Thinking budget exhausted: %d tokens generated but no visible answer produced",
+                token_count,
+            )
+            yield {"type": "error", "text": "THINKING_BUDGET_EXHAUSTED"}
 
         logger.info(
-            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d time_s=%.2f",
-            self._model_id, prompt_tokens, token_count, time.perf_counter() - start_time,
+            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d visible_chars=%d time_s=%.2f",
+            self._model_id, prompt_tokens, token_count, visible_count, time.perf_counter() - start_time,
         )
 
     def _stream_tokens(
         self, prompt: str, max_tokens: int, temperature: float, top_p: float,
-        repetition_penalty: Optional[float], stop_tokens: list[str],
+        top_k: int, min_p: float,
+        repetition_penalty: Optional[float], presence_penalty: Optional[float],
+        stop_tokens: list[str],
         prompt_tokens: int,
         *,
         should_stop: Optional[callable] = None,
@@ -644,7 +728,10 @@ class MlxGenerator:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
             repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
         )
 
         stop_pattern = self._get_stop_tokens_pattern(stop_tokens)

@@ -43,8 +43,8 @@ function generateId(): string {
 }
 
 const MODELS = [
-  { id: "regular", name: "Regular", description: "Qwen3-30B" },
-  { id: "deep-research", name: "Deep Research", description: "Qwen3-80B (64GB+)" },
+  { id: "regular", name: "Regular", description: "Qwen3.5-35B-A3B" },
+  { id: "deep-research", name: "Deep Research", description: "Qwen3.5-35B-A3B (Deep Retrieval + Thinking)" },
 ] as const;
 
 const BACKEND_BASE =
@@ -117,7 +117,7 @@ async function* freeformStreaming(
 // ---------------------------------------------------------------------------
 
 /**
- * Ask the 30B model for a 2-3 word title summarising the conversation.
+ * Ask the Qwen3.5-35B-A3B model for a 2-3 word title summarising the conversation.
  * Returns an empty string on any failure so the caller can fall back silently.
  */
 async function generateTitleFromConversation(
@@ -138,7 +138,7 @@ async function generateTitleFromConversation(
     const res = await fetch(`${BACKEND_BASE}/api/freeform/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: titlePromptMessages, model: "regular" }),
+      body: JSON.stringify({ messages: titlePromptMessages, model: "regular", enable_thinking: false }),
       signal: controller.signal,
     });
 

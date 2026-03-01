@@ -42,9 +42,9 @@ def _make_config(mode: str = "regular") -> ModelConfig:
             reranker_min_docs=2,
             retrieval_budget=8000,
         )
-    elif mode == "power-deep-research":
+    elif mode == "deep-research":
         return ModelConfig(
-            mode="power-deep-research",
+            mode="deep-research",
             llm_model="test-model",
             embedding_model="test-embed",
             reranker_model="test-reranker",
@@ -565,13 +565,13 @@ class TestModeComparison:
     def test_modes_differ_in_top_k(self):
         """Different modes should have different top_k parameters."""
         regular = _make_config("regular")
-        deep = _make_config("power-deep-research")
+        deep = _make_config("deep-research")
         assert deep.top_k_dense > regular.top_k_dense
         assert deep.top_k_final > regular.top_k_final
 
     def test_modes_differ_in_threshold(self):
         regular = _make_config("regular")
-        deep = _make_config("power-deep-research")
+        deep = _make_config("deep-research")
         assert deep.reranker_threshold < regular.reranker_threshold
 
 

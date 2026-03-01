@@ -314,3 +314,7 @@ class HealthResponse(BaseModel):
 
     status: str = "ok"
     engine_loaded: bool = False
+    system_ram_gb: Optional[float] = Field(
+        default=None,
+        description="Detected system RAM in GB, used by frontend for capability gating.",
+    )

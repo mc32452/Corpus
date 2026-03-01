@@ -9,11 +9,14 @@ import pytest
 from src.config import (
     VALID_MODES,
     MODE_RAM_REQUIREMENTS,
+    INTENT_GENERATION_PARAMS_REGULAR,
+    INTENT_GENERATION_PARAMS_DEEP_RESEARCH,
     ModelConfig,
     _auto_select_mode,
     _get_mode_config,
     select_mode_config,
     resolve_retrieval_params,
+    resolve_generation_params,
 )
 from src.metrics import (
     BudgetMetrics,
@@ -71,12 +74,12 @@ class TestModeConfig:
         assert config.reranker_threshold == 0.04
         assert config.reranker_min_docs == 4
 
-    def test_power_deep_research_mode(self):
-        """M4 Max 64GB calibration: aggressive but memory-safe."""
-        config = _get_mode_config("power-deep-research", ram_gb=64.0)
-        assert "80B" in config.llm_model or "Next" in config.llm_model
-        # Context sized for ~10GB KV cache, leaving 2GB OS buffer
-        assert config.context_window == 48_000
+    def test_deep_research_mode(self):
+        """Deep research: same model, deeper retrieval, 48GB+ RAM required."""
+        config = _get_mode_config("deep-research", ram_gb=48.0)
+        assert "35B" in config.llm_model or "A3B" in config.llm_model
+        # Context window 64K with 40K retrieval budget
+        assert config.context_window == 64_000
         assert config.retrieval_budget == 40_000
         # Wide initial retrieval, selective reranking
         assert config.top_k_dense == 400
@@ -121,14 +124,14 @@ class TestAutoModeSelection:
 
 class TestModeSelectionPrecedence:
     def test_cli_overrides_env(self):
-        with mock.patch.dict(os.environ, {"RAG_MODE": "power-deep-research"}):
+        with mock.patch.dict(os.environ, {"RAG_MODE": "deep-research"}):
             config = select_mode_config(manual_mode="regular")
             assert config.mode == "regular"
 
     def test_env_used_when_no_cli(self):
-        with mock.patch.dict(os.environ, {"RAG_MODE": "power-deep-research"}):
+        with mock.patch.dict(os.environ, {"RAG_MODE": "deep-research"}):
             config = select_mode_config(manual_mode=None)
-            assert config.mode == "power-deep-research"
+            assert config.mode == "deep-research"
 
     def test_auto_when_no_override(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -161,6 +164,15 @@ class TestModeSelectionPrecedence:
                 config = select_mode_config(manual_mode="power-fast")
                 assert config.mode == "regular"
 
+    def test_power_deep_research_legacy_mapping(self):
+        # power-deep-research is now deprecated and maps to deep-research
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = os.environ.copy()
+            env.pop("RAG_MODE", None)
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = select_mode_config(manual_mode="power-deep-research")
+                assert config.mode == "deep-research"
+
 
 # ===========================================================================
 # ModelConfig dataclass
@@ -174,14 +186,14 @@ class TestModelConfig:
 
     def test_retrieval_params_differ_by_mode(self):
         regular = _get_mode_config("regular", 64.0)
-        deep = _get_mode_config("power-deep-research", 64.0)
+        deep = _get_mode_config("deep-research", 64.0)
         # Deep research mode has wider initial retrieval net
         assert deep.top_k_dense > regular.top_k_dense
         assert deep.top_k_rerank > regular.top_k_rerank
 
     def test_thresholds_differ_by_mode(self):
         regular = _get_mode_config("regular", 64.0)
-        deep = _get_mode_config("power-deep-research", 64.0)
+        deep = _get_mode_config("deep-research", 64.0)
         # Deep research uses more permissive threshold for wider capture
         assert regular.reranker_threshold >= deep.reranker_threshold
 
@@ -335,3 +347,150 @@ class TestIntentRetrievalOverrides:
         params = resolve_retrieval_params(base, "FACTUAL")
         expected_threshold = base.reranker_threshold * 1.3
         assert abs(params.reranker_threshold - expected_threshold) < 1e-9
+
+
+# ===========================================================================
+# Intent sampling profiles
+# ===========================================================================
+
+class TestIntentSamplingProfiles:
+    """Tests for intent-to-sampling-profile resolution with both modes."""
+
+    def test_regular_mode_never_enables_thinking(self):
+        """Regular mode should never enable thinking for any intent."""
+        for intent_key in INTENT_GENERATION_PARAMS_REGULAR:
+            params = INTENT_GENERATION_PARAMS_REGULAR[intent_key]
+            assert params.enable_thinking is False, (
+                f"Regular mode intent {intent_key} should have enable_thinking=False"
+            )
+
+    def test_deep_research_thinking_intents(self):
+        """Deep-research mode should enable thinking for ANALYZE, COMPARE, CRITIQUE, EXPLAIN."""
+        thinking_intents = {"ANALYZE", "COMPARE", "CRITIQUE", "EXPLAIN"}
+        for intent_key in thinking_intents:
+            params = INTENT_GENERATION_PARAMS_DEEP_RESEARCH[intent_key]
+            assert params.enable_thinking is True, (
+                f"Deep-research intent {intent_key} should have enable_thinking=True"
+            )
+            # Thinking mode should use Qwen3.5 official sampling
+            assert params.temperature == 1.0, f"{intent_key}: expected temp=1.0"
+            assert params.top_p == 0.95, f"{intent_key}: expected top_p=0.95"
+
+    def test_deep_research_non_thinking_intents(self):
+        """Deep-research non-thinking intents should NOT enable thinking."""
+        non_thinking = {"FACTUAL", "OVERVIEW", "SUMMARIZE", "COLLECTION",
+                        "EXTRACT", "TIMELINE", "HOW_TO", "QUOTE_EVIDENCE"}
+        for intent_key in non_thinking:
+            params = INTENT_GENERATION_PARAMS_DEEP_RESEARCH[intent_key]
+            assert params.enable_thinking is False, (
+                f"Deep-research intent {intent_key} should have enable_thinking=False"
+            )
+
+    def test_resolve_generation_params_mode_selection(self):
+        """resolve_generation_params should return mode-specific profiles."""
+        regular_params = resolve_generation_params("ANALYZE", mode="regular")
+        deep_params = resolve_generation_params("ANALYZE", mode="deep-research")
+        # Regular: no thinking, lower temp
+        assert regular_params.enable_thinking is False
+        # Deep: thinking enabled, high temp
+        assert deep_params.enable_thinking is True
+        assert deep_params.temperature == 1.0
+
+    def test_presence_penalty_in_deep_research_thinking_intents(self):
+        """Deep-research thinking intents should have presence_penalty > 0."""
+        thinking_intents = {"ANALYZE", "COMPARE", "CRITIQUE", "EXPLAIN"}
+        for intent_key in thinking_intents:
+            params = INTENT_GENERATION_PARAMS_DEEP_RESEARCH[intent_key]
+            assert params.presence_penalty > 0, (
+                f"Deep-research thinking intent {intent_key} should have presence_penalty > 0"
+            )
+
+
+# ===========================================================================
+# Deep-research prompt divergence
+# ===========================================================================
+
+class TestDeepResearchPromptDivergence:
+    """Tests that deep-research prompt instructions diverge from regular."""
+
+    def test_thinking_intents_task_diverges(self):
+        """ANALYZE, COMPARE, CRITIQUE, EXPLAIN should have different task text
+        in deep-research vs regular."""
+        from src.generation import (
+            INTENT_INSTRUCTIONS_REGULAR,
+            INTENT_INSTRUCTIONS_DEEP_RESEARCH,
+        )
+        from src.intent import Intent
+        thinking_intents = [Intent.ANALYZE, Intent.COMPARE, Intent.CRITIQUE, Intent.EXPLAIN]
+        for intent in thinking_intents:
+            regular_task = INTENT_INSTRUCTIONS_REGULAR[intent]["task"]
+            deep_task = INTENT_INSTRUCTIONS_DEEP_RESEARCH[intent]["task"]
+            assert regular_task != deep_task, (
+                f"Deep-research {intent.value} task should differ from regular"
+            )
+
+    def test_thinking_intents_format_has_present_directly(self):
+        """Thinking-enabled intents in deep-research should contain 'present directly'."""
+        from src.generation import INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        from src.intent import Intent
+        for intent in [Intent.ANALYZE, Intent.COMPARE, Intent.CRITIQUE, Intent.EXPLAIN]:
+            fmt = INTENT_INSTRUCTIONS_DEEP_RESEARCH[intent]["format"]
+            assert "present" in fmt.lower() and "directly" in fmt.lower(), (
+                f"Deep-research {intent.value} format should contain 'present directly'"
+            )
+
+    def test_non_thinking_intents_have_exhaustiveness(self):
+        """Non-thinking intents in deep-research should have longer task text
+        (exhaustiveness additions)."""
+        from src.generation import (
+            INTENT_INSTRUCTIONS_REGULAR,
+            INTENT_INSTRUCTIONS_DEEP_RESEARCH,
+        )
+        from src.intent import Intent
+        non_thinking = [
+            Intent.FACTUAL, Intent.OVERVIEW, Intent.SUMMARIZE, Intent.COLLECTION,
+            Intent.EXTRACT, Intent.TIMELINE, Intent.HOW_TO, Intent.QUOTE_EVIDENCE,
+        ]
+        for intent in non_thinking:
+            regular_task = INTENT_INSTRUCTIONS_REGULAR[intent]["task"]
+            deep_task = INTENT_INSTRUCTIONS_DEEP_RESEARCH[intent]["task"]
+            assert len(deep_task) > len(regular_task), (
+                f"Deep-research {intent.value} task should be longer than regular "
+                f"(exhaustiveness additions)"
+            )
+
+    def test_non_thinking_intents_format_unchanged(self):
+        """Non-thinking intents should keep the same format as regular."""
+        from src.generation import (
+            INTENT_INSTRUCTIONS_REGULAR,
+            INTENT_INSTRUCTIONS_DEEP_RESEARCH,
+        )
+        from src.intent import Intent
+        non_thinking = [
+            Intent.FACTUAL, Intent.OVERVIEW, Intent.SUMMARIZE, Intent.COLLECTION,
+            Intent.EXTRACT, Intent.TIMELINE, Intent.HOW_TO, Intent.QUOTE_EVIDENCE,
+        ]
+        for intent in non_thinking:
+            regular_fmt = INTENT_INSTRUCTIONS_REGULAR[intent]["format"]
+            deep_fmt = INTENT_INSTRUCTIONS_DEEP_RESEARCH[intent]["format"]
+            assert regular_fmt == deep_fmt, (
+                f"Deep-research {intent.value} format should be unchanged from regular"
+            )
+
+
+# ===========================================================================
+# Deep-research RAM gating
+# ===========================================================================
+
+class TestDeepResearchRamGating:
+    """Tests for RAM-based gating of deep-research mode."""
+
+    def test_deep_research_requires_48gb(self):
+        """Deep-research mode should require 48GB+ RAM."""
+        assert MODE_RAM_REQUIREMENTS.get("deep-research", 0) >= 48.0
+
+    def test_deep_research_low_ram_falls_back(self):
+        """Deep-research with <48GB RAM should fall back to regular."""
+        config = _get_mode_config("deep-research", ram_gb=32.0)
+        # Should fall back to regular mode parameters
+        assert config.mode == "regular"

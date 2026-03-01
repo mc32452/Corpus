@@ -147,6 +147,10 @@ Boilerplate filtering removes known LLM-speak ("as an AI", "as a language model"
   - Incremental `<think>...</think>` block filtering
   - On-the-fly stop-token detection (regex pattern matching with boundary guards)
   - 500-char buffer limit to prevent unbounded accumulation
+- **Thinking mode:** `stream_chat_with_thinking()` exposes the model's internal reasoning chain as `{"type": "thinking"}` / `{"type": "answer"}` dicts. Controlled via `enable_thinking` template parameter. Temperature/top_p floored to thinking-mode minimums (0.6 / 0.9).
+- **Dual token budget:** Thinking mode uses `max_internal_tokens` (total thinking+answer cap) and `max_tokens` (visible answer cap). Zero-visible-token detection yields `THINKING_BUDGET_EXHAUSTED` error.
+- **Sampling parameters:** All params (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty`) flow through `GenerationConfig`. No separate kwargs on public methods.
+- **Presence penalty:** Pure-MLX logits processor subtracts a fixed penalty from logits of unique previously-seen tokens (reduces repetitive phrasing without affecting new vocabulary).
 - **Repetition penalty:** Native mlx-lm `make_logits_processors()` or fallback pure-MLX ops
 - **Adaptive defaults:** Temperature/top_p/repetition_penalty tuned by model size (<30B, 30-70B, 70B+)
 - **Token budget packing:** Greedy packing with early termination (3 consecutive failures), optional sentence-boundary truncation
@@ -182,7 +186,7 @@ Intent-aware message builder producing chat-format messages:
   - `TIMELINE` → `[DATE] — event (1-2 sentences)` format; `→` for causal links; gap note appended.
   - `HOW_TO` → numbered steps with imperative phrasing; sub-steps as indented bullets; closes with outcome sentence.
   - `QUOTE_EVIDENCE` → block-quote format (`> "exact quote"`) each followed by one relevance sentence; max 5 quotes.
-- **Deep Research mode:** `INTENT_INSTRUCTIONS_DEEP_RESEARCH` dict mirrors `INTENT_INSTRUCTIONS_REGULAR`; resolved via `_get_intent_instructions(mode)`.
+- **Deep Research mode:** `INTENT_INSTRUCTIONS_DEEP_RESEARCH` diverges from `INTENT_INSTRUCTIONS_REGULAR` for thinking-enabled intents (ANALYZE, COMPARE, CRITIQUE, EXPLAIN): reasoning scaffolding is removed since the model's internal thinking phase handles it; visible output instructions describe the finished product. Non-thinking intents (FACTUAL, OVERVIEW, SUMMARIZE, COLLECTION, EXTRACT, TIMELINE, HOW_TO, QUOTE_EVIDENCE) get exhaustiveness additions to leverage deeper retrieval. Resolved via `_get_intent_instructions(mode)`.
 - **Citation rules:** When enabled, adds mandatory `[N]` inline citation format; passes `PASSAGE N` labeling into context. (Always on via UI)
 - **Source legend:** Maps source IDs to display names when they differ.
 - **Context-sparsity warning:** Injects an explicit anti-hallucination warning when retrieved context fills <10% of retrieval budget.
@@ -195,6 +199,8 @@ Central orchestrator consumed by both CLI and API:
 - **`RagEngine`**: Lazy-loads models on first query (embedding, reranker, generator, intent classifier)
 - **`query()`**: Synchronous path returning `QueryResult` (answer, intent, citations, metrics, latency)
 - **`query_events()`**: Streaming path yielding `QueryEvent` objects (status, intent, sources, citations, tokens, errors, finish)
+- **`enable_thinking` tri-state**: `None` (auto, intent-driven), `True` (user forced on), `False` (user forced off). RAM gating overrides to `False` when system RAM < 48GB.
+- **Intent-gated thinking**: In deep-research mode, ANALYZE/COMPARE/CRITIQUE/EXPLAIN auto-enable thinking with Qwen3.5 official sampling (temp=1.0, top_p=0.95); other intents use non-thinking profiles (temp=0.3–0.7).
 - **`ingest()`**: Ingests document, embeds chunks, optionally summarizes
 - **Output sanitization:** `_sanitize_output()` strips instruction leakage ("Important:", "Task:", "Format:", "Tone:"), filler phrases, and deduplicates repeated halves (>85% similarity). Retrieval jargon normalization (chunk/vector-search references) was removed; the prompt now enforces this directly via system instructions.
 - **Unified query pipeline:** `query()` and `query_events()` share a single `_query_pipeline()` implementation; the synchronous path collects events from the async generator rather than duplicating logic.
@@ -220,7 +226,7 @@ FastAPI application with streaming support:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/health` | GET | Engine status check |
+| `/api/health` | GET | Engine status + system RAM (GB) |
 | `/api/chat` | POST | Streaming chat (AI SDK text/plain format) |
 | `/api/query` | POST | Query with optional SSE stream (`stream=true`) |
 | `/api/sources` | GET | List ingested sources with metadata |
@@ -334,20 +340,23 @@ Current active modes (`VALID_MODES`) with RAM-aware scaling in `regular`:
 
 | Mode | LLM Model | Context Window | Retrieval Budget | RAM |
 |------|-----------|----------------|------------------|-----|
-| `regular` (32-47GB) | Qwen3.5-35B-A3B-Instruct-2507-4bit | 16K | 8K | 32GB+ |
-| `regular` (48-63GB) | Qwen3.5-35B-A3B-Instruct-2507-4bit | 64K | 32K | 48GB+ |
-| `regular` (64GB+) | Qwen3.5-35B-A3B-Instruct-2507-4bit | 64K | 48K | 64GB+ |
-| `power-deep-research` | Qwen3-Next-80B-A3B-Instruct-4bit | 48K | 40K | 64GB+ |
+| `regular` (32-47GB) | Qwen3.5-35B-A3B-4bit | 16K | 8K | 32GB+ |
+| `regular` (48-63GB) | Qwen3.5-35B-A3B-4bit | 64K | 32K | 48GB+ |
+| `regular` (64GB+) | Qwen3.5-35B-A3B-4bit | 64K | 48K | 64GB+ |
+| `deep-research` (48-63GB) | Qwen3.5-35B-A3B-4bit | 64K | 40K | 48GB+ |
+| `deep-research` (64GB+) | Qwen3.5-35B-A3B-4bit | 64K | 40K | 64GB+ |
+
+All modes use the same model (`NexVeridian/Qwen3.5-35B-A3B-Instruct-2507-4bit`). Deep-research mode differentiates through deeper retrieval, intent-gated thinking, and divergent prompt instructions.
 
 All modes share: Qwen3-Embedding-0.6B-4bit-DWQ (embeddings) + jinaai/jina-reranker-v3-mlx (reranker).
 
 ### 5.2 Mode Selection Precedence
 
-1. CLI flag: `--mode regular|power-deep-research`
+1. CLI flag: `--mode regular|deep-research`
 2. Environment variable: `RAG_MODE=<mode>`
 3. Auto-detection: defaults to `regular` with RAM-based parameter scaling
 
-Legacy mode names (`high`, `efficiency`, `power-fast`, etc.) are mapped to current modes with deprecation warning.
+Legacy mode names (`high`, `efficiency`, `power-fast`, `power-deep-research`, etc.) are mapped to current modes with deprecation warning.
 
 ### 5.3 Retrieval Parameters by Mode
 
@@ -360,11 +369,30 @@ Legacy mode names (`high`, `efficiency`, `power-fast`, etc.) are mapped to curre
 | `reranker_threshold` | 0.05 | 0.05 | 0.04 | 0.04 |
 | `reranker_min_docs` | 3 | 3 | 4 | 4 |
 
+### 5.4 Sampling Profiles
+
+| Profile | Temperature | top_p | top_k | min_p | presence_penalty |
+|---------|-------------|-------|-------|-------|------------------|
+| Regular (non-thinking) | 0.3–0.7 | 0.6–0.8 | 20 | 0.0 | 0.0 |
+| Deep-research (non-thinking) | 0.3–0.7 | 0.6–0.8 | 20 | 0.0 | 1.5 |
+| Deep-research (thinking) | 1.0 | 0.95 | 20 | 0.0 | 1.5 |
+
+Thinking-mode profiles follow Qwen3.5 official recommendations. The model template controls thinking via `enable_thinking=True/False`.
+
+### 5.5 Dual Token Budgets (Thinking Mode)
+
+| RAM Tier | Internal Cap (thinking+answer) | Visible Cap (answer only) |
+|----------|-------------------------------|---------------------------|
+| 48–63GB | 16,384 | 2,048 |
+| 64GB+ | 20,480 | 4,096 |
+
+If the model consumes the entire internal budget on thinking without producing visible tokens, a `THINKING_BUDGET_EXHAUSTED` error is returned.
+
 **Note:** `FACTUAL` intent overrides `reranker_min_docs` to **1**. This prevents below-threshold guard rails from pulling in loosely related chunks when the query is a narrow factual lookup. Below-threshold expansion is also scoped to sources that already have at least one above-threshold hit, preventing expansion from sources with zero relevant material.
 | Reranker enabled | Yes | Yes | Yes | Yes |
 | Context expansion | Yes | Yes | Yes | Yes |
 
-### 5.4 System Detection
+### 5.6 System Detection
 
 RAM detection cascade: `psutil` -> macOS `sysctl -n hw.memsize` -> Linux `os.sysconf`. Result cached globally.
 

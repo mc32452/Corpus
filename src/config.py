@@ -53,6 +53,11 @@ class IntentRetrievalOverrides:
 class IntentGenerationParams:
     temperature: float
     top_p: float
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
+    enable_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,19 +87,38 @@ INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
     "QUOTE_EVIDENCE": IntentRetrievalOverrides(top_k_dense_scale=0.9, top_k_fused_scale=0.7, top_k_final_scale=0.8, reranker_threshold_scale=1.35, reranker_min_docs=1),
 }
 
-INTENT_GENERATION_PARAMS: dict[str, IntentGenerationParams] = {
-    "FACTUAL":    IntentGenerationParams(temperature=0.1, top_p=0.2),
-    "SUMMARIZE":  IntentGenerationParams(temperature=0.3, top_p=0.6),
-    "EXPLAIN":    IntentGenerationParams(temperature=0.4, top_p=0.7),
-    "ANALYZE":    IntentGenerationParams(temperature=0.4, top_p=0.7),
-    "COMPARE":    IntentGenerationParams(temperature=0.35, top_p=0.65),
-    "CRITIQUE":   IntentGenerationParams(temperature=0.45, top_p=0.75),
-    "COLLECTION": IntentGenerationParams(temperature=0.2, top_p=0.4),
-    "EXTRACT":    IntentGenerationParams(temperature=0.15, top_p=0.3),
-    "TIMELINE":   IntentGenerationParams(temperature=0.2, top_p=0.4),
-    "HOW_TO":     IntentGenerationParams(temperature=0.3, top_p=0.6),
-    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.1, top_p=0.2),
+INTENT_GENERATION_PARAMS_REGULAR: dict[str, IntentGenerationParams] = {
+    "FACTUAL":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "SUMMARIZE":      IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXPLAIN":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "ANALYZE":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "COMPARE":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "CRITIQUE":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "COLLECTION":     IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "OVERVIEW":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXTRACT":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+    "TIMELINE":       IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.0, repetition_penalty=1.0, enable_thinking=False),
+    "HOW_TO":         IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
 }
+
+INTENT_GENERATION_PARAMS_DEEP_RESEARCH: dict[str, IntentGenerationParams] = {
+    "FACTUAL":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "SUMMARIZE":      IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXPLAIN":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "ANALYZE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "COMPARE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "CRITIQUE":       IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "COLLECTION":     IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "OVERVIEW":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXTRACT":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+    "TIMELINE":       IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.0, repetition_penalty=1.0, enable_thinking=False),
+    "HOW_TO":         IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+}
+
+# Backward-compatible alias
+INTENT_GENERATION_PARAMS = INTENT_GENERATION_PARAMS_REGULAR
 
 
 def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedRetrievalParams:
@@ -120,9 +144,18 @@ def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedR
     )
 
 
-def resolve_generation_params(intent: str) -> IntentGenerationParams:
-    """Return generation params for intent. Falls back to SUMMARIZE if unrecognized."""
-    return INTENT_GENERATION_PARAMS.get(intent.upper(), INTENT_GENERATION_PARAMS["SUMMARIZE"])
+def resolve_generation_params(intent: str, mode: str = "regular") -> IntentGenerationParams:
+    """Return generation params for intent and mode. Falls back to OVERVIEW if unrecognized."""
+    if mode == "deep-research":
+        params = INTENT_GENERATION_PARAMS_DEEP_RESEARCH.get(intent.upper())
+        if params is not None:
+            return params
+    params = INTENT_GENERATION_PARAMS_REGULAR.get(intent.upper())
+    if params is not None:
+        return params
+    return INTENT_GENERATION_PARAMS_REGULAR.get("OVERVIEW", IntentGenerationParams(
+        temperature=0.7, top_p=0.8, enable_thinking=False,
+    ))
 
 
 def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
@@ -173,17 +206,18 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
                 system_ram_gb=ram_gb,
             )
 
-    elif mode == "power-deep-research":
-        if ram_gb < 64:
-            logger.warning(f"power-deep-research mode requires 64GB+ RAM. Detected {ram_gb:.0f}GB.")
+    elif mode == "deep-research":
+        if ram_gb < 48:
+            logger.warning(
+                "deep-research mode requires 48GB+ RAM. Detected %.0fGB. "
+                "Falling back to regular mode.",
+                ram_gb,
+            )
+            return _get_mode_config("regular", ram_gb)
         return ModelConfig(
-            mode="power-deep-research",
-            llm_model="mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit",
-            embedding_model="mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-            reranker_model="jinaai/jina-reranker-v3-mlx",
-            embedding_device="cpu",
-            quantization="4-bit",
-            context_window=48_000,
+            mode="deep-research",
+            **_REGULAR_MODELS,
+            context_window=64_000,
             retrieval_budget=40_000,
             top_k_dense=400,
             top_k_sparse=400,
@@ -200,10 +234,10 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
     raise ValueError(f"Unknown mode: {mode}")
 
 
-VALID_MODES = {"regular", "power-deep-research"}
+VALID_MODES = {"regular", "deep-research"}
 MODE_RAM_REQUIREMENTS: dict[str, float] = {
     "regular": 32.0,
-    "power-deep-research": 64.0,
+    "deep-research": 48.0,
 }
 
 
@@ -297,6 +331,7 @@ def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
         "power-fast": "regular",  # Deprecated: use 'regular' which auto-scales
         "efficiency": "regular",
         "tier2": "regular",
+        "power-deep-research": "deep-research",  # Legacy: consolidated to single model
     }
     if mode in legacy_mapping:
         old_mode = mode

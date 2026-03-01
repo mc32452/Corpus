@@ -79,6 +79,24 @@ def encode_text_end(text_id: str = "text-0") -> str:
     return _encode_sse_payload({"type": "text-end", "id": text_id})
 
 
+def encode_reasoning_start(reasoning_id: str = "reasoning-0") -> str:
+    """Open a reasoning (thinking) block in the AI SDK UI message stream.
+
+    Must precede any ``encode_reasoning_delta`` calls with the same *reasoning_id*.
+    """
+    return _encode_sse_payload({"type": "reasoning-start", "id": reasoning_id})
+
+
+def encode_reasoning_delta(delta: str, reasoning_id: str = "reasoning-0") -> str:
+    """Emit one streaming reasoning token."""
+    return _encode_sse_payload({"type": "reasoning-delta", "id": reasoning_id, "delta": delta})
+
+
+def encode_reasoning_end(reasoning_id: str = "reasoning-0") -> str:
+    """Close the reasoning block.  Must follow all ``encode_reasoning_delta`` calls."""
+    return _encode_sse_payload({"type": "reasoning-end", "id": reasoning_id})
+
+
 # Legacy alias kept for any code still calling encode_text directly.
 # Emits all three frames inline — only safe for single-token responses.
 def encode_text(token: str) -> str:  # noqa: D401

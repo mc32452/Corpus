@@ -116,7 +116,7 @@ class TestEndToEnd:
                 reranker_threshold=0.0, reranker_min_docs=1,
                 retrieval_budget=8000,
             )
-        else:  # power-deep-research
+        else:  # deep-research
             model_config = ModelConfig(
                 mode=mode, llm_model="test", embedding_model="test",
                 reranker_model="test",
@@ -253,7 +253,7 @@ class TestEndToEnd:
     def test_e2e_all_queries_all_modes(self):
         """Run all fixed queries across all modes, collecting comprehensive metrics."""
         valid_queries = [q for q in FIXED_QUERIES if q.strip()]
-        modes = ["regular", "power-deep-research"]
+        modes = ["regular", "deep-research"]
         all_results: list[dict] = []
 
         for mode in modes:

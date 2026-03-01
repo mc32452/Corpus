@@ -10,6 +10,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { TypewriterText } from "@/components/ui/typewriter-text";
 import { useAppState } from "@/context/app-context";
 import { useSpeechToText } from "@/hooks/useSpeechToText";
+import { useSystemRam } from "@/hooks/useSystemRam";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -21,12 +22,14 @@ import {
   MessagePrimitive,
   SuggestionPrimitive,
   ThreadPrimitive,
+  useAssistantApi,
   useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  BrainIcon,
   CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -38,7 +41,7 @@ import {
   RefreshCwIcon,
   SquareIcon,
 } from "lucide-react";
-import { type FC, useCallback, useEffect, useRef, useState } from "react";
+import { type FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 export const Thread: FC = () => {
   return (
@@ -142,9 +145,9 @@ const ThreadSuggestionItem: FC = () => {
 };
 
 
-const MODES = [
+const ALL_MODES = [
   { id: "regular", name: "Regular", description: "Qwen3.5-35B-A3B" },
-  { id: "deep-research", name: "Deep Research", description: "Qwen3-Next-80B-A3B" },
+  { id: "deep-research", name: "Deep Research", description: "Qwen3.5-35B-A3B (Deep Retrieval + Thinking)", minRamGb: 48 },
 ];
 
 const ComposerSpeechButton: FC<{ disabled?: boolean }> = ({ disabled = false }) => {
@@ -263,9 +266,29 @@ const ComposerSpeechButton: FC<{ disabled?: boolean }> = ({ disabled = false }) 
 
 const Composer: FC = () => {
   const aui = useAui();
+  const api = useAssistantApi();
   const isEmpty = useAuiState((s) => s.composer.isEmpty);
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const systemRamGb = useSystemRam();
+  const canThink = systemRamGb !== null && systemRamGb >= 48;
+  const [thinkingEnabled, setThinkingEnabled] = useState<boolean | null>(null);
+
+  // Gate modes by available RAM
+  const modes = useMemo(
+    () =>
+      ALL_MODES.filter(
+        (m) => !m.minRamGb || (systemRamGb !== null && systemRamGb >= m.minRamGb),
+      ),
+    [systemRamGb],
+  );
+
+  // Register enableThinking in model context so the backend receives it
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const config = { config: { enableThinking: thinkingEnabled } as any };
+    return api.modelContext().register({ getModelContext: () => config });
+  }, [api, thinkingEnabled]);
 
   useEffect(() => {
     const el = inputRef.current;
@@ -310,9 +333,43 @@ const Composer: FC = () => {
           }}
         />
 
+        {/* Think toggle — visible when system has 48GB+ RAM */}
+        {canThink && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() =>
+                  setThinkingEnabled((v) =>
+                    v === null ? true : v === true ? false : null,
+                  )
+                }
+                className={cn(
+                  "shrink-0 inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs leading-none font-medium transition-colors hover:bg-white/10",
+                  thinkingEnabled === true
+                    ? "text-blue-400 ring-1 ring-inset ring-blue-400/40"
+                    : thinkingEnabled === false
+                      ? "text-muted-foreground/40"
+                      : "text-muted-foreground",
+                )}
+              >
+                <BrainIcon className="size-3.5 shrink-0" />
+                <span className={cn(thinkingEnabled === false && "line-through")}>Think</span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {thinkingEnabled === true
+                ? "Thinking forced on — click to force off"
+                : thinkingEnabled === false
+                  ? "Thinking forced off — click for auto"
+                  : "Thinking auto (intent-driven) — click to force on"}
+            </TooltipContent>
+          </Tooltip>
+        )}
+
         {/* Model selector — always visible */}
         <ModelSelector
-          models={MODES}
+          models={modes}
           defaultValue="regular"
           variant="ghost"
           size="sm"
@@ -380,7 +437,7 @@ const AssistantMessage: FC = () => {
       {/* only render the bubble once text begins to arrive */}
       {messageText.length > 0 && (
         <div
-          className="aui-assistant-message-content wrap-break-word px-4 py-3 text-foreground text-base leading-[1.65] bg-white/10 backdrop-blur-lg"
+          className="aui-assistant-message-content wrap-break-word px-4 py-3 text-foreground text-base leading-[1.65] bg-white/10 backdrop-blur-lg [&_p]:my-3 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-7 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-7 [&_li]:leading-relaxed [&_li+li]:mt-2.5 [&_li>p]:my-0"
           style={{
             borderRadius: "18px 18px 18px 4px",
           }}

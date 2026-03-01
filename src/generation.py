@@ -329,15 +329,139 @@ INTENT_INSTRUCTIONS_REGULAR: dict[Intent, dict[str, str]] = {
 
 # ---------------------------------------------------------------------------
 # Deep Research mode
-# Placeholder: deep research instructions will diverge in a future iteration.
-# Currently identical to regular instructions.
+# Intent instructions diverge from regular mode in two ways:
+# 1. Thinking-enabled intents (ANALYZE, COMPARE, CRITIQUE, EXPLAIN) get
+#    rewritten task/format: reasoning scaffolding is removed because the
+#    model's internal thinking phase handles it. Visible output instructions
+#    describe the finished product, not how to reason about it.
+# 2. Non-thinking intents get exhaustiveness additions to their task field
+#    to leverage the deeper retrieval budget in deep-research mode.
 # ---------------------------------------------------------------------------
 
-# Per-intent shallow copy so that future mutations to individual intent configs
-# in this dict do not bleed back into INTENT_INSTRUCTIONS_REGULAR.
+# Start from a per-intent shallow copy so mutations don't bleed back.
 INTENT_INSTRUCTIONS_DEEP_RESEARCH: dict[Intent, dict[str, str]] = {
     intent: dict(cfg) for intent, cfg in INTENT_INSTRUCTIONS_REGULAR.items()
 }
+
+# ── 8.2  Rewrite task/format for thinking-enabled intents ─────────────────
+
+_PRESENT_DIRECTLY = (
+    "Present your analysis directly. State your findings and support them "
+    "with evidence from the passages. Do not walk through your reasoning "
+    "step by step or narrate how you arrived at your conclusions."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.ANALYZE] = {
+    **INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.ANALYZE],
+    "task": (
+        "Synthesize patterns and relationships across all provided passages. "
+        "Identify where evidence converges or conflicts, assess the significance "
+        "of what you find, and flag what the sources collectively leave unaddressed. "
+        "Go beyond description to explain causes, relationships, and significance."
+    ),
+    "format": (
+        "Write 4\u20136 short paragraphs. Use blank lines between paragraphs.\n\n"
+        + _PRESENT_DIRECTLY + "\n\n"
+        "Write in prose \u2014 no bullet points."
+    ),
+}
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.COMPARE] = {
+    **INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.COMPARE],
+    "task": (
+        "Go beyond listing similarities and differences. Analyze what drives "
+        "the disagreements, evaluate which differences are substantively "
+        "significant versus superficial, and identify unstated assumptions "
+        "that explain why the positions diverge. If the sources share common "
+        "ground, assess how robust that agreement is."
+    ),
+    "format": (
+        "Write 4\u20137 short paragraphs. Use blank lines between paragraphs.\n\n"
+        + _PRESENT_DIRECTLY + "\n\n"
+        "Write in prose \u2014 no bullet points."
+    ),
+}
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.CRITIQUE] = {
+    **INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.CRITIQUE],
+    "task": (
+        "Evaluate argument strength, evidence quality, logical consistency, "
+        "and unstated assumptions. Deliver a clear evaluative judgment, not "
+        "just a list of strengths and weaknesses. If the text is one-sided, "
+        "say so and assess how well the one-sided case is made. You may note "
+        "what the text leaves unaddressed but should label omissions clearly. "
+        "Do NOT fabricate counterarguments not present in the context."
+    ),
+    "format": (
+        "Write 4\u20136 short paragraphs. Use blank lines between paragraphs.\n\n"
+        + _PRESENT_DIRECTLY + "\n\n"
+        "Write in prose \u2014 no bullet points."
+    ),
+}
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.EXPLAIN] = {
+    **INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.EXPLAIN],
+    "task": (
+        "Build a layered explanation that connects the core concept to its "
+        "broader implications and practical significance. Anticipate where "
+        "a reader would get confused and address those points proactively. "
+        "If the concept relates to other ideas in the provided material, "
+        "draw those connections. Do NOT introduce facts, definitions, or "
+        "topics not present in the context."
+    ),
+    "format": (
+        "Write 3\u20135 paragraphs, one concept per paragraph. "
+        "Where possible, use an analogy or everyday comparison to make the "
+        "key idea concrete.\n\n"
+        + _PRESENT_DIRECTLY
+    ),
+}
+
+# ── 8.3  Append exhaustiveness sentences to non-thinking intents ──────────
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.FACTUAL]["task"] += (
+    " Examine every provided passage before answering. Where multiple passages "
+    "address the question, corroborate across them and note any discrepancies."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.OVERVIEW]["task"] += (
+    " Draw on all provided passages to give a comprehensive overview. "
+    "Do not anchor on a single source when others provide additional scope."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.SUMMARIZE]["task"] += (
+    " Synthesize across all provided passages. Ensure claims from lower-ranked "
+    "passages are not omitted if they introduce distinct points not covered "
+    "by higher-ranked ones."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.COLLECTION]["task"] += (
+    " Be thorough \u2014 describe every document represented in the provided "
+    "summaries, not just the most prominent ones."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.EXTRACT]["task"] += (
+    " Examine every provided passage exhaustively. Do not stop after finding "
+    "the first match \u2014 continue through all passages to ensure completeness."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.TIMELINE]["task"] += (
+    " Check every provided passage for dates and events. Ensure the timeline "
+    "reflects the full range of the provided material, not just the most "
+    "prominent passages."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.HOW_TO]["task"] += (
+    " Draw on all provided passages to capture the complete procedure. "
+    "If different passages describe overlapping or complementary steps, "
+    "reconcile them into a coherent sequence."
+)
+
+INTENT_INSTRUCTIONS_DEEP_RESEARCH[Intent.QUOTE_EVIDENCE]["task"] += (
+    " Search every provided passage for relevant quotes. Do not stop at "
+    "the first few matches \u2014 the most relevant evidence may appear in "
+    "less prominent passages."
+)
 
 # Backward-compatible alias
 INTENT_INSTRUCTIONS = INTENT_INSTRUCTIONS_REGULAR
@@ -345,7 +469,7 @@ INTENT_INSTRUCTIONS = INTENT_INSTRUCTIONS_REGULAR
 
 def _get_intent_instructions(mode: Optional[str] = None) -> dict[Intent, dict[str, str]]:
     """Return the intent instruction set for the given operating mode."""
-    if mode == "power-deep-research":
+    if mode == "deep-research":
         return INTENT_INSTRUCTIONS_DEEP_RESEARCH
     return INTENT_INSTRUCTIONS_REGULAR
 
