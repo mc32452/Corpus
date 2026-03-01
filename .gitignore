@@ -48,3 +48,7 @@ chroma/
 # Allow specific markdown files
 !tests/README.md
 !tests/TEST_REPORT.md
+
+# Ignore unsaved/scratch editor files created by VS Code or browsers
+# e.g. "Untitled-1", "Untitled-7" from DevTools/Editor paste
+Untitled*
