@@ -95,6 +95,21 @@ _ensure_app_logging()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Tuning constants (were previously magic numbers scattered in handler bodies)
+# ---------------------------------------------------------------------------
+
+# SSE keepalive ping interval (seconds) — prevents client-side timeout
+# during long model loads.
+_KEEPALIVE_INTERVAL_S: float = 8.0
+
+# Timeout for waiting on the producer thread to finish after the consumer
+# exits or the client disconnects.
+_PRODUCER_CLEANUP_TIMEOUT_S: float = 5.0
+
+# Maximum upload size (bytes) — 50 MB
+_MAX_UPLOAD_BYTES: int = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
 # Module-level state (set during lifespan)
 # ---------------------------------------------------------------------------
 
@@ -102,6 +117,9 @@ _engine: object | None = None        # the single currently-loaded RagEngine
 _engine_mode: str | None = None      # which mode that engine was built for
 _engine_init_lock = threading.Lock()
 _engine_loaded: bool = False
+
+# Single-user concurrency guard: only one chat/freeform stream at a time.
+_chat_lock = asyncio.Lock()
 
 # Map frontend model IDs (from assistant-ui ModelSelector) to backend mode strings
 _FRONTEND_MODE_MAP: dict[str, str] = {
@@ -193,7 +211,7 @@ async def lifespan(app: FastAPI):
         try:
             _engine.close()  # type: ignore[union-attr]
         except Exception:
-            pass
+            logger.warning("Error closing engine during shutdown", exc_info=True)
         _engine = None
         _engine_mode = None
     _engine_loaded = False
@@ -426,12 +444,16 @@ async def _chat_stream_generator(
 
     logger.info("Chat request: frontend model=%r → backend mode=%r, intent_override=%r, enable_thinking=%r", frontend_model_name, request_mode, intent_override, enable_thinking)
 
+    # Pin the engine reference before spawning the producer thread (H2).
+    # This prevents a concurrent mode swap from closing the engine mid-stream.
+    pinned_engine = await asyncio.to_thread(_get_engine, request_mode)
+
     # --- Producer: runs in thread, pushes events to queue ---
     def _producer() -> None:
         try:
             logger.info("Chat producer: thread started")
-            engine = _get_engine(request_mode)
-            logger.info("Chat producer: _get_engine() returned, starting query_events")
+            engine = pinned_engine
+            logger.info("Chat producer: using pinned engine, starting query_events")
             for event in engine.query_events(
                 query_text,
                 source_id=source_id,
@@ -458,7 +480,7 @@ async def _chat_stream_generator(
     # --- Consumer: read events from queue, encode, yield ---
     # Use a timeout so we can yield keepalive bytes during long model loads and avoid client timeout
     first_event = True
-    keepalive_interval = 8.0
+    keepalive_interval = _KEEPALIVE_INTERVAL_S
 
     # Track streaming block state (AI SDK v6 text-start/delta/end and reasoning-start/delta/end)
     text_id = "text-0"
@@ -526,7 +548,7 @@ async def _chat_stream_generator(
         stop_event.set()
         # Wait for producer thread to finish
         try:
-            await asyncio.wait_for(producer_task, timeout=5.0)
+            await asyncio.wait_for(producer_task, timeout=_PRODUCER_CLEANUP_TIMEOUT_S)
         except (asyncio.TimeoutError, Exception):
             pass
 
@@ -538,26 +560,35 @@ async def _chat_stream_generator(
 async def chat(request: Request, chat_request: ChatRequest):
     """Stream a chat response using the AI SDK Data Stream Protocol.
 
-    Streams responses without server-side chat request locking.
+    Uses ``_chat_lock`` to enforce single-user concurrency — only one
+    chat stream may be active at a time.
     """
+    if _chat_lock.locked():
+        logger.warning("Chat: rejected — another request is in progress")
+        return JSONResponse(
+            status_code=429,
+            content=http_error_body("LOCK_BUSY", "Another query is already in progress"),
+        )
+
     logger.info("Chat: request received")
 
     stop_event = threading.Event()
 
     async def guarded_stream() -> AsyncGenerator[bytes, None]:
-        """Stream with disconnect detection and cleanup."""
-        gen = _chat_stream_generator(request, chat_request, stop_event)
-        try:
-            async for line in gen:
-                # Periodically check for client disconnect
-                if await request.is_disconnected():
-                    stop_event.set()
-                    return
-                yield line.encode("utf-8")
-        except asyncio.CancelledError:
-            stop_event.set()
-        finally:
-            stop_event.set()
+        """Stream with disconnect detection, cleanup, and single-user lock."""
+        async with _chat_lock:
+            gen = _chat_stream_generator(request, chat_request, stop_event)
+            try:
+                async for line in gen:
+                    # Periodically check for client disconnect
+                    if await request.is_disconnected():
+                        stop_event.set()
+                        return
+                    yield line.encode("utf-8")
+            except asyncio.CancelledError:
+                stop_event.set()
+            finally:
+                stop_event.set()
 
     return StreamingResponse(
         guarded_stream(),
@@ -606,10 +637,13 @@ async def _freeform_stream_generator(
         if m.role in ("user", "assistant"):
             messages.append({"role": m.role, "content": m.content})
 
+    # Pin engine reference before spawning the producer thread (H2).
+    freeform_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
+    pinned_engine = await asyncio.to_thread(_get_engine, freeform_mode)
+
     def _producer() -> None:
         try:
-            request_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
-            engine = _get_engine(request_mode)
+            engine = pinned_engine
             gen = engine._ensure_generator()
             # Resolve thinking: explicit True/False from user, or default off for freeform
             use_thinking = freeform_request.enable_thinking if freeform_request.enable_thinking is not None else False
@@ -639,7 +673,7 @@ async def _freeform_stream_generator(
                 stop_event.set()
                 return
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=8.0)
+                item = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL_S)
             except asyncio.TimeoutError:
                 yield ": ping\n\n"
                 continue
@@ -658,7 +692,7 @@ async def _freeform_stream_generator(
     finally:
         stop_event.set()
         try:
-            await asyncio.wait_for(producer_task, timeout=5.0)
+            await asyncio.wait_for(producer_task, timeout=_PRODUCER_CLEANUP_TIMEOUT_S)
         except (asyncio.TimeoutError, Exception):
             pass
 
@@ -669,25 +703,36 @@ async def _freeform_stream_generator(
 async def freeform_chat(request: Request, freeform_request: FreeformChatRequest):
     """Stream a freeform (non-RAG) chat response as plain SSE token events.
 
+    Uses ``_chat_lock`` to enforce single-user concurrency (shared with
+    the RAG chat endpoint).
+
     The SSE stream uses:
       event: token  / data: {"text": "..."}   — one per generated token
       event: complete / data: {}               — stream finished
       event: error  / data: {"error": "..."}  — on failure
     """
+    if _chat_lock.locked():
+        logger.warning("Freeform chat: rejected — another request is in progress")
+        return JSONResponse(
+            status_code=429,
+            content=http_error_body("LOCK_BUSY", "Another query is already in progress"),
+        )
+
     stop_event = threading.Event()
 
     async def guarded_stream() -> AsyncGenerator[bytes, None]:
-        gen = _freeform_stream_generator(request, freeform_request, stop_event)
-        try:
-            async for chunk in gen:
-                if await request.is_disconnected():
-                    stop_event.set()
-                    return
-                yield chunk.encode("utf-8")
-        except asyncio.CancelledError:
-            stop_event.set()
-        finally:
-            stop_event.set()
+        async with _chat_lock:
+            gen = _freeform_stream_generator(request, freeform_request, stop_event)
+            try:
+                async for chunk in gen:
+                    if await request.is_disconnected():
+                        stop_event.set()
+                        return
+                    yield chunk.encode("utf-8")
+            except asyncio.CancelledError:
+                stop_event.set()
+            finally:
+                stop_event.set()
 
     return StreamingResponse(
         guarded_stream(),
@@ -713,9 +758,13 @@ async def _query_stream_generator(
     if query_request.source_ids and len(query_request.source_ids) == 1:
         source_id = query_request.source_ids[0]
 
+    # Resolve and pin engine reference to avoid mid-stream swap (H2).
+    request_mode = _FRONTEND_MODE_MAP.get(query_request.mode, query_request.mode) if query_request.mode else None
+    pinned_engine = await asyncio.to_thread(_get_engine, request_mode)
+
     def _producer() -> None:
         try:
-            engine = _get_engine()
+            engine = pinned_engine
             _intent_override = query_request.intent_override
             if _intent_override == "auto":
                 _intent_override = None
@@ -789,7 +838,7 @@ async def _query_stream_generator(
     finally:
         stop_event.set()
         try:
-            await asyncio.wait_for(producer_task, timeout=5.0)
+            await asyncio.wait_for(producer_task, timeout=_PRODUCER_CLEANUP_TIMEOUT_S)
         except (asyncio.TimeoutError, Exception):
             pass
 
@@ -803,12 +852,16 @@ async def query_endpoint(request: Request, query_request: QueryRequest):
     if query_request.source_ids and len(query_request.source_ids) == 1:
         source_id = query_request.source_ids[0]
 
+    # Resolve mode: map frontend names, default to None (keep current engine)
+    request_mode = _FRONTEND_MODE_MAP.get(query_request.mode, query_request.mode) if query_request.mode else None
+
     if not query_request.stream:
         intent_override = query_request.intent_override
         if intent_override == "auto":
             intent_override = None
+        engine = await asyncio.to_thread(_get_engine, request_mode)
         result = await asyncio.to_thread(
-            _get_engine().query,
+            engine.query,
             query_request.query,
             source_id=source_id,
             citations_enabled=query_request.citations_enabled,
@@ -972,8 +1025,7 @@ async def ingest_source(request: IngestRequest):
         )
 
 
-# Maximum upload size: 50 MB
-_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# _MAX_UPLOAD_BYTES is defined at top-of-file with other tuning constants.
 _UPLOAD_DIR = Path(__file__).resolve().parent.parent / "data" / "uploads"
 _ALLOWED_EXTENSIONS = {".pdf", ".md", ".markdown"}
 
@@ -1068,7 +1120,7 @@ async def upload_source(
         try:
             dest.unlink(missing_ok=True)
         except Exception:
-            pass
+            logger.warning("Failed to clean up uploaded file %s", dest, exc_info=True)
         return JSONResponse(
             status_code=500,
             content=http_error_body(

@@ -759,6 +759,12 @@ class RagEngine:
     ) -> QueryResult:
         """Execute the full RAG pipeline and return a structured result.
 
+        This is the *synchronous* counterpart of :meth:`query_events`.
+        Both share the same pipeline steps (``_step_classify``,
+        ``_step_retrieve``, ``_step_pack_budget``) but differ in the
+        orchestration layer: ``query()`` returns a complete result,
+        ``query_events()`` yields incremental events for streaming.
+
         Parameters
         ----------
         query_text : str

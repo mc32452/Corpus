@@ -592,12 +592,15 @@ class StorageEngine:
         """Delete all data for a source: children, parents, and summary.
 
         Returns True if the source existed (had any data), False otherwise.
+        Raises ``RuntimeError`` if any individual delete step fails so
+        callers know the operation was only partially completed.
         """
         sid = source_id.strip()
         if not sid:
             raise ValueError("source_id must be non-empty.")
 
         deleted_any = False
+        errors: list[str] = []
 
         # Delete child chunks
         if self._table is not None:
@@ -608,6 +611,7 @@ class StorageEngine:
                 logger.info("Deleted children for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete children for source '%s': %s", sid, exc)
+                errors.append(f"children: {exc}")
 
         # Delete parent chunks
         if self._parents is not None:
@@ -617,6 +621,7 @@ class StorageEngine:
                 logger.info("Deleted parents for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete parents for source '%s': %s", sid, exc)
+                errors.append(f"parents: {exc}")
 
         # Delete summary
         if self._summaries is not None:
@@ -626,6 +631,12 @@ class StorageEngine:
                 logger.info("Deleted summary for source '%s'", sid)
             except Exception as exc:
                 logger.error("Failed to delete summary for source '%s': %s", sid, exc)
+                errors.append(f"summary: {exc}")
+
+        if errors:
+            raise RuntimeError(
+                f"Partial delete failure for source '{sid}': {'; '.join(errors)}"
+            )
 
         return deleted_any
 

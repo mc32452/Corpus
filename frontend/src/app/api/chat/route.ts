@@ -7,11 +7,13 @@
  * without buffering, giving true token-by-token streaming.
  *
  * assistant-ui's useChatRuntime points at /api/chat (this file).
- * This handler forwards the body to http://127.0.0.1:8000/api/chat and
+ * This handler forwards the body to the FastAPI backend /api/chat and
  * streams the SSE response back to the browser unchanged.
  */
 
-const FASTAPI_CHAT_URL = "http://127.0.0.1:8000/api/chat";
+import { getBackendApiBase } from "@/lib/backend-url";
+
+const FASTAPI_CHAT_URL = `${getBackendApiBase()}/chat`;
 
 export async function POST(req: Request): Promise<Response> {
   const body = await req.text(); // forward the body as-is (JSON string)

@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Citation } from "@/lib/event-parser";
-import { useAppState, useAppDispatch } from "@/context/app-context";
+import { useAppDispatch } from "@/context/app-context";
 
 interface ChatMarkdownProps {
   content: string;

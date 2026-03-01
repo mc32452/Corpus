@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Applied to retrieval budget estimates only. Do NOT change ingest chunking tokenizer.
 _WORD_TO_TOKEN_RATIO: float = 1.35
 
+# Adaptive reranker threshold: proportion of the top score below which
+# candidates are discarded. Lower values keep more marginal results.
+_ADAPTIVE_THRESHOLD_FACTOR: float = 0.15
+
 
 @dataclass(frozen=True)
 class _SubThresholdPolicy:
@@ -181,25 +185,6 @@ class RetrievalEngine:
             return [float(v) for v in embedding]
         except Exception as exc:  # pragma: no cover - dependency runtime
             raise RuntimeError("Embedding model encode failed.") from exc
-
-    def _hybrid_search(
-        self,
-        query: str,
-        top_k: int,
-        *,
-        source_id: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
-        """Single-call hybrid search via LanceDB (vector ANN + FTS BM25 + RRF)."""
-        if not query.strip():
-            raise ValueError("query must be a non-empty string.")
-        query_vector = self._encode_query(self._embedding_model, query)
-
-        return self._storage.hybrid_search(
-            query_text=query,
-            query_vector=query_vector,
-            top_k=top_k,
-            source_id=source_id,
-        )
 
     def _hybrid_search_decoupled(
         self,
@@ -433,7 +418,7 @@ class RetrievalEngine:
 
             # Adaptive threshold: relative to the top reranker score
             top_score = float(reranked[0].get(score_key, 0.0)) if reranked else 0.0
-            relative_factor = 0.15
+            relative_factor = _ADAPTIVE_THRESHOLD_FACTOR
             adaptive_threshold = max(
                 config_threshold,               # absolute floor (safety net)
                 top_score * relative_factor,     # relative to best match

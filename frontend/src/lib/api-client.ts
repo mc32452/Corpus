@@ -4,6 +4,8 @@
  * Provides typed wrappers around fetch calls to the FastAPI backend.
  */
 
+import { getBackendApiBase as _getBackendApiBase } from "./backend-url";
+
 export interface SourceInfo {
   source_id: string;
   summary: string | null;
@@ -96,90 +98,132 @@ export interface ApiError {
   };
 }
 
-export interface StreamEvent {
-  event:
-  | "status"
-  | "intent"
-  | "sources"
-  | "citations"
-  | "token"
-  | "complete"
-  | "error";
+export type StreamEvent = {
+  event: "status" | "intent" | "sources" | "citations" | "token" | "error" | "complete";
   data: Record<string, unknown>;
+};
+
+export interface QueryStreamingOptions {
+  sourceIds?: string[];
+  citationsEnabled?: boolean;
+  mode?: string;
+  signal?: AbortSignal;
 }
 
-function getBackendApiBase(): string {
-  const env =
-    typeof process !== "undefined" &&
-      typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
-      ? process.env.NEXT_PUBLIC_BACKEND_URL
-      : "";
-  const base = env || "http://127.0.0.1:8000";
-  return `${base.replace(/\/$/, "")}/api`;
-}
-
+/**
+ * Legacy stream helper used by ChatPanel.
+ *
+ * Consumes the AI SDK UI message stream from `/api/query` and maps it into
+ * simple event records (`status`, `intent`, `sources`, `citations`, `token`,
+ * `error`, `complete`) expected by the legacy chat renderer.
+ */
 export async function* queryStreaming(
   query: string,
-  options?: {
-    mode?: string;
-    sourceIds?: string[];
-    citationsEnabled?: boolean;
-    signal?: AbortSignal;
-  }
+  options: QueryStreamingOptions = {}
 ): AsyncGenerator<StreamEvent, void, unknown> {
-  const apiBase = getBackendApiBase();
-  const response = await fetch(`${apiBase}/query`, {
+  const res = await fetch("/api/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       query,
-      mode: options?.mode,
-      source_ids: options?.sourceIds,
-      citations_enabled: options?.citationsEnabled ?? true,
+      source_ids: options.sourceIds,
+      citations_enabled: options.citationsEnabled ?? true,
       stream: true,
+      mode: options.mode,
     }),
-    signal: options?.signal,
+    signal: options.signal,
   });
 
-  if (!response.ok) {
-    let message = `Query failed: HTTP ${response.status}`;
+  if (!res.ok || !res.body) {
+    let message = `Query failed: HTTP ${res.status}`;
     try {
-      const body = await response.json();
-      message = body?.error?.message ?? message;
+      const body = (await res.json()) as ApiError;
+      if (body?.error?.message) message = body.error.message;
     } catch {
-      // fall through
+      try {
+        const text = await res.text();
+        if (text) message = text;
+      } catch {
+        // keep fallback message
+      }
     }
     throw new Error(message);
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("No response body");
-
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
-  const parseEventBlock = (eventText: string): StreamEvent | null => {
-    const lines = eventText.split(/\r?\n/);
-    let eventType = "message";
+  const parseBlock = (block: string): string | null => {
+    const lines = block.split(/\r?\n/);
     const dataLines: string[] = [];
-
     for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventType = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
+      if (line.startsWith("data:")) {
         dataLines.push(line.slice(5).trimStart());
       }
     }
+    if (!dataLines.length) return null;
+    return dataLines.join("\n");
+  };
 
-    if (dataLines.length === 0) return null;
-    const rawData = dataLines.join("\n");
+  const mapPayload = (payload: unknown): StreamEvent[] => {
+    if (payload === "[DONE]") {
+      return [{ event: "complete", data: {} }];
+    }
+    if (!payload || typeof payload !== "object") return [];
 
-    try {
-      const parsed = JSON.parse(rawData);
-      const data = typeof parsed === "object" && parsed !== null ? parsed : { raw: parsed };
-      return { event: eventType as StreamEvent["event"], data };
-    } catch {
-      return { event: eventType as StreamEvent["event"], data: { raw: rawData } };
+    const frame = payload as Record<string, unknown>;
+    const type = frame.type;
+    if (typeof type !== "string") return [];
+
+    switch (type) {
+      case "text-delta": {
+        const text = typeof frame.delta === "string" ? frame.delta : "";
+        return text ? [{ event: "token", data: { text } }] : [];
+      }
+      case "data-status": {
+        const data = (frame.data ?? {}) as Record<string, unknown>;
+        const status = typeof data.status === "string" ? data.status : "Working...";
+        return [{ event: "status", data: { message: status } }];
+      }
+      case "data-intent": {
+        const data = (frame.data ?? {}) as Record<string, unknown>;
+        return [{
+          event: "intent",
+          data: {
+            intent: data.intent,
+            confidence: data.confidence,
+            method: data.method,
+          },
+        }];
+      }
+      case "data-sources": {
+        const data = (frame.data ?? {}) as Record<string, unknown>;
+        const sourceIds = Array.isArray(data.sourceIds)
+          ? data.sourceIds.filter((x): x is string => typeof x === "string")
+          : [];
+        return [{ event: "sources", data: { source_ids: sourceIds } }];
+      }
+      case "data-citations": {
+        const data = (frame.data ?? {}) as Record<string, unknown>;
+        const citations = Array.isArray(data.citations) ? data.citations : [];
+        return [{ event: "citations", data: { citations } }];
+      }
+      case "data-error": {
+        const data = (frame.data ?? {}) as Record<string, unknown>;
+        const err = (data.error ?? {}) as Record<string, unknown>;
+        const message = typeof err.message === "string" ? err.message : "Streaming error";
+        return [{ event: "error", data: { error: message, code: err.code } }];
+      }
+      case "error": {
+        const message = typeof frame.error === "string" ? frame.error : "Streaming error";
+        return [{ event: "error", data: { error: message } }];
+      }
+      case "finish": {
+        return [{ event: "complete", data: {} }];
+      }
+      default:
+        return [];
     }
   };
 
@@ -188,24 +232,44 @@ export async function* queryStreaming(
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? "";
 
-    const events = buffer.split(/\r?\n\r?\n/);
-    buffer = events.pop() || "";
+    for (const block of blocks) {
+      const rawData = parseBlock(block);
+      if (!rawData) continue;
 
-    for (const eventText of events) {
-      if (!eventText.trim()) continue;
-      const evt = parseEventBlock(eventText);
-      if (evt) {
-        yield evt;
+      if (rawData === "[DONE]") {
+        yield { event: "complete", data: {} };
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(rawData) as unknown;
+        const mapped = mapPayload(parsed);
+        for (const evt of mapped) {
+          yield evt;
+        }
+      } catch {
+        // ignore malformed frames and keep streaming
       }
     }
   }
 
-  const finalBlock = buffer.trim();
-  if (finalBlock) {
-    const evt = parseEventBlock(finalBlock);
-    if (evt) {
-      yield evt;
+  if (buffer.trim()) {
+    const rawData = parseBlock(buffer.trim());
+    if (rawData === "[DONE]") {
+      yield { event: "complete", data: {} };
+    } else if (rawData) {
+      try {
+        const parsed = JSON.parse(rawData) as unknown;
+        const mapped = mapPayload(parsed);
+        for (const evt of mapped) {
+          yield evt;
+        }
+      } catch {
+        // ignore malformed trailing frame
+      }
     }
   }
 }
@@ -241,13 +305,7 @@ class SourceApiClient {
    * bypass the Next.js dev proxy to avoid its ~30s timeout.
    */
   private getDirectBackendUrl(path: string): string {
-    const env =
-      typeof process !== "undefined" &&
-        typeof process.env?.NEXT_PUBLIC_BACKEND_URL === "string"
-        ? process.env.NEXT_PUBLIC_BACKEND_URL
-        : "";
-    const base = env || "http://127.0.0.1:8000";
-    return `${base.replace(/\/$/, "")}/api${path}`;
+    return `${_getBackendApiBase()}${path}`;
   }
 
   async listSources(): Promise<SourceInfo[]> {

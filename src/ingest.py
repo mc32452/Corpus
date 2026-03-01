@@ -522,7 +522,16 @@ def ingest_file_to_storage(
         raise RuntimeError("Embedding model encode failed.") from exc
 
     storage.add_parents(parents)
-    storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+    try:
+        storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+    except Exception:
+        # Roll back the parents we just wrote so storage stays consistent.
+        logger.error("Child chunk write failed for source '%s'; rolling back parents", source_id)
+        try:
+            storage.delete_source(source_id)
+        except Exception:
+            logger.exception("Rollback delete_source('%s') also failed", source_id)
+        raise
 
     if summarize:
         generator = summary_generator

@@ -27,6 +27,7 @@ import { useSpeechToText } from "@/hooks/useSpeechToText";
 import { cn } from "@/lib/utils";
 import { TypewriterText } from "@/components/ui/typewriter-text";
 import { useAppState } from "@/context/app-context";
+import { getBackendBase } from "@/lib/backend-url";
 import {
   saveSession,
   loadSession,
@@ -47,9 +48,7 @@ const MODELS = [
   { id: "deep-research", name: "Deep Research", description: "Qwen3.5-35B-A3B (Deep Retrieval + Thinking)" },
 ] as const;
 
-const BACKEND_BASE =
-  (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_BACKEND_URL) ||
-  "http://127.0.0.1:8000";
+const BACKEND_BASE = getBackendBase();
 
 // ---------------------------------------------------------------------------
 // Streaming

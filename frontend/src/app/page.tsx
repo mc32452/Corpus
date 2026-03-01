@@ -99,7 +99,7 @@ function RagArea({ selectedSourceIds, intentOverride, onData, onFinish }: RagAre
  */
 export default function Page() {
   const dispatch = useAppDispatch();
-  const { activeCitation, intentOverride, chatMode } = useAppState();
+  const { intentOverride, chatMode } = useAppState();
   const { theme, setTheme } = useTheme();
   const [themeOpen, setThemeOpen] = useState(false);
 

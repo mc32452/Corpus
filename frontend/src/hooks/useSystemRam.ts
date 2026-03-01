@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { getBackendBase } from "@/lib/backend-url";
 
-const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const BACKEND_BASE = getBackendBase();
 
 /**
  * Fetches system RAM from the backend health endpoint once on mount.
