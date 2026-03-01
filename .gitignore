@@ -1,7 +1,18 @@
 .DS_Store
 
+# Node (prevent accidentally installing packages in root)
+node_modules/
+package-lock.json
+
+# ignore the temporary example project used for new-particle-background work
+/new background/
+
 *.jsonl
 *.json
+!data/lance/schema_version.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
 
 # Python cache
 __pycache__/
@@ -20,6 +31,7 @@ __pycache__/
 /data/
 /testing/
 *.pdf
+*.txt
 
 # Local databases
 *.sqlite
@@ -33,6 +45,6 @@ chroma/
 !models/.gitkeep
 
 *.md
-# Allow specific markdown files in tests/
+# Allow specific markdown files
 !tests/README.md
 !tests/TEST_REPORT.md

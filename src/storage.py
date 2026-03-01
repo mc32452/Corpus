@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import lancedb
+import pyarrow as pa
 
 from .models import ChildChunk, ParentChunk
 
@@ -62,11 +63,39 @@ class StorageEngine:
         self._summaries: Optional[lancedb.table.Table] = None
         try:
             self._summaries = self._db.open_table(self._SUMMARIES_TABLE)
+            self._migrate_summaries_schema()
         except ValueError:
             pass  # Table does not exist yet
 
     def close(self) -> None:
         pass  # LanceDB connections do not require explicit close
+
+    # ------------------------------------------------------------------
+    # Schema migrations
+    # ------------------------------------------------------------------
+
+    _SUMMARIES_V2_COLUMNS = ("source_path", "snapshot_path")
+
+    def _migrate_summaries_schema(self) -> None:
+        """Add v2 columns to the source_summaries table if missing."""
+        if self._summaries is None:
+            return
+        existing = set(self._summaries.schema.names)
+        missing = [
+            pa.field(col, pa.utf8())
+            for col in self._SUMMARIES_V2_COLUMNS
+            if col not in existing
+        ]
+        if not missing:
+            return
+        self._summaries.add_columns(missing)
+        # Re-open so the cached schema is up to date
+        self._summaries = self._db.open_table(self._SUMMARIES_TABLE)
+        logger.info(
+            "Migrated '%s' table: added columns %s",
+            self._SUMMARIES_TABLE,
+            [f.name for f in missing],
+        )
 
     @staticmethod
     def _escape_sql_literal(value: str) -> str:
@@ -96,9 +125,15 @@ class StorageEngine:
         if self._table is None:
             return
         if force_rebuild or self._fts_dirty:
-            self._table.create_fts_index("text", replace=True)
-            self._fts_dirty = False
-            self._pending_fts_rows = 0
+            try:
+                self._table.create_fts_index("text", replace=True)
+            except Exception:
+                # Keep dirty state so future writes/queries can retry rebuild.
+                self._fts_dirty = True
+                raise
+            else:
+                self._fts_dirty = False
+                self._pending_fts_rows = 0
 
     def _maybe_rebuild_fts_after_write(self) -> None:
         policy = self._config.fts_rebuild_policy
@@ -128,6 +163,41 @@ class StorageEngine:
             self._ensure_fts_index(force_rebuild=True)
             logger.info("Refreshed dirty FTS index before hybrid search")
 
+    def get_child_vector_dimension(self) -> Optional[int]:
+        """Return child vector dimension if available, otherwise None."""
+        if self._table is None:
+            return None
+        try:
+            field = self._table.schema.field("vector")
+        except Exception:
+            return None
+
+        field_type = field.type
+        list_size = getattr(field_type, "list_size", None)
+        if isinstance(list_size, int) and list_size > 0:
+            return int(list_size)
+
+        value_type = getattr(field_type, "value_type", None)
+        nested_list_size = getattr(value_type, "list_size", None)
+        if isinstance(nested_list_size, int) and nested_list_size > 0:
+            return int(nested_list_size)
+        return None
+
+    def reset_all_tables(self) -> None:
+        """Drop all managed tables and clear in-memory handles."""
+        for table_name in (self._table_name, self._PARENTS_TABLE, self._SUMMARIES_TABLE):
+            try:
+                self._db.drop_table(table_name)
+                logger.warning("Dropped LanceDB table '%s'", table_name)
+            except Exception as exc:
+                logger.debug("Could not drop table '%s': %s", table_name, exc)
+
+        self._table = None
+        self._parents = None
+        self._summaries = None
+        self._fts_dirty = False
+        self._pending_fts_rows = 0
+
     def add_parents(self, parents: Iterable[ParentChunk]) -> None:
         records = [
             {
@@ -152,21 +222,67 @@ class StorageEngine:
                 len(records),
             )
         else:
-            # Upsert: remove existing parent_ids then re-add
+            # Safe upsert: backup existing rows for target IDs, delete, add,
+            # and restore backup on add failure.
             ids = list(dict.fromkeys(r["parent_id"] for r in records))
+            existing_rows: list[dict[str, Any]] = []
             try:
                 for id_batch in self._chunk(ids, self._MAX_IN_CLAUSE_VALUES):
+                    existing_rows.extend(
+                        self._parents
+                        .search()
+                        .where(self._where_in("parent_id", id_batch), prefilter=True)
+                        .to_list()
+                    )
+                for id_batch in self._chunk(ids, self._MAX_IN_CLAUSE_VALUES):
                     self._parents.delete(self._where_in("parent_id", id_batch))
+                self._parents.add(records)
             except Exception as exc:
                 logger.critical(
-                    "Upsert delete failed for parents table; aborting to prevent duplicates. "
+                    "Safe upsert failed for parents table; attempting rollback. "
                     "table=%s ids_count=%d error=%s",
                     self._PARENTS_TABLE,
                     len(ids),
                     exc,
                 )
+                try:
+                    if existing_rows:
+                        self._parents.add(existing_rows)
+                        logger.info(
+                            "Rollback restored %d existing parent rows for table '%s'",
+                            len(existing_rows),
+                            self._PARENTS_TABLE,
+                        )
+                except Exception as rollback_exc:
+                    logger.critical(
+                        "Rollback failed for parents table after safe upsert error. "
+                        "table=%s ids_count=%d rollback_error=%s",
+                        self._PARENTS_TABLE,
+                        len(ids),
+                        rollback_exc,
+                    )
                 raise
-            self._parents.add(records)
+
+    @staticmethod
+    def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in metadata.items()
+            if value is not None and not (isinstance(value, str) and value == "")
+        }
+
+    @staticmethod
+    def _row_to_metadata(row: dict[str, Any]) -> dict[str, Any]:
+        """Extract and clean standard metadata fields from a LanceDB row."""
+        meta = {
+            "source_id": row.get("source_id", ""),
+            "page_number": row.get("page_number"),
+            "page_label": row.get("page_label"),
+            "display_page": row.get("display_page"),
+            "header_path": row.get("header_path", ""),
+            "parent_id": row.get("parent_id", ""),
+        }
+        return StorageEngine._clean_metadata(meta)
 
     def add_children(
         self,
@@ -279,17 +395,10 @@ class StorageEngine:
                     child_id = row.get("id")
                     if not isinstance(child_id, str):
                         continue
-                    meta = {
-                        "source_id": row.get("source_id", ""),
-                        "page_number": row.get("page_number"),
-                        "page_label": row.get("page_label"),
-                        "display_page": row.get("display_page"),
-                        "header_path": row.get("header_path", ""),
-                        "parent_id": row.get("parent_id", ""),
-                    }
-                    meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+                    meta = self._row_to_metadata(row)
                     result[child_id] = {"text": row.get("text", ""), "metadata": meta}
-        except Exception:
+        except Exception as exc:
+            logger.error("Failed to fetch children by ids: %s", exc)
             return {}
         return result
 
@@ -365,15 +474,7 @@ class StorageEngine:
 
         results: list[dict[str, Any]] = []
         for rank, row in enumerate(rows, start=1):
-            meta = {
-                "source_id": row.get("source_id", ""),
-                "page_number": row.get("page_number"),
-                "page_label": row.get("page_label"),
-                "display_page": row.get("display_page"),
-                "header_path": row.get("header_path", ""),
-                "parent_id": row.get("parent_id", ""),
-            }
-            meta = {k: v for k, v in meta.items() if v is not None and v != "" and v != 0}
+            meta = self._row_to_metadata(row)
             results.append({
                 "id": row.get("id", ""),
                 "text": row.get("text", ""),
@@ -389,16 +490,41 @@ class StorageEngine:
         rows = self._parents.to_arrow().to_pylist()
         return sorted(set(r["source_id"] for r in rows if r.get("source_id")))
 
-    def upsert_source_summary(self, *, source_id: str, summary: str) -> None:
+    def upsert_source_summary(
+        self,
+        *,
+        source_id: str,
+        summary: str,
+        source_path: Optional[str] = None,
+        snapshot_path: Optional[str] = None,
+    ) -> None:
+        """Insert or update a source summary record (schema v2).
+
+        Parameters
+        ----------
+        source_id : str
+            Unique identifier for the source.
+        summary : str
+            Summary text for the source.
+        source_path : str | None
+            Original file path used during ingest.
+        snapshot_path : str | None
+            Path to cached text snapshot under data/source_cache/.
+        """
         if not source_id.strip():
             raise ValueError("source_id must be non-empty.")
         if not summary.strip():
             raise ValueError("summary must be non-empty.")
         sid = source_id.strip()
-        record = {"source_id": sid, "summary": summary.strip()}
+        record: dict[str, Any] = {
+            "source_id": sid,
+            "summary": summary.strip(),
+            "source_path": source_path or "",
+            "snapshot_path": snapshot_path or "",
+        }
         if self._summaries is None:
             self._summaries = self._db.create_table(self._SUMMARIES_TABLE, [record])
-            logger.info("Created LanceDB table '%s'", self._SUMMARIES_TABLE)
+            logger.info("Created LanceDB table '%s' (schema v2)", self._SUMMARIES_TABLE)
         else:
             try:
                 self._summaries.delete(self._where_eq("source_id", sid))
@@ -422,6 +548,97 @@ class StorageEngine:
             for r in rows
             if r.get("source_id") and r.get("summary")
         }
+
+    def get_source_details(self) -> list[dict[str, Any]]:
+        """Return full details for all sources (schema v2 fields).
+
+        Returns list of dicts with keys: source_id, summary, source_path, snapshot_path.
+        """
+        if self._summaries is None:
+            return []
+        rows = self._summaries.to_arrow().to_pylist()
+        return [
+            {
+                "source_id": r.get("source_id", ""),
+                "summary": r.get("summary", ""),
+                "source_path": r.get("source_path", ""),
+                "snapshot_path": r.get("snapshot_path", ""),
+            }
+            for r in rows
+            if r.get("source_id")
+        ]
+
+    def get_source_detail(self, source_id: str) -> Optional[dict[str, Any]]:
+        """Return details for a single source, or None if not found."""
+        if self._summaries is None:
+            return None
+        rows = (
+            self._summaries
+            .search()
+            .where(self._where_eq("source_id", source_id), prefilter=True)
+            .to_list()
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "source_id": r.get("source_id", ""),
+            "summary": r.get("summary", ""),
+            "source_path": r.get("source_path", ""),
+            "snapshot_path": r.get("snapshot_path", ""),
+        }
+
+    def delete_source(self, source_id: str) -> bool:
+        """Delete all data for a source: children, parents, and summary.
+
+        Returns True if the source existed (had any data), False otherwise.
+        Raises ``RuntimeError`` if any individual delete step fails so
+        callers know the operation was only partially completed.
+        """
+        sid = source_id.strip()
+        if not sid:
+            raise ValueError("source_id must be non-empty.")
+
+        deleted_any = False
+        errors: list[str] = []
+
+        # Delete child chunks
+        if self._table is not None:
+            try:
+                self._table.delete(self._where_eq("source_id", sid))
+                self._mark_fts_dirty(0)
+                deleted_any = True
+                logger.info("Deleted children for source '%s'", sid)
+            except Exception as exc:
+                logger.error("Failed to delete children for source '%s': %s", sid, exc)
+                errors.append(f"children: {exc}")
+
+        # Delete parent chunks
+        if self._parents is not None:
+            try:
+                self._parents.delete(self._where_eq("source_id", sid))
+                deleted_any = True
+                logger.info("Deleted parents for source '%s'", sid)
+            except Exception as exc:
+                logger.error("Failed to delete parents for source '%s': %s", sid, exc)
+                errors.append(f"parents: {exc}")
+
+        # Delete summary
+        if self._summaries is not None:
+            try:
+                self._summaries.delete(self._where_eq("source_id", sid))
+                deleted_any = True
+                logger.info("Deleted summary for source '%s'", sid)
+            except Exception as exc:
+                logger.error("Failed to delete summary for source '%s': %s", sid, exc)
+                errors.append(f"summary: {exc}")
+
+        if errors:
+            raise RuntimeError(
+                f"Partial delete failure for source '{sid}': {'; '.join(errors)}"
+            )
+
+        return deleted_any
 
     def get_parent_texts_by_source(self, *, source_id: str) -> list[str]:
         if self._parents is None:

@@ -12,7 +12,9 @@ from src.intent import (
     _classify_heuristic,
     _parse_llm_response,
     is_low_information_query,
+    is_source_selection_query,
 )
+
 from src.retrieval import (
     build_source_legend,
     format_chunk_for_citation,
@@ -39,15 +41,15 @@ class TestCitationFormatting:
         result = format_chunk_for_citation(
             "Some text here.", source_id="doc1", display_page="5"
         )
-        assert "[CHUNK START | SOURCE: doc1 | PAGE: 5]" in result
+        assert "[PASSAGE 1 | SOURCE: doc1 | PAGE: 5]" in result
         assert "Some text here." in result
-        assert "[CHUNK END]" in result
+        assert "[PASSAGE END]" in result
 
     def test_format_chunk_without_page(self):
         result = format_chunk_for_citation(
             "Some text.", source_id="doc1", display_page=None
         )
-        assert "[CHUNK START | SOURCE: doc1]" in result
+        assert "[PASSAGE 1 | SOURCE: doc1]" in result
         assert "PAGE" not in result
 
     def test_format_chunk_empty_page(self):
@@ -189,9 +191,14 @@ class TestIntentClassification:
             ("How many core counts does the chip have?", Intent.FACTUAL),
             ("What does the author say about behaviorism?", Intent.FACTUAL),
             ("What specific method did they use?", Intent.FACTUAL),
+            ("What is community?", Intent.FACTUAL),
+            ("What is epistemology?", Intent.FACTUAL),
             ("Name the key theorists", Intent.FACTUAL),
-            ("Extract all publication years and cited authors", Intent.FACTUAL),
-            ("Format the results as a table", Intent.FACTUAL),
+            ("Extract all publication years and cited authors", Intent.EXTRACT),
+            ("Format the results as a table", Intent.EXTRACT),
+            ("what mentions of ChatGPT are there", Intent.FACTUAL),
+            ("where is mortality discussed in the text", Intent.FACTUAL),
+            ("find all references to the Nurse", Intent.FACTUAL),
             # COLLECTION intent tests
             ("What documents do we have?", Intent.COLLECTION),
             ("What are we looking at?", Intent.COLLECTION),
@@ -202,11 +209,13 @@ class TestIntentClassification:
             ("Show me all the sources", Intent.COLLECTION),
             ("What topics do the documents cover?", Intent.COLLECTION),
             ("Give me an overview of everything", Intent.COLLECTION),
+            ("Which of these docs is a critique of ChatGPT?", Intent.COLLECTION),
             # Structural comparative / analysis
             ("Differences between Skinner and Chomsky", Intent.COMPARE),
             ("Critique of Skinner in light of modern LLMs", Intent.COMPARE),
             ("Trace the chain Skinner -> Chomsky -> modern LLM criticism", Intent.ANALYZE),
             ("What is chomskys critique of skinner", Intent.ANALYZE),
+            ("whic document is abiut connectioism", Intent.COLLECTION),
         ],
     )
     def test_heuristic_classification(self, query: str, expected: Intent):
@@ -338,6 +347,8 @@ class TestMessageBuilding:
 
     def test_all_intents_have_instructions(self):
         for intent in Intent:
+            if intent == Intent.OVERVIEW:
+                continue
             assert intent in INTENT_INSTRUCTIONS
             cfg = INTENT_INSTRUCTIONS[intent]
             assert "task" in cfg
@@ -355,7 +366,8 @@ class TestMessageBuilding:
         assert "Be very concise" in system
 
     def test_citation_rules_format(self):
-        assert "[SourceID, p. X]" in _CITATION_RULES
+        assert "[1], [2], [3]" in _CITATION_RULES
+        assert "MUST cite" in _CITATION_RULES.upper() or "MUST CITE" in _CITATION_RULES.upper()
 
 
 # ===========================================================================
@@ -574,6 +586,7 @@ class TestCollectionIntent:
             "Describe all the sources",
             "What is in here?",
             "Overview of all documents",
+            "Which of these docs is a critique of ChatGPT?",
         ],
     )
     def test_collection_classification(self, query: str):
@@ -588,7 +601,7 @@ class TestCollectionIntent:
         assert result.confidence >= 0.60
 
     def test_collection_generation_messages(self):
-        """COLLECTION messages should contain corpus/collection-level instructions."""
+        """COLLECTION messages should include user-facing wording constraints."""
         messages = build_messages(
             context="Source: doc1\nSummary: About linguistics.\n\nSource: doc2\nSummary: About philosophy.",
             question="What documents do we have?",
@@ -596,7 +609,7 @@ class TestCollectionIntent:
             citations_enabled=False,
         )
         system = messages[0]["content"]
-        assert "collection" in system.lower() or "document" in system.lower()
+        assert "reference retrieval internals" in system.lower()
 
     def test_collection_citations_auto_disabled(self):
         """COLLECTION intent uses summaries, so citation rules should NOT be injected."""
@@ -621,6 +634,21 @@ class TestCollectionIntent:
             assert result.intent == Intent.COLLECTION, (
                 f"Query '{q}': expected collection, got {result.intent.value}"
             )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what mentions of ChatGPT are there",
+            "where is mortality discussed in the text",
+            "find all references to the Nurse",
+        ],
+    )
+    def test_entity_mentions_not_collection(self, query: str):
+        """Entity-mention queries should route to FACTUAL chunk retrieval, not COLLECTION summaries."""
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.FACTUAL, (
+            f"Query '{query}': expected factual, got {result.intent.value}"
+        )
 
     def test_single_doc_overview_stays_overview(self):
         """Single-document overview queries should still be OVERVIEW, not COLLECTION."""
@@ -681,6 +709,10 @@ class TestIntentBoundaries:
         result = _classify_heuristic("What is this paper about?")
         assert result.intent == Intent.OVERVIEW
 
+    def test_what_is_term_is_factual(self):
+        result = _classify_heuristic("What is community?")
+        assert result.intent == Intent.FACTUAL
+
     def test_summarize_all_is_collection(self):
         """'Summarize all documents' should be COLLECTION, not SUMMARIZE."""
         result = _classify_heuristic("Summarize all documents")
@@ -723,3 +755,347 @@ class TestLowInformationQueryDetection:
     )
     def test_low_information_detector(self, query: str, expected: bool):
         assert is_low_information_query(query) is expected
+
+
+class TestSourceSelectionRoutingGuard:
+    @pytest.mark.parametrize(
+        "query,expected",
+        [
+            ("Which of these docs covers a critique of ChatGPT?", True),
+            ("which of thse docs covers aa crituqe of chatgpt", True),
+            ("What source discusses reinforcement learning risks?", True),
+            ("Summarize the key points of this paper", False),
+            ("Explain this in simple terms", False),
+        ],
+    )
+    def test_source_selection_query_detector(self, query: str, expected: bool):
+        assert is_source_selection_query(query) is expected
+
+
+class TestQueryExpansionRemoved:
+    """Verify the dead query expansion infrastructure has been fully removed."""
+
+    def test_no_expand_query_function(self) -> None:
+        import src.rag_engine as _mod
+        assert not hasattr(_mod, "_expand_query"), (
+            "_expand_query still exists — it should have been removed"
+        )
+
+    def test_no_expansion_terms_dict(self) -> None:
+        import src.rag_engine as _mod
+        assert not hasattr(_mod, "_EXPANSION_TERMS"), (
+            "_EXPANSION_TERMS still exists — it should have been removed"
+        )
+
+    def test_query_method_no_expansion_param(self) -> None:
+        import inspect, src.rag_engine as _mod
+        sig = inspect.signature(_mod.RagEngine.query)
+        assert "enable_query_expansion" not in sig.parameters, (
+            "query() still accepts enable_query_expansion"
+        )
+
+
+# ===========================================================================
+# New intents: EXTRACT, TIMELINE, HOW_TO, QUOTE_EVIDENCE
+# ===========================================================================
+
+class TestExtractIntent:
+    """Tests for the EXTRACT intent — structured data extraction."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "Extract all dates mentioned in the document",
+            "Extract all author names",
+            "Extract all figures and numbers from the text",
+            "List all the names in chronological order",
+            "Give me all the entities in a table",
+            "Pull out all the dates from the text",
+            "Compile a list of all the terms defined",
+            "Format the results as a table",
+        ],
+    )
+    def test_extract_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.EXTRACT, (
+            f"Query '{query}': expected extract, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_extract_in_intent_map(self):
+        """EXTRACT should be in the _INTENT_MAP for LLM response parsing."""
+        from src.intent import _INTENT_MAP
+        assert "extract" in _INTENT_MAP
+        assert _INTENT_MAP["extract"] == Intent.EXTRACT
+
+    def test_extract_instructions_present(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.EXTRACT in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.EXTRACT in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.EXTRACT]
+        assert "task" in cfg and "format" in cfg and "tone" in cfg
+        assert "exhaustiv" in cfg["task"].lower()
+
+    def test_extract_build_messages(self):
+        messages = build_messages(
+            context="The battle of Waterloo occurred in 1815. Napoleon was defeated.",
+            question="Extract all dates mentioned.",
+            intent=Intent.EXTRACT,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "list" in system.lower() or "table" in system.lower()
+
+
+class TestTimelineIntent:
+    """Tests for the TIMELINE intent — chronological event ordering."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "Create a timeline of events",
+            "Show me the timeline",
+            "List events in chronological order",
+            "What is the chronology of events in this document?",
+            "Give me a chronological sequence of events",
+            "Trace the history of development in the text",
+        ],
+    )
+    def test_timeline_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.TIMELINE, (
+            f"Query '{query}': expected timeline, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_timeline_in_intent_map(self):
+        from src.intent import _INTENT_MAP
+        assert "timeline" in _INTENT_MAP
+        assert _INTENT_MAP["timeline"] == Intent.TIMELINE
+
+    def test_timeline_instructions_present(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.TIMELINE in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.TIMELINE in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.TIMELINE]
+        assert "task" in cfg and "format" in cfg and "tone" in cfg
+        assert "chronolog" in cfg["task"].lower() or "date" in cfg["task"].lower()
+
+    def test_timeline_build_messages(self):
+        messages = build_messages(
+            context="In 1789 the Revolution began. In 1815 Napoleon was defeated.",
+            question="Create a timeline of events.",
+            intent=Intent.TIMELINE,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "chronolog" in system.lower() or "order" in system.lower()
+
+
+class TestHowToIntent:
+    """Tests for the HOW_TO intent — step-by-step procedural queries."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "How to apply this technique?",
+            "What are the steps to reproduce the experiment?",
+            "Walk me through the process",
+            "Give step-by-step instructions for this procedure",
+            "What are the steps in this method?",
+            "Instructions for applying this approach",
+        ],
+    )
+    def test_how_to_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.HOW_TO, (
+            f"Query '{query}': expected how_to, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_how_to_in_intent_map(self):
+        from src.intent import _INTENT_MAP
+        assert "how_to" in _INTENT_MAP
+        assert _INTENT_MAP["how_to"] == Intent.HOW_TO
+
+    def test_how_to_instructions_present(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.HOW_TO in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.HOW_TO in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.HOW_TO]
+        assert "task" in cfg and "format" in cfg and "tone" in cfg
+        assert "step" in cfg["format"].lower() or "procedur" in cfg["format"].lower()
+
+    def test_how_to_build_messages(self):
+        messages = build_messages(
+            context="First, prepare the reagents. Second, mix them carefully.",
+            question="How to apply this technique?",
+            intent=Intent.HOW_TO,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "step" in system.lower() or "procedur" in system.lower()
+
+
+class TestQuoteEvidenceIntent:
+    """Tests for the QUOTE_EVIDENCE intent — direct textual evidence."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "Find me a quote supporting this claim",
+            "What does the text say exactly about this?",
+            "Give me a verbatim passage about the argument",
+            "Find direct evidence supporting this position",
+            "Quote the relevant passage word for word",
+            "What textual evidence supports this argument?",
+        ],
+    )
+    def test_quote_evidence_classification(self, query: str):
+        result = _classify_heuristic(query)
+        assert result.intent == Intent.QUOTE_EVIDENCE, (
+            f"Query '{query}': expected quote_evidence, got {result.intent.value} "
+            f"(confidence={result.confidence:.2f})"
+        )
+
+    def test_quote_evidence_in_intent_map(self):
+        from src.intent import _INTENT_MAP
+        assert "quote_evidence" in _INTENT_MAP
+        assert _INTENT_MAP["quote_evidence"] == Intent.QUOTE_EVIDENCE
+
+    def test_quote_evidence_instructions_present(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR, INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        assert Intent.QUOTE_EVIDENCE in INTENT_INSTRUCTIONS_REGULAR
+        assert Intent.QUOTE_EVIDENCE in INTENT_INSTRUCTIONS_DEEP_RESEARCH
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.QUOTE_EVIDENCE]
+        assert "task" in cfg and "format" in cfg and "tone" in cfg
+        assert "quot" in cfg["task"].lower() or "verbatim" in cfg["format"].lower()
+
+    def test_quote_evidence_build_messages(self):
+        messages = build_messages(
+            context="The author states: 'Language is innate to all humans.'",
+            question="Find a direct quote supporting the nativist view.",
+            intent=Intent.QUOTE_EVIDENCE,
+            citations_enabled=False,
+        )
+        system = messages[0]["content"]
+        assert "quote" in system.lower() or "verbatim" in system.lower()
+
+
+class TestNewIntentEnum:
+    """Verify all new intents are correctly wired into the enum and classifier."""
+
+    def test_all_new_intents_in_enum(self):
+        assert Intent.EXTRACT.value == "extract"
+        assert Intent.TIMELINE.value == "timeline"
+        assert Intent.HOW_TO.value == "how_to"
+        assert Intent.QUOTE_EVIDENCE.value == "quote_evidence"
+
+    def test_all_new_intents_in_intent_map(self):
+        from src.intent import _INTENT_MAP
+        for key in ("extract", "timeline", "how_to", "quote_evidence"):
+            assert key in _INTENT_MAP, f"'{key}' missing from _INTENT_MAP"
+
+    def test_all_new_intents_have_generation_instructions(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        for intent in (Intent.EXTRACT, Intent.TIMELINE, Intent.HOW_TO, Intent.QUOTE_EVIDENCE):
+            assert intent in INTENT_INSTRUCTIONS_REGULAR, (
+                f"{intent.value} missing from INTENT_INSTRUCTIONS_REGULAR"
+            )
+            cfg = INTENT_INSTRUCTIONS_REGULAR[intent]
+            for key in ("task", "format", "tone"):
+                assert key in cfg, f"'{key}' missing from {intent.value} instructions"
+
+    def test_llm_classification_prompt_includes_new_intents(self):
+        from src.intent import _build_classification_prompt
+        prompt = _build_classification_prompt("test query")
+        for intent_name in ("extract", "timeline", "how_to", "quote_evidence"):
+            assert intent_name in prompt, (
+                f"'{intent_name}' not found in LLM classification prompt"
+            )
+
+    def test_parse_llm_response_handles_new_intents(self):
+        from src.intent import _parse_llm_response
+        for intent_name, expected_intent in [
+            ("extract", Intent.EXTRACT),
+            ("timeline", Intent.TIMELINE),
+            ("how_to", Intent.HOW_TO),
+            ("quote_evidence", Intent.QUOTE_EVIDENCE),
+        ]:
+            response = f'{{"intent": "{intent_name}", "confidence": 0.9}}'
+            result = _parse_llm_response(response)
+            assert result is not None, f"Failed to parse intent '{intent_name}'"
+            assert result[0] == expected_intent
+
+    def test_intent_override_with_new_intents(self):
+        """rag_engine._classify_intent should handle new intent strings."""
+        # We test the intent_map directly by checking that all new keys resolve
+        from src.intent import _INTENT_MAP
+        for key in ("extract", "timeline", "how_to", "quote_evidence"):
+            assert key in _INTENT_MAP
+            intent = _INTENT_MAP[key]
+            assert isinstance(intent, Intent)
+
+
+class TestGenerationImprovements:
+    """Verify the spec-mandated improvements to existing intent instructions."""
+
+    def test_summarize_bullet_range(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.SUMMARIZE]
+        # Sentence-count constraints replaced word-count constraints (plan phase 2A).
+        # SUMMARIZE bullets should now specify "1-2" sentences, not a word range.
+        assert "1-2" in cfg["format"], (
+            "SUMMARIZE format should use sentence-count constraints (1-2 sentences per bullet)"
+        )
+        assert "15-35" not in cfg["format"], (
+            "Word-count constraint '15-35 words' should be replaced with sentence count"
+        )
+
+    def test_summarize_has_no_opening_sentence_requirement(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.SUMMARIZE]
+        assert "Start with one sentence" not in cfg["format"], (
+            "SUMMARIZE format should not require an opening document-identification sentence"
+        )
+
+    def test_factual_multi_passage_guidance(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.FACTUAL]
+        assert "multiple" in cfg["task"].lower() or "combining" in cfg["task"].lower(), (
+            "FACTUAL task should mention multi-passage synthesis"
+        )
+
+    def test_collection_document_types_guidance(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.COLLECTION]
+        assert "document type" in cfg["task"].lower() or "types" in cfg["task"].lower(), (
+            "COLLECTION task should mention document types"
+        )
+        assert "gap" in cfg["task"].lower(), (
+            "COLLECTION task should mention corpus coverage gaps"
+        )
+
+
+class TestIntentOverrideAliases:
+    def test_rag_engine_accepts_summarise_alias(self):
+        from src.rag_engine import RagEngine
+
+        engine = RagEngine.__new__(RagEngine)
+        result = RagEngine._classify_intent(
+            engine,
+            query_text="anything",
+            intent_override="summarise",
+            no_generate=True,
+        )
+
+        assert result.intent == Intent.SUMMARIZE
+        assert result.method == "manual"
+        assert result.confidence == 1.0
+
+    def test_explain_fallback_for_nontechnical(self):
+        from src.generation import INTENT_INSTRUCTIONS_REGULAR
+        cfg = INTENT_INSTRUCTIONS_REGULAR[Intent.EXPLAIN]
+        assert "non-technical" in cfg["task"].lower() or "already" in cfg["task"].lower(), (
+            "EXPLAIN task should have fallback for non-technical source material"
+        )

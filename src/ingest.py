@@ -1,18 +1,37 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 from .models import ChildChunk, Metadata, ParentChunk
-from .intent import Intent
-from .generation import build_messages
+from .generation import build_ingest_summary_messages
 from .generator import MlxGenerator
 from .storage import StorageEngine
 
+logger = logging.getLogger(__name__)
+
 # Maximum characters of parent text to feed into summary generation.
 _SUMMARY_CONTEXT_CHAR_LIMIT = 12_000
+
+
+def _sample_context(text: str, limit: int) -> str:
+    """Return a representative sample of *text* up to *limit* characters.
+
+    If the text is within the limit it is returned unchanged.  Otherwise the
+    head, middle, and tail thirds are joined with a '[...]' separator so the
+    summary model sees the beginning, a mid-document slice, and the end.
+    """
+    if len(text) <= limit:
+        return text
+    third = limit // 3
+    head = text[:third]
+    mid_center = len(text) // 2
+    middle = text[mid_center - third // 2 : mid_center + third // 2]
+    tail = text[-third:]
+    return "\n\n[...]\n\n".join([head, middle, tail])
 
 HEADER_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
@@ -25,6 +44,10 @@ CHILD_MIN_TOKENS = 200
 CHILD_MAX_TOKENS = 300
 CHILD_TARGET_TOKENS = 250
 CHILD_OVERLAP_TOKENS = 50
+CHILD_OVERLAP_SENTENCES = 2
+
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CLAUSE_BOUNDARY_RE = re.compile(r";\s+|,\s+(?:and|but|which|or)\s+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -39,6 +62,10 @@ def _tokenize(text: str) -> list[str]:
 
 def _detokenize(tokens: Iterable[str]) -> str:
     return " ".join(tokens).strip()
+
+
+def _token_count(text: str) -> int:
+    return len(_tokenize(text))
 
 
 def clean_ocr_artifacts(text: str) -> str:
@@ -68,6 +95,33 @@ def _split_tokens(tokens: list[str], chunk_size: int, overlap: int) -> list[list
             break
         start = end - overlap
     return chunks
+
+
+def _split_sentences(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    return [sentence.strip() for sentence in SENTENCE_SPLIT_RE.split(stripped) if sentence.strip()]
+
+
+def _split_long_sentence_on_clause(sentence: str, target_tokens: int) -> list[str]:
+    if _token_count(sentence) <= max(1, int(target_tokens * 0.4)):
+        return [sentence]
+
+    boundary_matches = list(CLAUSE_BOUNDARY_RE.finditer(sentence))
+    if not boundary_matches:
+        return [sentence]
+
+    midpoint = len(sentence) / 2
+    best = min(boundary_matches, key=lambda match: abs(match.start() - midpoint))
+    split_index = best.start() + 1 if sentence[best.start()] in {",", ";"} else best.start()
+
+    left = sentence[:split_index].strip()
+    right = sentence[split_index:].strip()
+    if not left or not right:
+        return [sentence]
+
+    return [left, right]
 
 
 def _parse_markdown_sections(text: str) -> list[_Section]:
@@ -141,19 +195,65 @@ def _split_parent_chunks(
 
 
 def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
-    tokens = _tokenize(parent.text)
-    if not tokens:
+    sentences = _split_sentences(parent.text)
+    if not sentences:
         return []
 
-    token_chunks = _split_tokens(tokens, CHILD_TARGET_TOKENS, CHILD_OVERLAP_TOKENS)
-    child_chunks: list[ChildChunk] = []
+    units: list[str] = []
+    for sentence in sentences:
+        units.extend(_split_long_sentence_on_clause(sentence, CHILD_TARGET_TOKENS))
 
-    for chunk_tokens in token_chunks:
-        if len(chunk_tokens) < CHILD_MIN_TOKENS:
+    sentence_chunks: list[list[str]] = []
+    current_chunk: list[str] = []
+    current_tokens = 0
+
+    for unit in units:
+        unit_tokens = _token_count(unit)
+
+        if current_chunk and (current_tokens + unit_tokens) > CHILD_TARGET_TOKENS:
+            sentence_chunks.append(current_chunk)
+            overlap_sentences = current_chunk[-CHILD_OVERLAP_SENTENCES:] if CHILD_OVERLAP_SENTENCES > 0 else []
+            current_chunk = list(overlap_sentences)
+            current_tokens = sum(_token_count(sentence) for sentence in current_chunk)
+
+        current_chunk.append(unit)
+        current_tokens += unit_tokens
+
+    if current_chunk:
+        sentence_chunks.append(current_chunk)
+
+    child_chunks: list[ChildChunk] = []
+    _merge_count = 0
+    _sole_child_count = 0
+
+    for chunk_sentences in sentence_chunks:
+        text = " ".join(chunk_sentences).strip()
+        token_count = _token_count(text)
+        if token_count < CHILD_MIN_TOKENS:
+            # Instead of dropping, merge into previous child or create sole child
+            if child_chunks:
+                # Merge into previous child's text
+                prev = child_chunks[-1]
+                merged_text = prev.text + " " + text
+                # Re-create with same id and metadata (frozen model)
+                child_chunks[-1] = ChildChunk.model_construct(
+                    id=prev.id, text=merged_text, metadata=prev.metadata,
+                )
+                _merge_count += 1
+            else:
+                # No previous child — create a sole child (short but searchable)
+                metadata = Metadata(
+                    source_id=parent.metadata.source_id,
+                    page_number=parent.metadata.page_number,
+                    page_label=parent.metadata.page_label,
+                    display_page=parent.metadata.display_page,
+                    header_path=parent.metadata.header_path,
+                    parent_id=parent.id,
+                )
+                child_chunks.append(ChildChunk(text=text, metadata=metadata))
+                _sole_child_count += 1
             continue
-        if len(chunk_tokens) > CHILD_MAX_TOKENS:
-            chunk_tokens = chunk_tokens[:CHILD_MAX_TOKENS]
-        text = _detokenize(chunk_tokens)
+
         metadata = Metadata(
             source_id=parent.metadata.source_id,
             page_number=parent.metadata.page_number,
@@ -163,6 +263,12 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
             parent_id=parent.id,
         )
         child_chunks.append(ChildChunk(text=text, metadata=metadata))
+
+    if _merge_count or _sole_child_count:
+        logger.info(
+            "Child merge: %d short segments merged, %d sole-child chunks created",
+            _merge_count, _sole_child_count,
+        )
 
     return child_chunks
 
@@ -214,6 +320,37 @@ def ingest_markdown(
     return parents, children
 
 
+@dataclass
+class _PageData:
+    """Extracted text and metadata for a single PDF page (or whole-doc fallback)."""
+    text: str
+    page_number: Optional[int]
+    page_label: Optional[str]
+    display_page: Optional[str]
+
+
+def _chunk_pages(
+    pages: list[_PageData],
+    source_id: str,
+) -> tuple[list[ParentChunk], list[ChildChunk]]:
+    """Convert extracted page data into parent/child chunk pairs."""
+    parents: list[ParentChunk] = []
+    children: list[ChildChunk] = []
+    sid = source_id.strip()
+    for page in pages:
+        section = _Section(header_path="Document", text=page.text)
+        for parent in _split_parent_chunks(
+            section,
+            source_id=sid,
+            page_number=page.page_number,
+            page_label=page.page_label,
+            display_page=page.display_page,
+        ):
+            parents.append(parent)
+            children.extend(_split_child_chunks(parent))
+    return parents, children
+
+
 def ingest_pdf(
     file_path: str | Path,
     *,
@@ -239,6 +376,8 @@ def ingest_pdf(
     parents: list[ParentChunk] = []
     children: list[ChildChunk] = []
 
+    # ---------- Strategy 1: pypdf per-page extraction ----------
+    pages: list[_PageData] = []
     for index, page in enumerate(reader.pages, start=1):
         page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
         if not page_text:
@@ -252,18 +391,12 @@ def ingest_pdf(
             pass
 
         display_page = page_label if page_label else str(index)
-        
-        section = _Section(header_path="Document", text=page_text)
-        for parent in _split_parent_chunks(
-            section,
-            source_id=source_id.strip(),
-            page_number=index,
-            page_label=page_label,
-            display_page=display_page,
-        ):
-            parents.append(parent)
-            children.extend(_split_child_chunks(parent))
+        pages.append(_PageData(page_text, index, page_label, display_page))
 
+    if pages:
+        parents, children = _chunk_pages(pages, source_id)
+
+    # ---------- Strategy 2: pdfminer whole-document fallback ----------
     if not parents:
         try:
             from pdfminer.high_level import extract_text
@@ -274,17 +407,10 @@ def ingest_pdf(
 
         fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
         if fallback_text:
-            section = _Section(header_path="Document", text=fallback_text)
-            for parent in _split_parent_chunks(
-                section,
-                source_id=source_id.strip(),
-                page_number=None,
-                page_label=None,
-                display_page=None,
-            ):
-                parents.append(parent)
-                children.extend(_split_child_chunks(parent))
+            pages = [_PageData(fallback_text, None, None, None)]
+            parents, children = _chunk_pages(pages, source_id)
 
+    # ---------- Strategy 3: PyMuPDF per-page fallback ----------
     if not parents:
         try:
             import fitz  # PyMuPDF
@@ -294,6 +420,7 @@ def ingest_pdf(
             ) from exc
 
         doc = fitz.open(str(path))
+        pages = []
         for index in range(doc.page_count):
             page = doc.load_page(index)
             page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
@@ -309,18 +436,12 @@ def ingest_pdf(
 
             page_number = index + 1
             display_page = page_label if page_label else str(page_number)
-            
-            section = _Section(header_path="Document", text=page_text)
-            for parent in _split_parent_chunks(
-                section,
-                source_id=source_id.strip(),
-                page_number=page_number,
-                page_label=page_label,
-                display_page=display_page,
-            ):
-                parents.append(parent)
-                children.extend(_split_child_chunks(parent))
+            pages.append(_PageData(page_text, page_number, page_label, display_page))
 
+        if pages:
+            parents, children = _chunk_pages(pages, source_id)
+
+    # ---------- Strategy 4: OCR fallback (pytesseract) ----------
     if not parents:
         try:
             from pdf2image import convert_from_path
@@ -334,6 +455,7 @@ def ingest_pdf(
         # images into memory simultaneously.  A 200-page PDF at 300 DPI
         # can consume 4-6 GB when fully rasterized, risking OOM on 32 GB
         # Apple Silicon machines.
+        pages = []
         page_count = len(reader.pages)
         for index in range(1, page_count + 1):
             page_images = convert_from_path(
@@ -347,16 +469,10 @@ def ingest_pdf(
             del page_images  # release rasterized image immediately
             if not page_text:
                 continue
-            section = _Section(header_path="Document", text=page_text)
-            for parent in _split_parent_chunks(
-                section,
-                source_id=source_id.strip(),
-                page_number=index,
-                page_label=None,
-                display_page=str(index),
-            ):
-                parents.append(parent)
-                children.extend(_split_child_chunks(parent))
+            pages.append(_PageData(page_text, index, None, str(index)))
+
+        if pages:
+            parents, children = _chunk_pages(pages, source_id)
 
     if not parents:
         raise ValueError(
@@ -406,20 +522,24 @@ def ingest_file_to_storage(
         raise RuntimeError("Embedding model encode failed.") from exc
 
     storage.add_parents(parents)
-    storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+    try:
+        storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+    except Exception:
+        # Roll back the parents we just wrote so storage stays consistent.
+        logger.error("Child chunk write failed for source '%s'; rolling back parents", source_id)
+        try:
+            storage.delete_source(source_id)
+        except Exception:
+            logger.exception("Rollback delete_source('%s') also failed", source_id)
+        raise
 
     if summarize:
         generator = summary_generator
         if generator is None:
             raise ValueError("summary_generator is required when summarize=True")
         context = "\n\n".join(parent.text for parent in parents)
-        if len(context) > _SUMMARY_CONTEXT_CHAR_LIMIT:
-            context = context[:_SUMMARY_CONTEXT_CHAR_LIMIT]
-        messages = build_messages(
-            context=context,
-            question="Summarize this document.",
-            intent=Intent.SUMMARIZE,
-        )
+        context = _sample_context(context, _SUMMARY_CONTEXT_CHAR_LIMIT)
+        messages = build_ingest_summary_messages(context)
         summary = generator.generate_chat(messages)
         storage.upsert_source_summary(source_id=source_id, summary=summary)
 

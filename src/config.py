@@ -26,54 +26,171 @@ class ModelConfig:
     top_k_dense: int = 100
     top_k_sparse: int = 100
     top_k_fused: int = 50
-    top_k_rerank: int = 20
+    top_k_rerank: int = 30
     top_k_final: int = 5
     reranker_threshold: float = 0.05
     reranker_min_docs: int = 3
+    reranker_enabled: bool = True
+    context_expansion_enabled: bool = True
     system_ram_gb: float = 0.0
+    max_children_per_parent: int = 2
+
+
+# ── Intent-aware parameter overrides ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class IntentRetrievalOverrides:
+    top_k_dense_scale: float = 1.0
+    top_k_fused_scale: float = 1.0
+    top_k_rerank_scale: float = 1.0
+    top_k_final_scale: float = 1.0
+    reranker_threshold_scale: float = 1.0
+    reranker_min_docs: Optional[int] = None     # absolute override, not scale
+
+
+@dataclass(frozen=True)
+class IntentGenerationParams:
+    temperature: float
+    top_p: float
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
+    enable_thinking: bool = False
+
+
+@dataclass(frozen=True)
+class ResolvedRetrievalParams:
+    top_k_dense: int
+    top_k_fused: int
+    top_k_rerank: int
+    top_k_final: int
+    reranker_threshold: float
+    reranker_min_docs: int
+    max_children_per_parent: int = 2
+
+
+INTENT_RETRIEVAL_OVERRIDES: dict[str, IntentRetrievalOverrides] = {
+    # FACTUAL: stricter threshold (1.3×) + min_docs=1 so a single high-confidence
+    # fact is not padded with low-quality backfill chunks.
+    "FACTUAL":    IntentRetrievalOverrides(top_k_dense_scale=0.85, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.3, reranker_min_docs=1),
+    "SUMMARIZE":  IntentRetrievalOverrides(top_k_dense_scale=1.0, top_k_final_scale=1.0),
+    "EXPLAIN":    IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.2),
+    "ANALYZE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "COMPARE":    IntentRetrievalOverrides(top_k_dense_scale=1.3, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "CRITIQUE":   IntentRetrievalOverrides(top_k_dense_scale=1.2, top_k_final_scale=1.25, reranker_threshold_scale=0.85),
+    "COLLECTION": IntentRetrievalOverrides(top_k_dense_scale=1.1, top_k_fused_scale=0.5, top_k_final_scale=1.0, reranker_threshold_scale=1.2),
+    "EXTRACT":    IntentRetrievalOverrides(top_k_dense_scale=0.9, top_k_final_scale=1.0, reranker_threshold_scale=1.2, reranker_min_docs=1),
+    "TIMELINE":   IntentRetrievalOverrides(top_k_dense_scale=1.4, top_k_fused_scale=1.2, top_k_final_scale=1.5, reranker_threshold_scale=0.8),
+    "HOW_TO":     IntentRetrievalOverrides(top_k_dense_scale=1.1, top_k_final_scale=1.2),
+    "QUOTE_EVIDENCE": IntentRetrievalOverrides(top_k_dense_scale=0.9, top_k_fused_scale=0.7, top_k_final_scale=0.8, reranker_threshold_scale=1.35, reranker_min_docs=1),
+}
+
+INTENT_GENERATION_PARAMS_REGULAR: dict[str, IntentGenerationParams] = {
+    "FACTUAL":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "SUMMARIZE":      IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXPLAIN":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "ANALYZE":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "COMPARE":        IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "CRITIQUE":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "COLLECTION":     IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "OVERVIEW":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXTRACT":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+    "TIMELINE":       IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.0, repetition_penalty=1.0, enable_thinking=False),
+    "HOW_TO":         IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+}
+
+INTENT_GENERATION_PARAMS_DEEP_RESEARCH: dict[str, IntentGenerationParams] = {
+    "FACTUAL":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "SUMMARIZE":      IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXPLAIN":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "ANALYZE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "COMPARE":        IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "CRITIQUE":       IntentGenerationParams(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=True),
+    "COLLECTION":     IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "OVERVIEW":       IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "EXTRACT":        IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+    "TIMELINE":       IntentGenerationParams(temperature=0.5, top_p=0.7, top_k=20, min_p=0.0, presence_penalty=1.0, repetition_penalty=1.0, enable_thinking=False),
+    "HOW_TO":         IntentGenerationParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False),
+    "QUOTE_EVIDENCE": IntentGenerationParams(temperature=0.3, top_p=0.6, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, enable_thinking=False),
+}
+
+# Backward-compatible alias
+INTENT_GENERATION_PARAMS = INTENT_GENERATION_PARAMS_REGULAR
+
+
+def resolve_retrieval_params(mode_config: ModelConfig, intent: str) -> ResolvedRetrievalParams:
+    """Apply intent-specific scale factors to base mode config values.
+
+    Scale factors multiply the mode's base value. Absolute overrides (top_k_final,
+    reranker_min_docs) replace the base value when not None. All scaled values are
+    clamped to minimum 1. Falls back to base mode values if intent is not recognized.
+    """
+    overrides = INTENT_RETRIEVAL_OVERRIDES.get(intent.upper(), IntentRetrievalOverrides())
+    return ResolvedRetrievalParams(
+        top_k_dense=max(1, round(mode_config.top_k_dense * overrides.top_k_dense_scale)),
+        top_k_fused=max(1, round(mode_config.top_k_fused * overrides.top_k_fused_scale)),
+        top_k_rerank=max(1, round(mode_config.top_k_rerank * overrides.top_k_rerank_scale)),
+        top_k_final=max(1, round(mode_config.top_k_final * overrides.top_k_final_scale)),
+        reranker_threshold=mode_config.reranker_threshold * overrides.reranker_threshold_scale,
+        reranker_min_docs=(
+            overrides.reranker_min_docs
+            if overrides.reranker_min_docs is not None
+            else mode_config.reranker_min_docs
+        ),
+        max_children_per_parent=mode_config.max_children_per_parent,
+    )
+
+
+def resolve_generation_params(intent: str, mode: str = "regular") -> IntentGenerationParams:
+    """Return generation params for intent and mode. Falls back to OVERVIEW if unrecognized."""
+    if mode == "deep-research":
+        params = INTENT_GENERATION_PARAMS_DEEP_RESEARCH.get(intent.upper())
+        if params is not None:
+            return params
+    params = INTENT_GENERATION_PARAMS_REGULAR.get(intent.upper())
+    if params is not None:
+        return params
+    return INTENT_GENERATION_PARAMS_REGULAR.get("OVERVIEW", IntentGenerationParams(
+        temperature=0.7, top_p=0.8, enable_thinking=False,
+    ))
 
 
 def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
     """Get mode configuration with RAM-aware token budget adjustments."""
+
+    # Shared model stack per mode (fields identical across RAM tiers)
+    _REGULAR_MODELS = dict(
+        llm_model="NexVeridian/Qwen3.5-35B-A3B-4bit",
+        embedding_model="mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+        reranker_model="jinaai/jina-reranker-v3-mlx",
+        embedding_device="cpu",
+        quantization="4-bit",
+    )
+
     if mode == "regular":
         if ram_gb < 48:
             # 32GB systems: reduced context to avoid swap thrashing
             return ModelConfig(
                 mode="regular",
-                llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-                embedding_model="BAAI/bge-m3",
-                reranker_model="jinaai/jina-reranker-v3-mlx",
-                embedding_device="cpu",
-                quantization="4-bit",
+                **_REGULAR_MODELS,
                 context_window=16_000,
                 retrieval_budget=8_000,
-                top_k_dense=100,
-                top_k_sparse=100,
-                top_k_fused=50,
-                top_k_rerank=20,
-                top_k_final=5,
-                reranker_threshold=0.05,  # Cosine similarity threshold (Jina v3 scores in ~0..1)
-                reranker_min_docs=3,
                 system_ram_gb=ram_gb,
             )
         elif ram_gb >= 64:
-            # M4 Max 64GB "Regular Plus": deep retrieval exploiting 500GB/s+
-            # bandwidth and ~49GB headroom (30B-A3B 4-bit ≈ 15GB loaded).
-            # Wider retrieval net + deeper reranking while keeping 64K context
-            # at the Lost-in-the-Middle sweet spot.
+            # M4 Max 64GB: deep retrieval exploiting 500GB/s+ bandwidth
             return ModelConfig(
                 mode="regular",
-                llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-                embedding_model="BAAI/bge-m3",
-                reranker_model="jinaai/jina-reranker-v3-mlx",
-                embedding_device="cpu",
-                quantization="4-bit",
+                **_REGULAR_MODELS,
                 context_window=64_000,
                 retrieval_budget=48_000,
                 top_k_dense=200,
                 top_k_sparse=200,
                 top_k_fused=100,
-                top_k_rerank=40,
+                top_k_rerank=55,
                 top_k_final=8,
                 reranker_threshold=0.04,
                 reranker_min_docs=4,
@@ -83,58 +200,45 @@ def _get_mode_config(mode: str, ram_gb: float) -> ModelConfig:
             # 48-63GB systems: standard context, moderate retrieval
             return ModelConfig(
                 mode="regular",
-                llm_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
-                embedding_model="BAAI/bge-m3",
-                reranker_model="jinaai/jina-reranker-v3-mlx",
-                embedding_device="cpu",
-                quantization="4-bit",
+                **_REGULAR_MODELS,
                 context_window=64_000,
                 retrieval_budget=32_000,
-                top_k_dense=100,
-                top_k_sparse=100,
-                top_k_fused=50,
-                top_k_rerank=20,
-                top_k_final=5,
-                reranker_threshold=0.05,
-                reranker_min_docs=3,
                 system_ram_gb=ram_gb,
             )
 
-    elif mode == "power-deep-research":
-        if ram_gb < 64:
-            logger.warning(f"power-deep-research mode requires 64GB+ RAM. Detected {ram_gb:.0f}GB.")
-        # M4 Max 64GB calibration:
-        # 80B MoE 4-bit ≈ 48-52GB loaded → ~12GB headroom.
-        # KV cache at ~0.2MB/token → 48K ctx ≈ 9.6GB, leaving ~2.4GB OS buffer.
-        # Wide initial retrieval (400 dense+sparse) funneled through selective
-        # reranking (60) to 8 final docs — matches Regular mode's sweet spot
-        # for signal-to-noise ratio. Prior top_k_final=10 with threshold=0.015
-        # admitted low-scored docs (0.03-0.05) that diluted context without
-        # improving synthesis. Threshold=0.04 aligns with Regular mode.
+    elif mode == "deep-research":
+        if ram_gb < 48:
+            logger.warning(
+                "deep-research mode requires 48GB+ RAM. Detected %.0fGB. "
+                "Falling back to regular mode.",
+                ram_gb,
+            )
+            return _get_mode_config("regular", ram_gb)
         return ModelConfig(
-            mode="power-deep-research",
-            llm_model="mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit",
-            embedding_model="BAAI/bge-m3",
-            reranker_model="jinaai/jina-reranker-v3-mlx",
-            embedding_device="cpu",
-            quantization="4-bit",
-            context_window=48_000,
+            mode="deep-research",
+            **_REGULAR_MODELS,
+            context_window=64_000,
             retrieval_budget=40_000,
             top_k_dense=400,
             top_k_sparse=400,
             top_k_fused=200,
-            top_k_rerank=60,
+            top_k_rerank=80,
             top_k_final=8,
             reranker_threshold=0.04,
             reranker_min_docs=4,
+            reranker_enabled=True,
+            context_expansion_enabled=True,
             system_ram_gb=ram_gb,
         )
 
     raise ValueError(f"Unknown mode: {mode}")
 
 
-VALID_MODES = {"regular", "power-deep-research"}
-MODE_RAM_REQUIREMENTS: dict[str, float] = {"regular": 32.0, "power-deep-research": 64.0}
+VALID_MODES = {"regular", "deep-research"}
+MODE_RAM_REQUIREMENTS: dict[str, float] = {
+    "regular": 32.0,
+    "deep-research": 48.0,
+}
 
 
 # =============================================================================
@@ -227,6 +331,7 @@ def select_mode_config(*, manual_mode: Optional[str] = None) -> ModelConfig:
         "power-fast": "regular",  # Deprecated: use 'regular' which auto-scales
         "efficiency": "regular",
         "tier2": "regular",
+        "power-deep-research": "deep-research",  # Legacy: consolidated to single model
     }
     if mode in legacy_mapping:
         old_mode = mode

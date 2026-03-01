@@ -12,3 +12,15 @@ pdf2image
 
 # Optional: RAM detection and bench_memory script
 psutil
+
+# API layer
+fastapi
+uvicorn
+httpx
+python-multipart
+
+# Offline Speech-to-Text (MLX Whisper)
+mlx-whisper
+soundfile          # audio decoding (WAV, WebM, OGG)
+scipy              # resampling + WAV fallback decoder
+av                 # robust WebM/OGG/Opus decode fallback (PyAV)

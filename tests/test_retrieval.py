@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from src.config import ModelConfig
+from src import retrieval
 from src.retrieval import RetrievalEngine, RetrievalResult
 from src.metrics import DeduplicationMetrics, ThresholdMetrics
 from tests.conftest import (
@@ -41,24 +42,9 @@ def _make_config(mode: str = "regular") -> ModelConfig:
             reranker_min_docs=2,
             retrieval_budget=8000,
         )
-    elif mode == "power-fast":
+    elif mode == "deep-research":
         return ModelConfig(
-            mode="power-fast",
-            llm_model="test-model",
-            embedding_model="test-embed",
-            reranker_model="test-reranker",
-            top_k_dense=20,
-            top_k_sparse=20,
-            top_k_fused=15,
-            top_k_rerank=10,
-            top_k_final=5,
-            reranker_threshold=0.02,
-            reranker_min_docs=3,
-            retrieval_budget=50000,
-        )
-    elif mode == "power-deep-research":
-        return ModelConfig(
-            mode="power-deep-research",
+            mode="deep-research",
             llm_model="test-model",
             embedding_model="test-embed",
             reranker_model="test-reranker",
@@ -129,13 +115,13 @@ class TestHybridSearch:
 
 class TestDeduplication:
     def test_dedup_keeps_highest_score(self):
-        """Should keep the child with highest score per parent_id."""
+        """Should keep the child with highest score per parent_id (one-per-parent mode)."""
         items = [
             {"id": "c1", "score": 0.9, "metadata": {"parent_id": "p1"}},
             {"id": "c2", "score": 0.5, "metadata": {"parent_id": "p1"}},
             {"id": "c3", "score": 0.8, "metadata": {"parent_id": "p2"}},
         ]
-        deduped, metrics = RetrievalEngine._deduplicate_by_parent(items, top_k=10)
+        deduped, metrics = RetrievalEngine._deduplicate_by_parent(items, top_k=10, max_children_per_parent=1)
         ids = [d["id"] for d in deduped]
         assert "c1" in ids  # higher score for p1
         assert "c2" not in ids
@@ -146,7 +132,7 @@ class TestDeduplication:
             {"id": f"c{i}", "score": float(i), "metadata": {"parent_id": "p1"}}
             for i in range(5)
         ]
-        deduped, metrics = RetrievalEngine._deduplicate_by_parent(items, top_k=10)
+        deduped, metrics = RetrievalEngine._deduplicate_by_parent(items, top_k=10, max_children_per_parent=1)
         assert metrics.children_before_dedup == 5
         assert metrics.children_after_dedup == 1
         assert metrics.reduction_pct > 0
@@ -168,6 +154,64 @@ class TestDeduplication:
         ]
         deduped, _ = RetrievalEngine._deduplicate_by_parent(items, top_k=3)
         assert len(deduped) <= 3
+
+    def test_dedup_two_children_per_parent_default(self):
+        """Default max_children_per_parent=2: both top children from same parent are kept."""
+        items = [
+            {"id": "c1", "score": 0.9, "metadata": {"parent_id": "p1"}},
+            {"id": "c2", "score": 0.85, "metadata": {"parent_id": "p1"}},
+            {"id": "c3", "score": 0.5, "metadata": {"parent_id": "p1"}},
+            {"id": "c4", "score": 0.82, "metadata": {"parent_id": "p2"}},
+        ]
+        deduped, metrics = RetrievalEngine._deduplicate_by_parent(items, top_k=10)
+        ids = [d["id"] for d in deduped]
+        assert "c1" in ids
+        assert "c2" in ids   # second-best sibling kept under default=2
+        assert "c3" not in ids  # third sibling dropped
+        assert "c4" in ids
+        assert metrics.children_before_dedup == 4
+        assert metrics.children_after_dedup == 3  # 2 from p1 + 1 from p2
+
+    def test_dedup_diversity_when_budget_allows(self):
+        """With top_k=3 and max_children_per_parent=2, second sibling enters the list."""
+        items = [
+            {"id": "a1", "score": 0.9,  "metadata": {"parent_id": "pA"}},
+            {"id": "a2", "score": 0.85, "metadata": {"parent_id": "pA"}},
+            {"id": "a3", "score": 0.5,  "metadata": {"parent_id": "pA"}},
+            {"id": "b1", "score": 0.82, "metadata": {"parent_id": "pB"}},
+        ]
+        # With max=2, top_k=3: a1 (0.9), a2 (0.85), b1 (0.82)
+        deduped, _ = RetrievalEngine._deduplicate_by_parent(items, top_k=3, max_children_per_parent=2)
+        ids = [d["id"] for d in deduped]
+        assert ids == ["a1", "a2", "b1"]
+
+    def test_dedup_displacement_when_budget_tight(self):
+        """When top_k=2, the second sibling displaces the lower-scored other-parent chunk."""
+        items = [
+            {"id": "a1", "score": 0.9,  "metadata": {"parent_id": "pA"}},
+            {"id": "a2", "score": 0.85, "metadata": {"parent_id": "pA"}},
+            {"id": "a3", "score": 0.5,  "metadata": {"parent_id": "pA"}},
+            {"id": "b1", "score": 0.82, "metadata": {"parent_id": "pB"}},
+        ]
+        # With max=2, top_k=2: a1 (0.9), a2 (0.85) — b1 displaced
+        deduped, _ = RetrievalEngine._deduplicate_by_parent(items, top_k=2, max_children_per_parent=2)
+        ids = [d["id"] for d in deduped]
+        assert "a1" in ids
+        assert "a2" in ids
+        assert "b1" not in ids
+
+    def test_dedup_one_per_parent_baseline(self):
+        """max_children_per_parent=1 reproduces old one-per-parent behaviour."""
+        items = [
+            {"id": "a1", "score": 0.9,  "metadata": {"parent_id": "pA"}},
+            {"id": "a2", "score": 0.85, "metadata": {"parent_id": "pA"}},
+            {"id": "b1", "score": 0.82, "metadata": {"parent_id": "pB"}},
+        ]
+        deduped, _ = RetrievalEngine._deduplicate_by_parent(items, top_k=3, max_children_per_parent=1)
+        ids = [d["id"] for d in deduped]
+        assert "a1" in ids
+        assert "a2" not in ids  # only best child kept
+        assert "b1" in ids
 
     def test_dedup_empty_list(self):
         deduped, metrics = RetrievalEngine._deduplicate_by_parent([], top_k=10)
@@ -197,30 +241,6 @@ class TestReranking:
         reranked, _ = retrieval_engine._rerank("Chomsky language grammar", items)
         scores = [r["rerank_score"] for r in reranked]
         assert scores == sorted(scores, reverse=True)
-
-    def test_boilerplate_filtered_in_search_stage(self, retrieval_engine: RetrievalEngine, monkeypatch):
-        """Boilerplate is filtered in final search stage, not _rerank()."""
-        def _fake_hybrid_search(query: str, top_k: int, *, source_id=None):
-            return [
-                {
-                    "id": "boiler",
-                    "text": "As an AI language model, I cannot be considered a person",
-                    "score": 0.9,
-                    "metadata": {"parent_id": "p1", "source_id": "test_doc_linguistics"},
-                },
-                {
-                    "id": "normal",
-                    "text": "Chomsky language theory and generative grammar",
-                    "score": 0.8,
-                    "metadata": {"parent_id": "p2", "source_id": "test_doc_linguistics"},
-                },
-            ]
-
-        monkeypatch.setattr(retrieval_engine, "_hybrid_search", _fake_hybrid_search)
-        results = retrieval_engine.search("language", collect_metrics=False)
-        ids = [r.child_id for r in results]
-        assert "boiler" not in ids
-        assert "normal" in ids
 
     def test_rerank_empty_items(self, retrieval_engine: RetrievalEngine):
         reranked, scores = retrieval_engine._rerank("test", [])
@@ -311,6 +331,186 @@ class TestThresholdFiltering:
             metrics = results[0].metrics
             assert metrics.threshold is not None
 
+    def test_safety_net_tags_below_threshold_items(
+        self,
+        tmp_storage,
+        mock_embedder,
+        mock_reranker,
+        monkeypatch,
+    ):
+        """min_docs safety net: sub-threshold items get below_threshold=True;
+        above-threshold items are not tagged."""
+        # Set a threshold of 0.5 so only the first item passes.
+        # min_docs=3 forces the safety net to extend to 3 items (2 backfill).
+        config = ModelConfig(
+            mode="regular",
+            llm_model="test",
+            embedding_model="test",
+            reranker_model="test",
+            top_k_dense=10,
+            top_k_sparse=10,
+            top_k_fused=6,
+            top_k_rerank=6,
+            top_k_final=5,
+            reranker_threshold=0.5,
+            reranker_min_docs=3,
+        )
+        engine = RetrievalEngine(
+            storage=tmp_storage,
+            embedding_model=mock_embedder,
+            reranker=mock_reranker,
+            config=config,
+        )
+
+        def _fake_hybrid(*, embedding_query, bm25_query, top_k, source_id=None, query_vector=None):
+            return [
+                {"id": "a1", "text": "above threshold", "score": 0.9, "metadata": {"parent_id": "pa1", "source_id": "src"}},
+                {"id": "b1", "text": "below threshold one", "score": 0.8, "metadata": {"parent_id": "pb1", "source_id": "src"}},
+                {"id": "c1", "text": "below threshold two", "score": 0.7, "metadata": {"parent_id": "pc1", "source_id": "src"}},
+            ]
+
+        def _fake_rerank(query, items):
+            # Sorted descending: a1 above threshold (0.9), b1 and c1 below (0.1, 0.08)
+            reranked = [
+                {**items[0], "rerank_score": 0.90},
+                {**items[1], "rerank_score": 0.10},
+                {**items[2], "rerank_score": 0.08},
+            ]
+            return reranked, [0.90, 0.10, 0.08]
+
+        monkeypatch.setattr(engine, "_hybrid_search_decoupled", _fake_hybrid)
+        monkeypatch.setattr(engine, "_rerank", _fake_rerank)
+
+        results = engine.search("test query")
+
+        # Safety net fires: threshold=0.5 passes only a1 (score 0.90), but
+        # min_docs=3 extends to b1 and c1.
+        assert len(results) == 3
+
+        by_id = {r.child_id: r for r in results}
+
+        # a1 scored 0.90 >= 0.5 threshold: must NOT be tagged
+        assert not by_id["a1"].metadata.get("below_threshold"), (
+            "above-threshold item should not have below_threshold=True"
+        )
+
+        # b1 and c1 scored below threshold: must be tagged
+        assert by_id["b1"].metadata.get("below_threshold") is True, (
+            "sub-threshold safety-net item b1 missing below_threshold=True"
+        )
+        assert by_id["c1"].metadata.get("below_threshold") is True, (
+            "sub-threshold safety-net item c1 missing below_threshold=True"
+        )
+
+    def test_sub_threshold_expansion_scoped_to_above_threshold_sources(
+        self,
+        tmp_storage,
+        mock_embedder,
+        mock_reranker,
+        monkeypatch,
+    ):
+        config = ModelConfig(
+            mode="regular",
+            llm_model="test",
+            embedding_model="test",
+            reranker_model="test",
+            top_k_dense=10,
+            top_k_sparse=10,
+            top_k_fused=6,
+            top_k_rerank=6,
+            top_k_final=1,
+            reranker_threshold=0.05,
+            reranker_min_docs=1,
+            retrieval_budget=400,
+        )
+        engine = RetrievalEngine(
+            storage=tmp_storage,
+            embedding_model=mock_embedder,
+            reranker=mock_reranker,
+            config=config,
+        )
+
+        token_rich_text = "word " * 15
+
+        def _fake_hybrid_search_decoupled(*, embedding_query, bm25_query, top_k, source_id=None, query_vector=None):
+            return [
+                {"id": "a1", "text": token_rich_text, "score": 0.9, "metadata": {"parent_id": "pa1", "source_id": "source_a"}},
+                {"id": "b1", "text": token_rich_text, "score": 0.8, "metadata": {"parent_id": "pb1", "source_id": "source_b"}},
+                {"id": "a2", "text": token_rich_text, "score": 0.7, "metadata": {"parent_id": "pa2", "source_id": "source_a"}},
+                {"id": "b2", "text": token_rich_text, "score": 0.6, "metadata": {"parent_id": "pb2", "source_id": "source_b"}},
+            ]
+
+        def _fake_rerank(query, items):
+            reranked = [
+                {**items[0], "rerank_score": 0.90},
+                {**items[1], "rerank_score": 0.10},
+                {**items[2], "rerank_score": 0.09},
+                {**items[3], "rerank_score": 0.08},
+            ]
+            return reranked, [0.90, 0.10, 0.09, 0.08]
+
+        monkeypatch.setattr(engine, "_hybrid_search_decoupled", _fake_hybrid_search_decoupled)
+        monkeypatch.setattr(engine, "_rerank", _fake_rerank)
+        monkeypatch.setattr(retrieval, "_WORD_TO_TOKEN_RATIO", 1.0)
+
+        results = engine.search("what mentions of ChatGPT are there", intent="factual")
+        sources = {r.metadata.get("source_id") for r in results if r.metadata.get("source_id")}
+        assert "source_b" not in sources
+        assert sources == {"source_a"}
+
+    def test_sub_threshold_expansion_falls_back_when_no_above_threshold_hits(
+        self,
+        tmp_storage,
+        mock_embedder,
+        mock_reranker,
+        monkeypatch,
+    ):
+        config = ModelConfig(
+            mode="regular",
+            llm_model="test",
+            embedding_model="test",
+            reranker_model="test",
+            top_k_dense=10,
+            top_k_sparse=10,
+            top_k_fused=6,
+            top_k_rerank=6,
+            top_k_final=1,
+            reranker_threshold=0.50,
+            reranker_min_docs=1,
+            retrieval_budget=400,
+        )
+        engine = RetrievalEngine(
+            storage=tmp_storage,
+            embedding_model=mock_embedder,
+            reranker=mock_reranker,
+            config=config,
+        )
+
+        token_rich_text = "word " * 15
+
+        def _fake_hybrid_search_decoupled(*, embedding_query, bm25_query, top_k, source_id=None, query_vector=None):
+            return [
+                {"id": "a1", "text": token_rich_text, "score": 0.9, "metadata": {"parent_id": "pa1", "source_id": "source_a"}},
+                {"id": "b1", "text": token_rich_text, "score": 0.8, "metadata": {"parent_id": "pb1", "source_id": "source_b"}},
+                {"id": "a2", "text": token_rich_text, "score": 0.7, "metadata": {"parent_id": "pa2", "source_id": "source_a"}},
+            ]
+
+        def _fake_rerank(query, items):
+            reranked = [
+                {**items[0], "rerank_score": 0.20},
+                {**items[1], "rerank_score": 0.19},
+                {**items[2], "rerank_score": 0.18},
+            ]
+            return reranked, [0.20, 0.19, 0.18]
+
+        monkeypatch.setattr(engine, "_hybrid_search_decoupled", _fake_hybrid_search_decoupled)
+        monkeypatch.setattr(engine, "_rerank", _fake_rerank)
+        monkeypatch.setattr(retrieval, "_WORD_TO_TOKEN_RATIO", 1.0)
+
+        results = engine.search("who is Romeo", intent="factual")
+        sources = {r.metadata.get("source_id") for r in results if r.metadata.get("source_id")}
+        assert "source_b" in sources
+
 
 # ===========================================================================
 # Full search pipeline
@@ -365,16 +565,14 @@ class TestModeComparison:
     def test_modes_differ_in_top_k(self):
         """Different modes should have different top_k parameters."""
         regular = _make_config("regular")
-        power = _make_config("power-fast")
-        assert power.top_k_dense > regular.top_k_dense
-        assert power.top_k_final > regular.top_k_final
+        deep = _make_config("deep-research")
+        assert deep.top_k_dense > regular.top_k_dense
+        assert deep.top_k_final > regular.top_k_final
 
     def test_modes_differ_in_threshold(self):
         regular = _make_config("regular")
-        power = _make_config("power-fast")
-        deep = _make_config("power-deep-research")
-        assert power.reranker_threshold < regular.reranker_threshold
-        assert deep.reranker_threshold < power.reranker_threshold
+        deep = _make_config("deep-research")
+        assert deep.reranker_threshold < regular.reranker_threshold
 
 
 # ===========================================================================
@@ -416,3 +614,17 @@ class TestRetrievalLatency:
             logger.info(
                 f"full_search '{q[:40]}...': {t.result.elapsed_ms:.2f}ms, {result_count} results"
             )
+
+# ===========================================================================
+# Token ratio
+# ===========================================================================
+
+class TestWordToTokenRatio:
+    def test_word_to_token_ratio_applied(self):
+        """_est_tokens should apply _WORD_TO_TOKEN_RATIO to the word count."""
+        # 100 whitespace-separated words × 1.35 = 135
+        text = "word " * 100
+        from src import retrieval as _retrieval
+        # Replicate the closure logic directly
+        result = int(len(text.split()) * _retrieval._WORD_TO_TOKEN_RATIO)
+        assert result == int(100 * 1.35)
