@@ -14,6 +14,8 @@ export interface FreeChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** Captured <think>…</think> reasoning chain, set when thinking mode is on */
+  thinkingContent?: string;
   timestamp: number;
 }
 

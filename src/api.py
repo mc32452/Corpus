@@ -536,6 +536,7 @@ class FreeformMessage(BaseModel):
 class FreeformChatRequest(BaseModel):
     messages: list[FreeformMessage]
     model: str = "regular"  # "regular" | "deep-research"
+    enable_thinking: bool = False  # only effective for the 35B model (Qwen3.5)
 
 
 _FREEFORM_SYSTEM = (
@@ -568,11 +569,18 @@ async def _freeform_stream_generator(
             request_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
             engine = _get_engine(request_mode)
             gen = engine._ensure_generator()
-            for token in gen.generate_chat_stream(
-                messages,
-                should_stop=lambda: stop_event.is_set(),
-            ):
-                loop.call_soon_threadsafe(queue.put_nowait, token)
+            if freeform_request.enable_thinking:
+                for event in gen.stream_chat_with_thinking(
+                    messages,
+                    should_stop=lambda: stop_event.is_set(),
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+            else:
+                for token in gen.generate_chat_stream(
+                    messages,
+                    should_stop=lambda: stop_event.is_set(),
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, {"type": "answer", "text": token})
         except Exception as exc:
             logger.exception("freeform producer error: %s", exc)
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -597,9 +605,10 @@ async def _freeform_stream_generator(
                 err_json = json.dumps({"error": str(item)})
                 yield f"event: error\ndata: {err_json}\n\n"
                 return
-            # item is a token string
-            token_json = json.dumps({"text": item})
-            yield f"event: token\ndata: {token_json}\n\n"
+            # item is a dict {"type": "thinking"|"answer", "text": str}
+            sse_event = "thinking_token" if item.get("type") == "thinking" else "token"
+            token_json = json.dumps({"text": item.get("text", "")})
+            yield f"event: {sse_event}\ndata: {token_json}\n\n"
     except asyncio.CancelledError:
         stop_event.set()
     finally:

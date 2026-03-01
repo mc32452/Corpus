@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatMarkdown } from "@/components/chat-markdown";
 import {
   ArrowUpIcon,
+  BrainIcon,
   CheckIcon,
   CopyIcon,
   MicIcon,
@@ -14,7 +15,14 @@ import {
   PickerTrigger,
   PickerContent,
   PickerItem,
+  pickerTriggerVariants,
 } from "@/components/ui/picker";
+import {
+  ReasoningRoot,
+  ReasoningTrigger,
+  ReasoningContent,
+  ReasoningText,
+} from "@/components/assistant-ui/reasoning";
 import { useSpeechToText } from "@/hooks/useSpeechToText";
 import { cn } from "@/lib/utils";
 import { TypewriterText } from "@/components/ui/typewriter-text";
@@ -51,10 +59,12 @@ async function* freeformStreaming(
   messages: FreeChatMessage[],
   model: string,
   signal: AbortSignal,
+  enableThinking: boolean = false,
 ): AsyncGenerator<{ event: string; data: string }, void, unknown> {
   const body = JSON.stringify({
     messages: messages.map((m) => ({ role: m.role, content: m.content })),
     model,
+    enable_thinking: enableThinking,
   });
 
   const res = await fetch(`${BACKEND_BASE}/api/freeform/chat`, {
@@ -201,6 +211,7 @@ export function FreeformChatPanel({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState("regular");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [thinkingEnabled, setThinkingEnabled] = useState(false);
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -213,9 +224,15 @@ export function FreeformChatPanel({
   const titleGeneratedRef = useRef(false);
   const lastInsertedRef = useRef("");
   const lastChunkRef = useRef<{ text: string; at: number } | null>(null);
+  const thinkingTextRef = useRef("");
 
   // ── Sync refs ──────────────────────────────────────────────────────────────
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  // Reset thinking mode when switching to a model that doesn't support it
+  useEffect(() => {
+    if (selectedModel === "deep-research") setThinkingEnabled(false);
+  }, [selectedModel]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -401,6 +418,7 @@ export function FreeformChatPanel({
 
       const nextMessages = [...messagesRef.current, userMsg, assistantMsg];
       streamingTextRef.current = "";
+      thinkingTextRef.current = "";
       setMessages(nextMessages);
       setIsStreaming(true);
 
@@ -413,7 +431,12 @@ export function FreeformChatPanel({
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: streamingTextRef.current, timestamp: Date.now() }
+                ? {
+                    ...m,
+                    content: streamingTextRef.current,
+                    thinkingContent: thinkingTextRef.current || undefined,
+                    timestamp: Date.now(),
+                  }
                 : m,
             ),
           );
@@ -428,8 +451,18 @@ export function FreeformChatPanel({
           historyToSend,
           selectedModel,
           controller.signal,
+          thinkingEnabled,
         )) {
-          if (event === "token") {
+          if (event === "thinking_token") {
+            try {
+              const parsed = JSON.parse(data);
+              const token = typeof parsed.text === "string" ? parsed.text : "";
+              if (token) {
+                thinkingTextRef.current += token;
+                scheduleUpdate();
+              }
+            } catch { /* skip */ }
+          } else if (event === "token") {
             try {
               const parsed = JSON.parse(data);
               const token = typeof parsed.text === "string" ? parsed.text : "";
@@ -449,7 +482,12 @@ export function FreeformChatPanel({
             const finalText = streamingTextRef.current;
             const finalMessages = nextMessages.map((m) =>
               m.id === assistantId
-                ? { ...m, content: finalText, timestamp: Date.now() }
+                ? {
+                    ...m,
+                    content: finalText,
+                    thinkingContent: thinkingTextRef.current || undefined,
+                    timestamp: Date.now(),
+                  }
                 : m,
             );
             setMessages(finalMessages);
@@ -472,7 +510,7 @@ export function FreeformChatPanel({
         setIsStreaming(false);
       }
     },
-    [saveCurrentSession, selectedModel],
+    [saveCurrentSession, selectedModel, thinkingEnabled],
   );
 
   // ── Form submit ────────────────────────────────────────────────────────────
@@ -527,9 +565,12 @@ export function FreeformChatPanel({
 
         {/* Message list */}
         {messages.map((message) => {
-          if (!message.content && message.role === "assistant" && !isStreaming) return null;
+          if (!message.content && !message.thinkingContent && message.role === "assistant" && !isStreaming) return null;
           const isUser = message.role === "user";
-          const isPlaceholder = message.role === "assistant" && !message.content && isStreaming;
+          // Show placeholder spinner only when there's no content of any kind yet
+          const isPlaceholder = message.role === "assistant" && !message.content && !message.thinkingContent && isStreaming;
+          // Thinking is actively streaming when we have thinking content but no answer tokens yet
+          const isThinkingStreaming = isStreaming && !!message.thinkingContent && !message.content;
 
           if (isUser) {
             return (
@@ -556,9 +597,25 @@ export function FreeformChatPanel({
               className="fade-in slide-in-from-bottom-1 relative mx-auto w-full max-w-(--thread-max-width) animate-in py-4 duration-150"
               data-role="assistant"
             >
-              {isPlaceholder ? (
-                <span className="px-2 text-muted-foreground animate-pulse">Thinking…</span>
-              ) : (
+              {/* Loading spinner — before any tokens arrive */}
+              {isPlaceholder && (
+                <span className="px-2 text-muted-foreground animate-pulse">Loading model…</span>
+              )}
+
+              {/* Reasoning panel — rendered naked, no bubble */}
+              {message.thinkingContent && (
+                <ReasoningRoot defaultOpen variant="ghost" className="mb-2">
+                  <ReasoningTrigger active={isThinkingStreaming} />
+                  <ReasoningContent aria-busy={isThinkingStreaming} className="rounded-md bg-white/10 backdrop-blur-lg mt-1">
+                    <ReasoningText className="text-foreground/70">
+                      <ChatMarkdown content={message.thinkingContent} citations={[]} />
+                    </ReasoningText>
+                  </ReasoningContent>
+                </ReasoningRoot>
+              )}
+
+              {/* Answer bubble — only rendered once answer tokens arrive */}
+              {message.content && (
                 <div
                   className="wrap-break-word w-fit max-w-full px-4 py-3 text-foreground text-base leading-[1.65] bg-white/10 backdrop-blur-lg"
                   style={{ borderRadius: "18px 18px 18px 4px" }}
@@ -637,6 +694,33 @@ export function FreeformChatPanel({
                 rows={1}
                 className="max-h-40 flex-1 resize-none bg-transparent py-2 text-sm text-white outline-none placeholder:text-[#555555] focus-visible:ring-0 disabled:opacity-50 overflow-y-auto"
               />
+
+              {/* Thinking mode toggle — only shown for the 35B model */}
+              {selectedModel === "regular" && (
+                <button
+                  type="button"
+                  onClick={() => setThinkingEnabled((v) => !v)}
+                  aria-pressed={thinkingEnabled}
+                  title={thinkingEnabled ? "Thinking mode on — click to disable" : "Enable thinking mode"}
+                  className={cn(
+                    pickerTriggerVariants({ variant: "ghost", size: "sm" }),
+                    "shrink-0",
+                    thinkingEnabled ? "text-blue-400" : "text-muted-foreground",
+                  )}
+                >
+                  {thinkingEnabled ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-blue-400 shrink-0" />
+                      <span className="font-medium">Think</span>
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1.5">
+                      <BrainIcon className="size-3.5" />
+                      <span className="font-medium">Think</span>
+                    </span>
+                  )}
+                </button>
+              )}
 
               {/* Model selector */}
               <PickerRoot open={pickerOpen} onOpenChange={setPickerOpen}>

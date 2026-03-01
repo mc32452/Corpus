@@ -492,6 +492,140 @@ class MlxGenerator:
             if output:
                 yield output
 
+    def stream_chat_with_thinking(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        config: Optional[GenerationConfig] = None,
+        should_stop: Optional[callable] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ):
+        """Stream chat with the model's reasoning chain exposed.
+
+        Yields dicts::
+            {"type": "thinking", "text": str}  — inside <think> block
+            {"type": "answer",   "text": str}  — visible response tokens
+
+        The Qwen3 chat template appends ``<think>`` to the prompt tail when
+        ``enable_thinking=True``, so the very first generated token is already
+        inside the think block.  Generation parameters are floored to values
+        recommended for thinking mode (temp >= 0.6, max_tokens >= 8192).
+        """
+        if not messages:
+            raise ValueError("messages must be a non-empty list of role/content dicts.")
+
+        prompt = self._apply_chat_template(messages, enable_thinking=True)
+        final_max_tokens, resolved_temperature, resolved_top_p, repetition_penalty, stop_tokens, prompt_tokens = (
+            self._resolve_generation_inputs(prompt, config)
+        )
+        # Thinking mode: floor temperature and token budget to sensible minimums
+        effective_temp = max(temperature if temperature is not None else resolved_temperature, 0.6)
+        effective_top_p = max(top_p if top_p is not None else resolved_top_p, 0.9)
+        effective_max_tokens = max(final_max_tokens, 8192)
+
+        try:
+            from mlx_lm.generate import stream_generate  # noqa: F401 – confirm available
+        except ImportError:
+            raise RuntimeError("mlx-lm stream_generate is not available for thinking mode.")
+
+        yield from self._stream_tokens_thinking(
+            prompt, effective_max_tokens, effective_temp, effective_top_p,
+            repetition_penalty, stop_tokens, prompt_tokens,
+            should_stop=should_stop,
+        )
+
+    def _stream_tokens_thinking(
+        self, prompt: str, max_tokens: int, temperature: float, top_p: float,
+        repetition_penalty: Optional[float], stop_tokens: list[str],
+        prompt_tokens: int,
+        *,
+        should_stop: Optional[callable] = None,
+    ):
+        """Yield thinking/answer classified dicts from mlx-lm stream_generate.
+
+        The chat template pre-injects ``<think>`` at the prompt tail, so the
+        stream starts already inside the think block (``in_think`` starts True).
+        """
+        from mlx_lm.generate import stream_generate
+
+        generate_kwargs = self._build_generation_kwargs(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        stop_pattern = self._get_stop_tokens_pattern(stop_tokens)
+        max_stop_len = max((len(t) for t in stop_tokens), default=0)
+        answer_boundary_guard = max(max_stop_len - 1, 0)
+        think_boundary_guard = len(self._thinking_close_tag) - 1
+
+        start_time = time.perf_counter()
+        accumulated = ""
+        in_think = True  # chat template pre-injects <think> into prompt tail
+        token_count = 0
+
+        for response in stream_generate(**generate_kwargs):
+            if should_stop is not None and should_stop():
+                logger.info("Thinking stream stopped by callback")
+                break
+
+            accumulated += response.text
+            token_count += 1
+
+            while accumulated:
+                if in_think:
+                    close_idx = accumulated.find(self._thinking_close_tag)
+                    if close_idx == -1:
+                        # Still inside think; emit all but the closing-tag boundary guard
+                        safe = len(accumulated) - think_boundary_guard
+                        if safe > 0:
+                            yield {"type": "thinking", "text": accumulated[:safe]}
+                            accumulated = accumulated[safe:]
+                        break
+                    else:
+                        if close_idx > 0:
+                            yield {"type": "thinking", "text": accumulated[:close_idx]}
+                        accumulated = accumulated[close_idx + len(self._thinking_close_tag):]
+                        in_think = False
+                        # continue scanning for answer text
+                else:
+                    stop_match = stop_pattern.search(accumulated) if stop_pattern else None
+                    if stop_match:
+                        content = accumulated[:stop_match.start()]
+                        if content:
+                            yield {"type": "answer", "text": content}
+                        logger.info(
+                            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d "
+                            "time_s=%.2f (stop token)",
+                            self._model_id, prompt_tokens, token_count,
+                            time.perf_counter() - start_time,
+                        )
+                        return
+                    safe = len(accumulated) - answer_boundary_guard
+                    if safe > 0:
+                        yield {"type": "answer", "text": accumulated[:safe]}
+                        accumulated = accumulated[safe:]
+                    elif len(accumulated) > STREAM_BUFFER_LIMIT_CHARS:
+                        yield {"type": "answer", "text": accumulated}
+                        accumulated = ""
+                    break
+
+        # Flush remainder
+        if accumulated:
+            stop_match = stop_pattern.search(accumulated) if stop_pattern else None
+            if stop_match:
+                accumulated = accumulated[:stop_match.start()]
+            if accumulated:
+                yield {"type": "answer" if not in_think else "thinking", "text": accumulated}
+
+        logger.info(
+            "LLM thinking stream | model=%s prompt_tokens=%d output_tokens=%d time_s=%.2f",
+            self._model_id, prompt_tokens, token_count, time.perf_counter() - start_time,
+        )
+
     def _stream_tokens(
         self, prompt: str, max_tokens: int, temperature: float, top_p: float,
         repetition_penalty: Optional[float], stop_tokens: list[str],
@@ -601,14 +735,14 @@ class MlxGenerator:
             self._model_id, prompt_tokens, token_count, elapsed_s, stopped_on_stop_token,
         )
 
-    def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
+    def _apply_chat_template(self, messages: list[dict[str, str]], *, enable_thinking: bool = False) -> str:
         if hasattr(self._tokenizer, "apply_chat_template"):
             try:
                 return self._tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
-                    enable_thinking=False,
+                    enable_thinking=enable_thinking,
                 )
             except TypeError:
                 return self._tokenizer.apply_chat_template(

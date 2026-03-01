@@ -77,10 +77,10 @@ export function ChatMarkdown({
             <blockquote className="border-l-2 border-current/30 pl-3 italic my-2">{children}</blockquote>
           ),
           pre: ({ children }) => (
-            <pre className="bg-black/20 rounded-md p-3 overflow-x-auto my-2">{children}</pre>
+            <pre className="bg-zinc-900 rounded-md p-3 overflow-x-auto my-2 text-sm">{children}</pre>
           ),
           code: ({ children }) => (
-            <code className="font-mono text-[0.9em] bg-black/20 px-1 py-0.5 rounded">{children}</code>
+            <code className="font-mono text-[0.9em] bg-zinc-900 px-1 py-0.5 rounded">{children}</code>
           ),
           a: ({ href, children }) => {
             const index = extractCitationIndex(href);

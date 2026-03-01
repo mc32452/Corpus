@@ -42,8 +42,8 @@ export const ThinkingPanel: FC = () => {
   return (
     <ReasoningRoot variant="ghost" defaultOpen={false}>
       <ReasoningTrigger active={isRunning} label={triggerLabel} />
-      <ReasoningContent aria-busy={isRunning}>
-        <ReasoningText>
+      <ReasoningContent aria-busy={isRunning} className="rounded-md bg-white/10 backdrop-blur-lg mt-1">
+        <ReasoningText className="text-foreground/70">
           <ul className="space-y-1.5">
             {thinkingSteps.map((step) => (
               <li key={step.id} className="flex items-start gap-2">
