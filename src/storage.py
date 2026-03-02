@@ -419,6 +419,10 @@ class StorageEngine:
             return {}
         return result
 
+    def _fts_index_ready(self) -> bool:
+        """Return True if the FTS index exists and is not dirty."""
+        return self._table is not None and not self._fts_dirty
+
     def _execute_hybrid_search(
         self,
         *,
@@ -426,17 +430,17 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str],
+        query_type: str = "hybrid",
     ) -> list[dict[str, Any]]:
         if self._table is None:
             return []
 
-        builder = (
-            self._table
-            .search(query_type="hybrid")
-            .vector(query_vector)
-            .text(query_text)
-            .limit(top_k)
-        )
+        builder = self._table.search(query_type=query_type)
+        if query_type in ("hybrid", "vector"):
+            builder = builder.vector(query_vector)
+        if query_type in ("hybrid", "fts"):
+            builder = builder.text(query_text)
+        builder = builder.limit(top_k)
         if source_id:
             builder = builder.where(self._where_eq("source_id", source_id), prefilter=True)
         return builder.to_list()
@@ -448,6 +452,7 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str],
+        query_type: str = "hybrid",
     ) -> list[dict[str, Any]]:
         try:
             return self._execute_hybrid_search(
@@ -455,6 +460,7 @@ class StorageEngine:
                 query_vector=query_vector,
                 top_k=top_k,
                 source_id=source_id,
+                query_type=query_type,
             )
         except Exception as exc:
             logger.warning(
@@ -467,6 +473,7 @@ class StorageEngine:
                 query_vector=query_vector,
                 top_k=top_k,
                 source_id=source_id,
+                query_type=query_type,
             )
 
     def hybrid_search(
@@ -476,10 +483,28 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str] = None,
+        mode: str = "hybrid",
     ) -> list[dict[str, Any]]:
-        """LanceDB native hybrid search (vector ANN + full-text BM25 with RRF fusion)."""
+        """LanceDB native hybrid search (vector ANN + full-text BM25 with RRF fusion).
+
+        Parameters
+        ----------
+        mode : str
+            Search mode: ``"hybrid"`` (default, vector + FTS), ``"dense"``
+            (vector-only ANN), or ``"sparse"`` (FTS-only BM25).  Passed as
+            ``query_type`` to LanceDB.  All existing callers use the default
+            ``"hybrid"`` unchanged.
+        """
         if self._table is None:
             raise RuntimeError("LanceDB table is not initialized. Run ingest first.")
+
+        query_type_map = {"hybrid": "hybrid", "dense": "vector", "sparse": "fts"}
+        query_type = query_type_map.get(mode, "hybrid")
+
+        # FTS-only fallback: if FTS index is not ready, fall back to hybrid
+        if query_type == "fts" and not self._fts_index_ready():
+            logger.warning("FTS index not ready; falling back to hybrid search for callback")
+            query_type = "hybrid"
 
         self._refresh_fts_if_dirty_for_query()
         rows = self._run_hybrid_search_with_index_retry(
@@ -487,6 +512,7 @@ class StorageEngine:
             query_vector=query_vector,
             top_k=top_k,
             source_id=source_id,
+            query_type=query_type,
         )
 
         results: list[dict[str, Any]] = []

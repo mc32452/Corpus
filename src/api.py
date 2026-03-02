@@ -58,6 +58,8 @@ from .query_events import (
     StatusEvent,
     TextTokenEvent,
     ThinkingTokenEvent,
+    ToolCallBeginEvent,
+    ToolResultEvent,
 )
 from .stream_protocol import (
     annotation_error,
@@ -77,6 +79,8 @@ from .stream_protocol import (
     encode_text_delta,
     encode_text_end,
     encode_text_start,
+    encode_tool_call_begin,
+    encode_tool_result,
     http_error_body,
     STREAM_HEADERS,
 )
@@ -337,6 +341,10 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
         return annotation_sources(event.source_ids)
     elif isinstance(event, CitationListEvent):
         return annotation_citations(event.citations)
+    elif isinstance(event, ToolCallBeginEvent):
+        return encode_tool_call_begin(event.tool_call_id, event.tool_name, event.arguments)
+    elif isinstance(event, ToolResultEvent):
+        return encode_tool_result(event.tool_call_id, event.result)
     elif isinstance(event, TextTokenEvent):
         # Should not reach here — handled statefully in the consumer loop.
         return None
@@ -520,6 +528,27 @@ async def _chat_stream_generator(
     elif raw_enable_thinking is False:
         enable_thinking = False
 
+    follow_up_instruction: Optional[str] = frontend_config.get("followUpInstruction") or None
+
+    # Detect follow-up from conversation history: if any prior message has role
+    # "assistant", this is a follow-up turn regardless of whether the legacy
+    # follow_up_instruction field is set.
+    prior_messages = chat_request.messages[:-1]
+    is_follow_up: bool = any(
+        getattr(m, "role", None) == "assistant" for m in prior_messages
+    )
+    if is_follow_up:
+        logger.info("Chat: detected follow-up turn from conversation history")
+
+    # Serialize full conversation history for follow-up routing so the engine
+    # can skip retrieval and pass history directly to tool-augmented generation.
+    conversation_history: list[dict[str, str]] = []
+    if is_follow_up:
+        for _m in chat_request.messages:
+            _text = _m.get_text().strip()
+            if _m.role in ("user", "assistant") and _text:
+                conversation_history.append({"role": _m.role, "content": _text})
+
     logger.info("Chat request: frontend model=%r → backend mode=%r, intent_override=%r, enable_thinking=%r", frontend_model_name, request_mode, intent_override, enable_thinking)
 
     pinned_engine = await asyncio.to_thread(_get_engine, request_mode)
@@ -533,6 +562,9 @@ async def _chat_stream_generator(
                 intent_override=intent_override,
                 should_stop=lambda: stop_event.is_set(),
                 enable_thinking=enable_thinking,
+                follow_up_instruction=follow_up_instruction,
+                is_follow_up=is_follow_up,
+                conversation_history=conversation_history,
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:

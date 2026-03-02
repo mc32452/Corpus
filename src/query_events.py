@@ -83,6 +83,32 @@ class FinishEvent:
     completion_tokens: int = 0
 
 
+@dataclass(frozen=True)
+class ToolCallBeginEvent:
+    """Start of a tool call — maps to AI SDK v6 ``tool-call-begin`` frame.
+
+    Emitted when the model invokes a tool.  The frontend runtime creates
+    a tool-call message part which is rendered by ``makeAssistantToolUI``
+    or the ``ToolFallback`` component.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    arguments: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolResultEvent:
+    """Result of a tool execution — maps to AI SDK v6 ``tool-result`` frame.
+
+    Emitted after the tool has been executed so the frontend can display
+    the result inside the tool-call card.
+    """
+
+    tool_call_id: str
+    result: object = None
+
+
 # Union type for type checking (Python 3.9 compatible)
 QueryEvent = Union[
     StatusEvent,
@@ -93,4 +119,6 @@ QueryEvent = Union[
     CitationListEvent,
     ErrorEvent,
     FinishEvent,
+    ToolCallBeginEvent,
+    ToolResultEvent,
 ]

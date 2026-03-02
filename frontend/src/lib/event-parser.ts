@@ -31,6 +31,8 @@ export interface Citation {
   chunk_text?: string;
   /** Optional verified highlight anchor computed post-generation. */
   highlight_text?: string;
+  /** True when this citation is new relative to a previous branch (set by frontend diffing). */
+  isNew?: boolean;
 }
 
 // ---------------------------------------------------------------------------

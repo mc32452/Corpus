@@ -55,6 +55,64 @@ STREAM_BUFFER_LIMIT_CHARS = 500
 STREAM_TAIL_GUARD_CHARS = 128
 SENTENCE_BOUNDARY_REGEX = re.compile(r"[.!?][\s\n]+")
 
+# ---------------------------------------------------------------------------
+# Tool call parsers (module-level — used by CallbackEngine)
+# ---------------------------------------------------------------------------
+
+# Format A (XML-parameter format) — what Qwen3.5 actually produces:
+#   <tool_call>
+#   <function=search>
+#   <parameter=query>value</parameter>
+#   <parameter=max_results>5</parameter>
+#   </function>
+#   </tool_call>
+_TOOL_CALL_XML_RE = re.compile(
+    r"<tool_call>\s*<function=(\w+)>(.*?)</function>\s*</tool_call>",
+    re.DOTALL,
+)
+_PARAM_RE = re.compile(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+# Format B (JSON) — fallback for other Qwen3 variants:
+#   <tool_call>{"name": "search", "arguments": {"query": "..."}}</tool_call>
+_TOOL_CALL_JSON_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def parse_tool_call(text: str) -> dict | None:
+    """Parse a Qwen3.5 tool call from generated text.
+
+    Handles both the XML-parameter format (primary, confirmed for this model)
+    and the JSON format (fallback for other Qwen3 variants).
+
+    Returns ``{"name": str, "arguments": dict}`` or ``None`` on any failure.
+    Never raises.
+    """
+    # Try XML-parameter format first (confirmed format for Qwen3.5)
+    match = _TOOL_CALL_XML_RE.search(text)
+    if match:
+        func_name = match.group(1)
+        arguments: dict = {}
+        for pm in _PARAM_RE.finditer(match.group(2)):
+            val: object = pm.group(2).strip()
+            try:
+                val = int(val)  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                pass
+            arguments[pm.group(1)] = val
+        if func_name and arguments:
+            return {"name": func_name, "arguments": arguments}
+
+    # Try JSON format
+    match = _TOOL_CALL_JSON_RE.search(text)
+    if match:
+        try:
+            payload = json.loads(match.group(1))
+            if isinstance(payload.get("name"), str) and isinstance(payload.get("arguments"), dict):
+                return {"name": payload["name"], "arguments": payload["arguments"]}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    return None
+
 
 class MlxGenerator:
     """MLX-LM based text generator with KVCache for context warming."""
@@ -481,12 +539,22 @@ class MlxGenerator:
         messages: list[dict[str, str]],
         *,
         config: Optional[GenerationConfig] = None,
+        tools: list[dict] | None = None,
     ) -> str:
-        """Non-streaming chat generation. All sampling params come from config."""
+        """Non-streaming chat generation. All sampling params come from config.
+
+        Parameters
+        ----------
+        tools : list[dict] | None
+            Optional tool definitions to inject into the chat template.
+            Used by the callback verification pass.  When provided the
+            tokenizer renders the tool schema into the system message; the
+            model may then respond with a tool call or a plain response.
+        """
         if not messages:
             raise ValueError("messages must be a non-empty list of role/content dicts.")
 
-        prompt = self._apply_chat_template(messages, enable_thinking=False)
+        prompt = self._apply_chat_template(messages, enable_thinking=False, tools=tools)
         final_max_tokens, temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, stop_tokens, prompt_tokens = (
             self._resolve_generation_inputs(prompt, config)
         )
@@ -773,21 +841,41 @@ class MlxGenerator:
             time.perf_counter() - start_time,
         )
 
-    def _apply_chat_template(self, messages: list[dict[str, str]], *, enable_thinking: bool = False) -> str:
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        enable_thinking: bool = False,
+        tools: list[dict] | None = None,
+    ) -> str:
         if hasattr(self._tokenizer, "apply_chat_template"):
             try:
                 return self._tokenizer.apply_chat_template(
                     messages,
+                    tools=tools,
                     tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=enable_thinking,
                 )
             except TypeError:
-                return self._tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                # Fallback 1: tokenizer doesn't support tools= or enable_thinking=
+                if tools is not None:
+                    logger.warning(
+                        "apply_chat_template raised TypeError with tools=; retrying without tools"
+                    )
+                try:
+                    return self._tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    return self._tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
             except Exception:
                 pass
 

@@ -226,6 +226,36 @@ def annotation_citations(citations: list[dict[str, Any]]) -> str:
     return encode_annotation([{"type": "citations", "citations": citations}])
 
 
+def encode_tool_call_begin(tool_call_id: str, tool_name: str, args: dict) -> str:
+    """Emit a tool-call-begin frame that opens a tool-call message part.
+
+    The AI SDK v6 runtime creates a ``tool-call`` part in the assistant
+    message, which is rendered by ``makeAssistantToolUI`` or the
+    ``ToolFallback`` component.
+    """
+    return _encode_sse_payload({
+        "type": "tool-call-begin",
+        "toolCallId": tool_call_id,
+        "toolName": tool_name,
+    }) + _encode_sse_payload({
+        "type": "tool-call-delta",
+        "toolCallId": tool_call_id,
+        "argsTextDelta": json.dumps(args),
+    })
+
+
+def encode_tool_result(tool_call_id: str, result: object) -> str:
+    """Emit a tool-result frame that closes a tool-call message part.
+
+    Provides the tool execution result to be displayed in the tool-call card.
+    """
+    return _encode_sse_payload({
+        "type": "tool-result",
+        "toolCallId": tool_call_id,
+        "result": result,
+    })
+
+
 # ---------------------------------------------------------------------------
 # HTTP error body helper (for non-streaming error responses)
 # ---------------------------------------------------------------------------

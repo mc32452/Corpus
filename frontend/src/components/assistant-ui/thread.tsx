@@ -426,7 +426,7 @@ const AssistantMessage: FC = () => {
       return acc + (part as { text: string }).text;
     }, ""),
   );
-
+  const isRunning = useAuiState((s) => s.message.status?.type === "running");
   return (
     <MessagePrimitive.Root
       className="aui-assistant-message-root fade-in slide-in-from-bottom-1 relative mx-auto w-full max-w-(--thread-max-width) animate-in py-4 duration-150"

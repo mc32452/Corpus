@@ -10,10 +10,12 @@ from __future__ import annotations
 import concurrent.futures
 import difflib
 import gc
+import json
 import logging
 import os
 import re
 import threading
+import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
@@ -36,6 +38,7 @@ from .generator import (
     MlxGenerator,
     count_tokens,
     enforce_token_budget,
+    parse_tool_call,
 )
 from .ingest import ingest_file_to_storage
 from .intent import (
@@ -67,10 +70,38 @@ from .query_events import (
     StatusEvent,
     TextTokenEvent,
     ThinkingTokenEvent,
+    ToolCallBeginEvent,
+    ToolResultEvent,
 )
 from .storage import StorageConfig, StorageEngine
-
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tool definitions for tool-augmented generation
+# ---------------------------------------------------------------------------
+
+SEARCH_TOOL_DEF: dict = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": (
+            "Search the knowledge base for additional information. Use this "
+            "when the current context is insufficient to fully answer the "
+            "user's follow-up question, or when you need to verify or expand "
+            "on a claim."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to find relevant passages.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Result data classes
@@ -464,6 +495,7 @@ class RagEngine:
         self._generator_load_lock = threading.Lock()
         self._preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+
     # -- properties --------------------------------------------------------
 
     @property
@@ -676,6 +708,7 @@ class RagEngine:
             return result
 
         return _run()
+
 
     def _apply_collection_guard(
         self,
@@ -963,6 +996,9 @@ class RagEngine:
         citations_enabled: Optional[bool] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         enable_thinking: Optional[bool] = None,
+        follow_up_instruction: Optional[str] = None,
+        is_follow_up: bool = False,
+        conversation_history: Optional[list[dict]] = None,
     ) -> Iterable[QueryEvent]:
         """Execute the RAG pipeline yielding structured events.
 
@@ -988,6 +1024,10 @@ class RagEngine:
         enable_thinking : bool | None
             Tri-state thinking override: ``True`` = user forced on,
             ``False`` = user forced off, ``None`` = auto/intent-driven.
+        is_follow_up : bool
+            When True (detected from conversation history having a prior
+            assistant message), routes to tool-augmented generation so the
+            model can decide whether to run a fresh search or answer directly.
         """
         _stop = should_stop or (lambda: False)
 
@@ -999,6 +1039,9 @@ class RagEngine:
                 citations_enabled=citations_enabled,
                 should_stop=_stop,
                 enable_thinking=enable_thinking,
+                follow_up_instruction=follow_up_instruction,
+                is_follow_up=is_follow_up,
+                conversation_history=conversation_history,
             )
         except Exception as exc:
             logger.exception("query_events error: %s", exc)
@@ -1021,6 +1064,9 @@ class RagEngine:
         citations_enabled: Optional[bool],
         should_stop: Callable[[], bool],
         enable_thinking: Optional[bool] = None,
+        follow_up_instruction: Optional[str] = None,
+        is_follow_up: bool = False,
+        conversation_history: Optional[list[dict]] = None,
     ) -> Iterable[QueryEvent]:
         """Internal implementation of query_events (unwrapped from error handling)."""
         logger.info("query_events_impl: started")
@@ -1036,6 +1082,62 @@ class RagEngine:
 
         if self._memory_constrained and self._generator is not None:
             self._release_generator_model()
+
+        # -- follow-up fast path: skip retrieval entirely ------------------
+        # When the conversation already has prior assistant turns the frontend
+        # sends the full history; route straight to tool-augmented generation
+        # so the model decides whether a fresh search is needed.
+        if is_follow_up and conversation_history:
+            logger.info("[FOLLOW_UP] Skipping retrieval — routing to tool-augmented generation with history")
+            yield StatusEvent(status="Continuing conversation...")
+
+            # Default balanced generation params (no intent classification needed)
+            _fup_gen_params = IntentGenerationParams(
+                temperature=0.7, top_p=0.8, top_k=20, min_p=0.0,
+                presence_penalty=1.5, repetition_penalty=1.0, enable_thinking=False,
+            )
+            if enable_thinking is True:
+                _fup_gen_params = _dc_replace(_fup_gen_params, enable_thinking=True, temperature=1.0, top_p=0.95)
+            elif enable_thinking is False:
+                _fup_gen_params = _dc_replace(_fup_gen_params, enable_thinking=False)
+            if _fup_gen_params.enable_thinking and self._system_ram_gb > 0 and self._system_ram_gb < 48:
+                _fup_gen_params = _dc_replace(_fup_gen_params, enable_thinking=False)
+
+            _fup_gen_config = GenerationConfig(
+                max_tokens=self._generation_max_tokens,
+                context_window=config.context_window,
+                temperature=_fup_gen_params.temperature,
+                top_p=_fup_gen_params.top_p,
+                top_k=_fup_gen_params.top_k,
+                min_p=_fup_gen_params.min_p,
+                presence_penalty=_fup_gen_params.presence_penalty,
+            )
+
+            _empty_packed = _PackResult(
+                context="",
+                cite=cite,
+                source_legend=None,
+                result_metadatas=[],
+                budget_metrics=None,
+                citation_list=[],
+                packed_retrieval_results=[],
+                pack_result=None,
+                packed_metadatas=[],
+            )
+
+            yield from self._tool_augmented_generation(
+                messages=conversation_history,
+                gen_config=_fup_gen_config,
+                gen_params=_fup_gen_params,
+                should_stop=should_stop,
+                source_id=source_id,
+                cite=cite,
+                packed=_empty_packed,
+                config=config,
+                classified=None,
+                intent_result=None,
+            )
+            return
 
         # -- load retrieval models -----------------------------------------
         yield StatusEvent(status="Preparing retrieval models...")
@@ -1211,17 +1313,35 @@ class RagEngine:
             retrieval_budget=config.retrieval_budget,
         )
 
-        # -- generate with streaming tokens --------------------------------
+        if follow_up_instruction:
+            messages = messages + [{"role": "user", "content": follow_up_instruction}]
+            logger.info("Follow-up instruction injected (%d chars)", len(follow_up_instruction))
+
+        # -- inject context usage info for model awareness ------------------
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        est_tokens = total_chars // 4
+        max_ctx = config.context_window or 32768
+        n_chunks = len(packed.citation_list) if packed.citation_list else 0
+        context_usage_line = (
+            f"[CONTEXT_USAGE] tokens_used: {est_tokens} / max: {max_ctx} "
+            f"| chunks_loaded: {n_chunks}"
+        )
+        logger.info(context_usage_line)
+        # Prepend to system message content so the model sees budget info
+        if messages and messages[0].get("role") == "system":
+            messages = [
+                {**messages[0], "content": context_usage_line + "\n\n" + messages[0]["content"]},
+                *messages[1:],
+            ]
+
+        # -- resolve generation params -------------------------------------
         gen_params = classified.generation_params
 
         # Apply user thinking override (tri-state)
         if enable_thinking is True:
-            # User forced thinking on — switch to thinking-mode sampling
             gen_params = _dc_replace(gen_params, enable_thinking=True, temperature=1.0, top_p=0.95)
         elif enable_thinking is False:
-            # User forced thinking off — ensure non-thinking sampling
             gen_params = _dc_replace(gen_params, enable_thinking=False)
-        # else: None = auto, use intent-resolved value
 
         # RAM gate: disable thinking if insufficient RAM
         if gen_params.enable_thinking and self._system_ram_gb > 0 and self._system_ram_gb < 48:
@@ -1254,7 +1374,70 @@ class RagEngine:
             presence_penalty=gen_params.presence_penalty,
             repetition_penalty=gen_params.repetition_penalty if gen_params.repetition_penalty != 1.0 else None,
         )
+
+        # -- tool-augmented generation (follow-ups with search tool) -------
+        # Triggered when: (a) an explicit follow_up_instruction is provided
+        # (legacy inline-button path), OR (b) the conversation already has a
+        # prior assistant message (user typed a follow-up in the main composer).
+        if follow_up_instruction or is_follow_up:
+            yield from self._tool_augmented_generation(
+                messages=messages,
+                gen_config=gen_config,
+                gen_params=gen_params,
+                should_stop=should_stop,
+                source_id=source_id,
+                cite=cite,
+                packed=packed,
+                config=config,
+                classified=classified,
+                intent_result=intent_result,
+            )
+            return
+
+        # -- standard streaming generation (no tool augmentation) ----------
         yield StatusEvent(status="Generating answer...")
+        token_count, full_answer = yield from self._stream_generation(
+            messages=messages,
+            gen_config=gen_config,
+            gen_params=gen_params,
+            should_stop=should_stop,
+        )
+
+        # -- post-hoc citation highlight verification ----------------------
+        if cite and packed.citation_list and packed.packed_retrieval_results:
+            yield from self._verify_citation_highlights(full_answer, packed)
+
+        logger.info(
+            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | thinking=%s | tokens_generated=%d",
+            intent_result.intent.value,
+            gen_params.temperature,
+            gen_params.top_p,
+            gen_params.enable_thinking,
+            token_count,
+        )
+
+        yield FinishEvent(
+            finish_reason="stop",
+            completion_tokens=token_count,
+        )
+
+    # -- generation helper methods -----------------------------------------
+
+    def _stream_generation(
+        self,
+        messages: list[dict],
+        gen_config: GenerationConfig,
+        gen_params: Any,
+        should_stop: Callable[[], bool],
+    ) -> Iterable[QueryEvent]:
+        """Stream LLM generation, yielding text/thinking tokens.
+
+        Returns (token_count, full_answer_text) after exhausting the generator.
+        Implemented as a generator that the caller invokes with ``yield from``.
+        The return value is accessible via the generator's ``.value`` attribute
+        when using ``result = yield from self._stream_generation(...)``.
+        """
+        generator = self.ensure_generator()
         token_count = 0
         answer_tokens: list[str] = []
 
@@ -1268,7 +1451,7 @@ class RagEngine:
                 if should_stop():
                     yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
                     yield FinishEvent(finish_reason="error")
-                    return
+                    return 0, ""
                 token_count += 1
                 if event["type"] == "answer":
                     answer_tokens.append(event["text"])
@@ -1283,7 +1466,7 @@ class RagEngine:
                     message="The model's reasoning phase consumed the entire token budget. Please try a simpler question or disable thinking mode.",
                 )
                 yield FinishEvent(finish_reason="error")
-                return
+                return 0, ""
         else:
             for token in generator.generate_chat_stream(
                 messages,
@@ -1293,39 +1476,207 @@ class RagEngine:
                 if should_stop():
                     yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled during generation")
                     yield FinishEvent(finish_reason="error")
-                    return
+                    return 0, ""
                 token_count += 1
                 answer_tokens.append(token)
                 yield TextTokenEvent(token=token)
 
-        # -- post-hoc citation highlight verification ----------------------
-        if cite and packed.citation_list and packed.packed_retrieval_results:
-            full_answer = "".join(answer_tokens)
-            try:
-                highlight_map = compute_highlight_texts(full_answer, packed.packed_retrieval_results)
-                if highlight_map:
-                    updated_citations: list[dict[str, object]] = []
-                    for cit in packed.citation_list:
-                        cit_copy = dict(cit)
-                        cit_idx = cit_copy.get("index")
-                        if isinstance(cit_idx, int) and cit_idx in highlight_map:
-                            cit_copy["highlight_text"] = highlight_map[cit_idx]
-                        updated_citations.append(cit_copy)
-                    yield CitationListEvent(citations=updated_citations)
-                    logger.info(
-                        "Citation verification: corrected %d/%d citations",
-                        len(highlight_map),
-                        len(packed.citation_list),
-                    )
-            except Exception as exc:
-                logger.warning("Citation verification failed (non-fatal): %s", exc)
+        return token_count, "".join(answer_tokens)
+
+    def _verify_citation_highlights(
+        self,
+        full_answer: str,
+        packed: BudgetPackResult,
+    ) -> Iterable[QueryEvent]:
+        """Post-hoc citation highlight verification."""
+        if not packed.citation_list or not packed.packed_retrieval_results:
+            return
+        try:
+            highlight_map = compute_highlight_texts(full_answer, packed.packed_retrieval_results)
+            if highlight_map:
+                updated_citations: list[dict[str, object]] = []
+                for cit in packed.citation_list:
+                    cit_copy = dict(cit)
+                    cit_idx = cit_copy.get("index")
+                    if isinstance(cit_idx, int) and cit_idx in highlight_map:
+                        cit_copy["highlight_text"] = highlight_map[cit_idx]
+                    updated_citations.append(cit_copy)
+                yield CitationListEvent(citations=updated_citations)
+                logger.info(
+                    "Citation verification: corrected %d/%d citations",
+                    len(highlight_map),
+                    len(packed.citation_list),
+                )
+        except Exception as exc:
+            logger.warning("Citation verification failed (non-fatal): %s", exc)
+
+    def _tool_augmented_generation(
+        self,
+        messages: list[dict],
+        gen_config: GenerationConfig,
+        gen_params: Any,
+        should_stop: Callable[[], bool],
+        source_id: Optional[str],
+        cite: bool,
+        packed: BudgetPackResult,
+        config: Any,
+        classified: Any,
+        intent_result: Any,
+    ) -> Iterable[QueryEvent]:
+        """Follow-up generation with tool-use support.
+
+        Gives the model a ``search`` tool.  If the model calls it, we execute
+        fresh retrieval, inject the results, and re-generate.  If the model
+        answers directly (no tool call), we stream the direct answer.
+
+        Emits native AI SDK v6 tool-call protocol events so the frontend
+        renders them via ``ToolFallback`` / ``makeAssistantToolUI``.
+        """
+        generator = self.ensure_generator()
+
+        # -- Phase 1: Non-streaming generation with tools ------------------
+        yield StatusEvent(status="Evaluating follow-up with tools...")
+        logger.info("[TOOL_AUGMENTED] Starting non-streaming generation with search tool")
+
+        # Use a shorter budget for the tool decision pass
+        tool_gen_config = GenerationConfig(
+            max_tokens=gen_config.max_tokens,
+            context_window=gen_config.context_window,
+            temperature=gen_params.temperature,
+            top_p=gen_params.top_p,
+        )
+
+        try:
+            raw_output = generator.generate_chat(
+                messages,
+                config=tool_gen_config,
+                tools=[SEARCH_TOOL_DEF],
+            )
+        except Exception as exc:
+            logger.warning("[TOOL_AUGMENTED] Tool generation failed, falling back to standard: %s", exc)
+            yield StatusEvent(status="Generating answer...")
+            token_count, full_answer = yield from self._stream_generation(
+                messages=messages,
+                gen_config=gen_config,
+                gen_params=gen_params,
+                should_stop=should_stop,
+            )
+            if cite:
+                yield from self._verify_citation_highlights(full_answer, packed)
+            yield FinishEvent(finish_reason="stop", completion_tokens=token_count)
+            return
+
+        # -- Phase 2: Check for tool call ----------------------------------
+        tool_call_parsed = parse_tool_call(raw_output)
+
+        if not tool_call_parsed:
+            # Model decided not to search — stream the pre-generated answer directly
+            logger.info("[TOOL_AUGMENTED] No tool call — streaming direct answer (%d chars)", len(raw_output))
+            yield StatusEvent(status="Answering from existing context...")
+            # Emit the pre-generated answer as text tokens
+            for token in raw_output:
+                if should_stop():
+                    yield ErrorEvent(code="STREAM_CANCELLED", message="Cancelled")
+                    yield FinishEvent(finish_reason="error")
+                    return
+                yield TextTokenEvent(token=token)
+
+            if cite:
+                yield from self._verify_citation_highlights(raw_output, packed)
+
+            yield FinishEvent(
+                finish_reason="stop",
+                completion_tokens=len(raw_output),
+            )
+            return
+
+        # -- Phase 3: Execute tool call ------------------------------------
+        tc_name = tool_call_parsed["name"]
+        tc_args = tool_call_parsed.get("arguments", {})
+        tc_id = f"call_{uuid.uuid4().hex[:12]}"
+        search_query = tc_args.get("query", "")
 
         logger.info(
-            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | thinking=%s | tokens_generated=%d",
-            intent_result.intent.value,
-            gen_params.temperature,
-            gen_params.top_p,
-            gen_params.enable_thinking,
+            "[TOOL_CALL] name=%s query=%r tool_call_id=%s",
+            tc_name, search_query, tc_id,
+        )
+
+        yield ToolCallBeginEvent(
+            tool_call_id=tc_id,
+            tool_name=tc_name,
+            arguments=tc_args,
+        )
+
+        yield StatusEvent(status=f"Searching: {search_query[:80]}...")
+
+        # Execute retrieval using the search query from the tool call
+        try:
+            embedding_model = self._ensure_embedding_model()
+            reranker = self._ensure_reranker()
+            retrieval_engine = RetrievalEngine(
+                storage=self._storage,
+                embedding_model=embedding_model,
+                reranker=reranker,
+                config=config,
+            )
+            tool_results = retrieval_engine.search(
+                search_query,
+                source_id=source_id,
+                params=classified.retrieval_params if classified is not None else None,
+                retrieval_budget=config.retrieval_budget,
+                intent=intent_result.intent.value if intent_result is not None else None,
+            )
+            # Format results as context text
+            tool_context_parts = []
+            for i, r in enumerate(tool_results, 1):
+                text = r.parent_text if r.parent_text else r.text
+                src = r.metadata.get("source_id", "unknown")
+                tool_context_parts.append(f"[Search Result {i}] (source: {src})\n{text}")
+            tool_context = "\n\n".join(tool_context_parts)
+
+            result_summary = f"Found {len(tool_results)} passages for: {search_query}"
+            logger.info("[TOOL_RESULT] %s", result_summary)
+        except Exception as exc:
+            logger.exception("[TOOL_RESULT] Retrieval failed: %s", exc)
+            tool_context = f"Search failed: {exc}"
+            result_summary = f"Error: {exc}"
+            tool_results = []
+
+        yield ToolResultEvent(
+            tool_call_id=tc_id,
+            result={"summary": result_summary, "count": len(tool_results)},
+        )
+
+        # -- Phase 4: Re-generate with tool results in context -------------
+        yield StatusEvent(status="Generating answer with search results...")
+
+        # Build enriched messages: original messages + tool context + instruction
+        enriched_messages = list(messages) + [
+            {"role": "assistant", "content": f"I'll search for more information about: {search_query}"},
+            {"role": "user", "content": (
+                f"Here are additional search results:\n\n{tool_context}\n\n"
+                "Please provide a comprehensive answer using both the original context "
+                "and these additional search results. Include inline citation numbers "
+                "[N] when referencing specific passages."
+            )},
+        ]
+
+        token_count, full_answer = yield from self._stream_generation(
+            messages=enriched_messages,
+            gen_config=gen_config,
+            gen_params=gen_params,
+            should_stop=should_stop,
+        )
+
+        if cite:
+            yield from self._verify_citation_highlights(full_answer, packed)
+
+        logger.info(
+            "TOOL_AUGMENTED | intent=%s | tool=%s | query=%r | results=%d | tokens=%d",
+            intent_result.intent.value if intent_result is not None else "follow_up",
+            tc_name,
+            search_query,
+            len(tool_results),
             token_count,
         )
 

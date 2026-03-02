@@ -17,6 +17,28 @@ export function MessageReferences() {
     const dispatch = useAppDispatch();
     const citations = citationsByMessage[messageId] || [];
 
+    // Build set of chunk_ids from all OTHER messages' citations to detect new ones
+    const otherChunkIds = useMemo(() => {
+        const ids = new Set<string>();
+        for (const [mid, cits] of Object.entries(citationsByMessage)) {
+            if (mid === messageId) continue;
+            for (const c of cits) {
+                if (c.chunk_id) ids.add(c.chunk_id);
+            }
+        }
+        return ids;
+    }, [citationsByMessage, messageId]);
+
+    // Flag citations as new if their chunk_id wasn't in any previous branch
+    const hasOtherBranches = Object.keys(citationsByMessage).some((mid) => mid !== messageId && (citationsByMessage[mid]?.length ?? 0) > 0);
+    const citationsWithNewFlag = useMemo(() => {
+        if (!hasOtherBranches) return citations;
+        return citations.map((c) => ({
+            ...c,
+            isNew: !!c.chunk_id && !otherChunkIds.has(c.chunk_id),
+        }));
+    }, [citations, otherChunkIds, hasOtherBranches]);
+
     // Build a set of citation numbers that appear in the answer text (e.g. [1], [2])
     const citedNumbers = useMemo(() => {
         const nums = new Set<number>();
@@ -37,7 +59,7 @@ export function MessageReferences() {
     const [chunkCache, setChunkCache] = useState<Record<string, string>>({});
     const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
 
-    const grouped = useMemo(() => groupCitations(citations), [citations]);
+    const grouped = useMemo(() => groupCitations(citationsWithNewFlag), [citationsWithNewFlag]);
 
     const toggleDrawer = () => setIsDrawerOpen((prev) => !prev);
 
@@ -182,9 +204,12 @@ export function MessageReferences() {
 
                         return (
                             <div key={group.sourceId} className="flex flex-col text-sm text-foreground/90 w-full mb-1">
-                                <div className="flex flex-col mb-1 border-l-2 border-[#333] pl-3 py-0.5">
+                                    <div className="flex flex-col mb-1 border-l-2 pl-3 py-0.5" style={{ borderLeftColor: group.citations.some(c => c.isNew) ? '#22c55e' : '#333' }}>
                                     <div className="font-semibold text-foreground break-words line-clamp-2">
                                         {group.displayName}
+                                        {group.citations.some(c => c.isNew) && (
+                                            <span className="ml-2 text-[10px] font-semibold text-green-400 uppercase tracking-wide">new</span>
+                                        )}
                                     </div>
                                     <div className="flex items-center gap-1.5 flex-wrap mt-1">
                                         {group.citations.map((cit, idx) => {
@@ -193,7 +218,7 @@ export function MessageReferences() {
                                             <div key={cit.index} className="flex items-center gap-1.5 whitespace-nowrap">
                                                 <button
                                                     onClick={() => {
-                                                        const matchingCitation = citations.find((c) => c.number === cit.index);
+                                                        const matchingCitation = citationsWithNewFlag.find((c) => c.number === cit.index);
                                                         if (matchingCitation) {
                                                             dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
                                                         }
@@ -202,7 +227,7 @@ export function MessageReferences() {
                                                         isUsed
                                                             ? "text-black bg-green-400/90 hover:bg-green-400"
                                                             : "text-white bg-red-500/80 hover:bg-red-500"
-                                                    }`}
+                                                    } ${cit.isNew ? "ring-2 ring-green-400 ring-offset-1 ring-offset-black" : ""}`}
                                                     title={isUsed ? `Cited in answer — view passage [${cit.index}]` : `Retrieved but not cited — view passage [${cit.index}]`}
                                                 >
                                                     [{cit.index}]
@@ -239,7 +264,7 @@ export function MessageReferences() {
                                                 return (
                                                     <div
                                                         key={cit.index}
-                                                        className="flex flex-col bg-[#1e1e1e]/60 border border-white/10 rounded-md p-3 max-w-[95%]"
+                                                        className={`flex flex-col bg-[#1e1e1e]/60 border rounded-md p-3 max-w-[95%] ${cit.isNew ? "border-green-500/50 border-l-[3px] border-l-green-500" : "border-white/10"}`}
                                                     >
                                                         <div className="text-xs font-mono text-muted-foreground mb-1.5 flex justify-between items-center group-hover:text-foreground">
                                                             <span>[{cit.index}]{cit.page !== null ? ` p.${cit.page}` : ""}</span>
@@ -254,7 +279,7 @@ export function MessageReferences() {
                                                                         <button
                                                                             type="button"
                                                                             onClick={() => {
-                                                                                const matchingCitation = citations.find((c) => c.number === cit.index);
+                                                                                const matchingCitation = citationsWithNewFlag.find((c) => c.number === cit.index);
                                                                                 if (matchingCitation) {
                                                                                     dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
                                                                                 }

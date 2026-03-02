@@ -5,6 +5,7 @@ export type GroupedReferenceCitation = {
   chunkId: string;
   page: number | null;
   text?: string;
+  isNew?: boolean;
 };
 
 export type GroupedReference = {
@@ -40,6 +41,7 @@ export function groupCitations(citations: Citation[]): GroupedReference[] {
         chunkId: citation.chunk_id,
         page: citation.page ?? null,
         text: citation.chunk_text,
+        isNew: citation.isNew,
       });
 
       if (citation.page !== undefined && citation.page !== null && !group.pages.includes(citation.page)) {
