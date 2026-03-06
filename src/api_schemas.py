@@ -303,6 +303,71 @@ class ChunkBatchResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+
+class CorpusOverview(BaseModel):
+    """High-level corpus statistics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_count: int = 0
+    child_chunk_count: int = 0
+    parent_chunk_count: int = 0
+    estimated_tokens: int = 0
+    avg_chunks_per_doc: float = 0.0
+    source_ids: list[str] = Field(default_factory=list)
+
+
+class TopicCluster(BaseModel):
+    """A single TF-IDF topic cluster."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cluster_id: int
+    label: str
+    keywords: list[str]
+    source_ids: list[str]
+    size: int
+
+
+class EntityFrequency(BaseModel):
+    """Named entity with frequency count."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    type: str
+    count: int
+
+
+class TimelineBucket(BaseModel):
+    """A temporal distribution bucket (decade)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    period_start: int
+    period_end: int
+    label: str
+    count: int
+    sources: list[str]
+
+
+class AnalyticsResponse(BaseModel):
+    """Full corpus analytics response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    overview: CorpusOverview = Field(default_factory=CorpusOverview)
+    topics: list[TopicCluster] = Field(default_factory=list)
+    entities: list[EntityFrequency] = Field(default_factory=list)
+    timeline: list[TimelineBucket] = Field(default_factory=list)
+    ner_available: bool = False
+    timeline_available: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
@@ -317,4 +382,9 @@ class HealthResponse(BaseModel):
     system_ram_gb: Optional[float] = Field(
         default=None,
         description="Detected system RAM in GB, used by frontend for capability gating.",
+    )
+    spacy_available: bool = False
+    analytics_cache_status: Optional[str] = Field(
+        default=None,
+        description="Analytics cache status: 'fresh', 'stale', or 'empty'.",
     )

@@ -33,10 +33,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .api_schemas import (
+    AnalyticsResponse,
     ChatRequest,
     ChunkBatchItem,
     ChunkBatchResponse,
     ChunkDetailResponse,
+    CorpusOverview,
+    EntityFrequency,
     ErrorResponse,
     HealthResponse,
     IngestRequest,
@@ -47,6 +50,8 @@ from .api_schemas import (
     SourceDeleteResponse,
     SourceInfo,
     SourceListResponse,
+    TimelineBucket,
+    TopicCluster,
 )
 from .query_events import (
     CitationListEvent,
@@ -264,17 +269,119 @@ async def validation_exception_handler(request: Request, exc: Exception):
 @app.get("/api/health", response_model=HealthResponse)
 async def health():
     from .config import get_system_ram_gb
+    from .analytics import _SPACY_AVAILABLE, _CACHE_FILE
+
+    analytics_cache_status: Optional[str] = None
+    try:
+        if _CACHE_FILE.exists():
+            analytics_cache_status = "fresh"
+        else:
+            analytics_cache_status = "empty"
+    except Exception:
+        analytics_cache_status = "empty"
 
     return HealthResponse(
         status="ok",
         engine_loaded=_engine_loaded,
         system_ram_gb=round(get_system_ram_gb(), 1),
+        spacy_available=_SPACY_AVAILABLE,
+        analytics_cache_status=analytics_cache_status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+
+def _build_analytics_response(data: dict) -> AnalyticsResponse:
+    overview_raw = data.get("overview", {})
+    overview = CorpusOverview(
+        source_count=overview_raw.get("source_count", 0),
+        child_chunk_count=overview_raw.get("child_chunk_count", 0),
+        parent_chunk_count=overview_raw.get("parent_chunk_count", 0),
+        estimated_tokens=overview_raw.get("estimated_tokens", 0),
+        avg_chunks_per_doc=overview_raw.get("avg_chunks_per_doc", 0.0),
+        source_ids=overview_raw.get("source_ids", []),
+    )
+    topics = [
+        TopicCluster(
+            cluster_id=t.get("cluster_id", i),
+            label=t.get("label", ""),
+            keywords=t.get("keywords", []),
+            source_ids=t.get("source_ids", []),
+            size=t.get("size", 0),
+        )
+        for i, t in enumerate(data.get("topics", []))
+    ]
+    entities = [
+        EntityFrequency(text=e.get("text", ""), type=e.get("type", ""), count=e.get("count", 0))
+        for e in data.get("entities", [])
+    ]
+    timeline = [
+        TimelineBucket(
+            period_start=b.get("period_start", 0),
+            period_end=b.get("period_end", 0),
+            label=b.get("label", ""),
+            count=b.get("count", 0),
+            sources=b.get("sources", []),
+        )
+        for b in data.get("timeline", [])
+    ]
+    return AnalyticsResponse(
+        overview=overview,
+        topics=topics,
+        entities=entities,
+        timeline=timeline,
+        ner_available=data.get("ner_available", False),
+        timeline_available=data.get("timeline_available", True),
+    )
+
+
+@app.get("/api/analytics", response_model=AnalyticsResponse)
+async def get_analytics(force: bool = False):
+    """Return full corpus analytics (topics, entities, timeline, overview).
+
+    Results are cached. Pass ``?force=true`` to recompute from scratch.
+    Runs in a thread pool to avoid blocking the event loop.
+    """
+    from .analytics import compute_corpus_analytics
+
+    engine = await asyncio.to_thread(_get_engine)
+    data = await asyncio.to_thread(
+        compute_corpus_analytics,
+        engine.storage,
+        force_recompute=force,
+    )
+    return _build_analytics_response(data)
+
+
+@app.get("/api/analytics/overview", response_model=CorpusOverview)
+async def get_analytics_overview(force: bool = False):
+    """Return corpus overview statistics only."""
+    from .analytics import compute_corpus_analytics
+
+    engine = await asyncio.to_thread(_get_engine)
+    data = await asyncio.to_thread(
+        compute_corpus_analytics,
+        engine.storage,
+        force_recompute=force,
+    )
+    overview_raw = data.get("overview", {})
+    return CorpusOverview(
+        source_count=overview_raw.get("source_count", 0),
+        child_chunk_count=overview_raw.get("child_chunk_count", 0),
+        parent_chunk_count=overview_raw.get("parent_chunk_count", 0),
+        estimated_tokens=overview_raw.get("estimated_tokens", 0),
+        avg_chunks_per_doc=overview_raw.get("avg_chunks_per_doc", 0.0),
+        source_ids=overview_raw.get("source_ids", []),
     )
 
 
 # ---------------------------------------------------------------------------
 # Speech-to-Text  (MLX Whisper — fully offline)
 # ---------------------------------------------------------------------------
+
 
 
 @app.post("/api/transcribe")

@@ -23,3 +23,8 @@ mlx-whisper
 soundfile          # audio decoding (WAV, WebM, OGG)
 scipy              # resampling + WAV fallback decoder
 av                 # robust WebM/OGG/Opus decode fallback (PyAV)
+
+# Corpus analytics
+scikit-learn       # TF-IDF topic clustering
+# spacy            # NER — optional: pip install spacy && python -m spacy download en_core_web_sm
+# dateparser       # temporal extraction — optional: pip install dateparser

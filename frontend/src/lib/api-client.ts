@@ -98,6 +98,50 @@ export interface ApiError {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Analytics types
+// ---------------------------------------------------------------------------
+
+export interface CorpusOverview {
+  source_count: number;
+  child_chunk_count: number;
+  parent_chunk_count: number;
+  estimated_tokens: number;
+  avg_chunks_per_doc: number;
+  source_ids: string[];
+}
+
+export interface TopicCluster {
+  cluster_id: number;
+  label: string;
+  keywords: string[];
+  source_ids: string[];
+  size: number;
+}
+
+export interface EntityFrequency {
+  text: string;
+  type: string;
+  count: number;
+}
+
+export interface TimelineBucket {
+  period_start: number;
+  period_end: number;
+  label: string;
+  count: number;
+  sources: string[];
+}
+
+export interface AnalyticsResponse {
+  overview: CorpusOverview;
+  topics: TopicCluster[];
+  entities: EntityFrequency[];
+  timeline: TimelineBucket[];
+  ner_available: boolean;
+  timeline_available: boolean;
+}
+
 class SourceApiClient {
   private baseUrl: string;
 
@@ -235,6 +279,18 @@ class SourceApiClient {
     if (!res.ok) {
       const err: ApiError = await res.json();
       throw new Error(err.error.message);
+    }
+    return res.json();
+  }
+
+  async getAnalytics(force?: boolean): Promise<AnalyticsResponse> {
+    const url = force
+      ? `${this.baseUrl}/analytics?force=true`
+      : `${this.baseUrl}/analytics`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const message = await this.parseErrorResponse(res);
+      throw new Error(message);
     }
     return res.json();
   }

@@ -28,6 +28,7 @@ import { Meteors } from "@/components/ui/meteors";
 import { RainBackground } from "@/components/ui/rain";
 import { MeshGradientBackground } from "@/components/ui/mesh-gradient";
 import { BackgroundPaths } from "@/components/ui/paths";
+import { AnalyticsDashboard } from "@/components/analytics-dashboard";
 import { StarfieldBackground } from "@/components/ui/starfield";
 import { ParticleBackground } from "@/components/ui/particles";
 import { Leva } from "leva";
@@ -136,6 +137,9 @@ export default function Page() {
   // New chat reset keys
   const [ragKey, setRagKey] = useState(0);
   const [freeformKey, setFreeformKey] = useState(0);
+
+  // Analytics dashboard
+  const [showAnalytics, setShowAnalytics] = useState(false);
 
   // Restored freeform session state (passed to FreeformChatPanel)
   const [restoredSessionId, setRestoredSessionId] = useState<string | null>(null);
@@ -377,6 +381,18 @@ export default function Page() {
               </svg>
               Chat History
             </button>
+
+            {/* Analytics button */}
+            <button
+              onClick={() => setShowAnalytics(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors text-gray-500 hover:text-gray-300 hover:bg-[#1e1e1e]"
+              title="Corpus analytics"
+            >
+              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              Analytics
+            </button>
           </div>
         </header>
 
@@ -463,6 +479,12 @@ export default function Page() {
             onRestore={handleRestoreSession}
           />
         </div>
+
+        {/* Analytics dashboard modal */}
+        <AnalyticsDashboard
+          open={showAnalytics}
+          onClose={() => setShowAnalytics(false)}
+        />
       </div>
   );
 }
