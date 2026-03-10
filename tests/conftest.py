@@ -8,6 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+
+import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "slow: integration tests that require model downloads or GPU (skip with -m 'not slow')",
+    )
 import os
 import sys
 import tempfile

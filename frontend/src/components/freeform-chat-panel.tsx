@@ -7,6 +7,7 @@ import {
   BrainIcon,
   CheckIcon,
   CopyIcon,
+  Loader2Icon,
   MicIcon,
   SquareIcon,
 } from "lucide-react";
@@ -213,8 +214,6 @@ export function FreeformChatPanel({
   const sessionIdRef = useRef<string>(crypto.randomUUID());
   const isRestoredRef = useRef(false);
   const titleGeneratedRef = useRef(false);
-  const lastInsertedRef = useRef("");
-  const lastChunkRef = useRef<{ text: string; at: number } | null>(null);
   const thinkingTextRef = useRef("");
 
   // ── Sync refs ──────────────────────────────────────────────────────────────
@@ -326,47 +325,16 @@ export function FreeformChatPanel({
 
   // ── Speech-to-text ─────────────────────────────────────────────────────────
   const applyTranscript = useCallback(
-    (chunk: string, isFinal: boolean) => {
-      if (isFinal && !chunk) {
-        lastChunkRef.current = null;
-        lastInsertedRef.current = "";
-        return;
-      }
+    (chunk: string, _isFinal: boolean) => {
       if (!chunk) return;
-
       const el = textareaRef.current;
-      const normalized = chunk.trim().toLowerCase().replace(/\s+/g, " ");
-      const now = Date.now();
-
-      if (
-        normalized &&
-        lastChunkRef.current &&
-        lastChunkRef.current.text === normalized &&
-        now - lastChunkRef.current.at < 5000
-      ) return;
-
-      const lastNorm = lastInsertedRef.current.trim().toLowerCase().replace(/\s+/g, " ");
-      const shouldReplace =
-        !!lastNorm &&
-        normalized.length > lastNorm.length &&
-        normalized.startsWith(lastNorm) &&
-        now - (lastChunkRef.current?.at ?? 0) < 6000;
-
       setInputValue((prev) => {
-        const start = el?.selectionStart ?? prev.length;
-        const end = el?.selectionEnd ?? prev.length;
-        const effectiveStart = shouldReplace
-          ? Math.max(0, start - lastInsertedRef.current.length)
-          : start;
-        const before = prev.slice(0, effectiveStart);
-        const after = prev.slice(end);
-        const sep = before.length > 0 && !before.endsWith(" ") ? " " : "";
-        const inserted = sep + chunk;
-        lastInsertedRef.current = inserted;
-        lastChunkRef.current = { text: normalized, at: now };
-        const next = before + inserted + after;
+        const pos = el?.selectionStart ?? prev.length;
+        const sep = pos > 0 && !prev.slice(0, pos).endsWith(" ") ? " " : "";
+        const next = prev.slice(0, pos) + sep + chunk + prev.slice(pos);
+        const newPos = pos + sep.length + chunk.length;
         requestAnimationFrame(() => {
-          el?.setSelectionRange(before.length + inserted.length, before.length + inserted.length);
+          el?.setSelectionRange(newPos, newPos);
           el?.focus();
         });
         return next;
@@ -375,16 +343,18 @@ export function FreeformChatPanel({
     [],
   );
 
-  const { isListening, toggle: toggleMic, stop: stopMic } = useSpeechToText({
+  const { status: sttStatus, isListening, toggle: toggleMic, stop: stopMic } = useSpeechToText({
     onTranscript: applyTranscript,
     onPermissionDenied: () => {},
     onNoSpeech: () => {},
     onError: () => {},
   });
 
+  const isTranscribing = sttStatus === "transcribing";
+
   useEffect(() => {
-    if (isStreaming && isListening) stopMic();
-  }, [isStreaming, isListening, stopMic]);
+    if (isStreaming && (isListening || isTranscribing)) stopMic();
+  }, [isStreaming, isListening, isTranscribing, stopMic]);
 
   // ── Stop streaming ─────────────────────────────────────────────────────────
   const stop = useCallback(() => { abortRef.current?.abort(); }, []);
@@ -744,15 +714,19 @@ export function FreeformChatPanel({
                 {/* Mic — shown when empty and not streaming */}
                 <button
                   type="button"
-                  aria-label={isListening ? "Stop listening" : "Voice input"}
-                  onClick={() => { if (!isStreaming) toggleMic(); }}
+                  aria-label={isTranscribing ? "Transcribing…" : isListening ? "Stop listening" : "Voice input"}
+                  onClick={() => { if (!isStreaming && !isTranscribing) toggleMic(); }}
                   className={cn(
                     "absolute inset-0 flex items-center justify-center rounded-full transition-all duration-150",
                     (!isEmpty || isStreaming) ? "scale-0 opacity-0 pointer-events-none" : "",
                     isListening ? "bg-red-500" : "",
                   )}
                 >
-                  <MicIcon className={cn("size-4 text-black", isListening ? "animate-pulse" : "")} />
+                  {isTranscribing ? (
+                    <Loader2Icon className="size-4 text-black animate-spin" />
+                  ) : (
+                    <MicIcon className={cn("size-4 text-black", isListening ? "animate-pulse" : "")} />
+                  )}
                 </button>
 
                 {/* Send — shown when text present and not streaming */}

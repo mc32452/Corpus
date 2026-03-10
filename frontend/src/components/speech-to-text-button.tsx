@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef } from "react";
-import { MicIcon } from "lucide-react";
+import { Loader2Icon, MicIcon } from "lucide-react";
 import { useSpeechToText } from "@/hooks/useSpeechToText";
 import { cn } from "@/lib/utils";
 
@@ -58,12 +58,14 @@ export function SpeechToTextButton({
     [inputRef, onChange],
   );
 
-  const { isListening, toggle, stop } = useSpeechToText({
+  const { status, isListening, toggle, stop } = useSpeechToText({
     onTranscript: applyTranscript,
     onPermissionDenied: () => {},
     onNoSpeech: () => {},
     onError: () => {},
   });
+
+  const isTranscribing = status === "transcribing";
 
   // Stop mic when the button becomes disabled (e.g. streaming starts)
   useEffect(() => {
@@ -73,26 +75,32 @@ export function SpeechToTextButton({
   return (
     <button
       type="button"
-      aria-label={isListening ? "Stop listening" : "Voice input"}
-      disabled={disabled}
+      aria-label={isTranscribing ? "Transcribing…" : isListening ? "Stop listening" : "Voice input"}
+      disabled={disabled || isTranscribing}
       onClick={() => {
-        if (!disabled) toggle();
+        if (!disabled && !isTranscribing) toggle();
       }}
       className={cn(
         "w-10 h-10 flex items-center justify-center rounded-full transition-colors shrink-0",
         isListening
           ? "bg-red-600 hover:bg-red-700"
+          : isTranscribing
+          ? "bg-gray-600"
           : "bg-gray-700 hover:bg-gray-600",
-        disabled && "opacity-50 cursor-not-allowed",
+        (disabled || isTranscribing) && "opacity-50 cursor-not-allowed",
       )}
-      title={isListening ? "Stop listening" : "Voice input"}
+      title={isTranscribing ? "Transcribing…" : isListening ? "Stop listening" : "Voice input"}
     >
-      <MicIcon
-        className={cn(
-          "w-4 h-4 text-white",
-          isListening && "animate-pulse",
-        )}
-      />
+      {isTranscribing ? (
+        <Loader2Icon className="w-4 h-4 text-white animate-spin" />
+      ) : (
+        <MicIcon
+          className={cn(
+            "w-4 h-4 text-white",
+            isListening && "animate-pulse",
+          )}
+        />
+      )}
     </button>
   );
 }

@@ -17,7 +17,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type STTStatus = "idle" | "listening" | "stopping" | "error";
+export type STTStatus = "idle" | "listening" | "stopping" | "transcribing" | "error";
 
 export interface UseSpeechToTextOptions {
   /** Called with each transcript chunk from the backend */
@@ -66,12 +66,8 @@ export function useSpeechToText({
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const noSpeechTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const silenceRafRef = useRef<number | null>(null);
-  const gotSpeechRef = useRef(false);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingMimeTypeRef = useRef("audio/webm");
-  const flushInProgressRef = useRef(false);
-  const chunkInFlightRef = useRef(false);
-  const queuedChunkRef = useRef<{ blob: Blob; markFinal: boolean } | null>(null);
 
   // Keep stable refs to the latest callbacks so inner closures never go stale
   const onTranscriptRef = useRef(onTranscript);
@@ -96,8 +92,6 @@ export function useSpeechToText({
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
     }
-    queuedChunkRef.current = null;
-    chunkInFlightRef.current = false;
     mediaRecorderRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
@@ -109,20 +103,81 @@ export function useSpeechToText({
   // ── Stop ───────────────────────────────────────────────────────────────────
   // Stable ref so start() / silenceDetector can always call the latest stop
   const stopRef = useRef<() => void>(() => {});
-  const flushFullRecordingRef = useRef<() => Promise<void>>(async () => {});
 
   const stop = useCallback(() => {
-    try {
-      mediaRecorderRef.current?.requestData();
-    } catch {
-      // ignore requestData errors
+    // Cancel monitoring timers immediately
+    if (silenceRafRef.current !== null) { cancelAnimationFrame(silenceRafRef.current); silenceRafRef.current = null; }
+    if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
+    if (noSpeechTimerRef.current) { clearTimeout(noSpeechTimerRef.current); noSpeechTimerRef.current = null; }
+
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      audioCtxRef.current?.close().catch(() => {});
+      audioCtxRef.current = null;
+      analyserRef.current = null;
+      mediaRecorderRef.current = null;
+      setStatus("idle");
+      return;
     }
-    cleanup();
-    void flushFullRecordingRef.current().finally(() => {
-      onTranscriptRef.current("", true); // end-of-session signal
-    });
-    setStatus("idle");
-  }, [cleanup]);
+
+    setStatus("stopping");
+
+    // Wire up onstop BEFORE calling stop() so we capture the final chunk.
+    // cleanup() (unmount path) will NOT set onstop, so no spurious upload.
+    recorder.onstop = () => {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      audioCtxRef.current?.close().catch(() => {});
+      audioCtxRef.current = null;
+      analyserRef.current = null;
+      mediaRecorderRef.current = null;
+
+      const chunks = recordedChunksRef.current;
+      recordedChunksRef.current = [];
+      const mimeType = recordingMimeTypeRef.current;
+      const totalBytes = chunks.reduce((s, b) => s + b.size, 0);
+
+      if (totalBytes < 100) {
+        setStatus("idle");
+        return;
+      }
+
+      setStatus("transcribing");
+
+      const blob = new Blob(chunks, { type: mimeType });
+      const form = new FormData();
+      const ext = mimeType.includes("ogg") ? "ogg" : mimeType.includes("wav") ? "wav" : "webm";
+      form.append("audio", blob, `recording.${ext}`);
+      form.append("sample_rate", "16000");
+
+      fetch(BACKEND_URL, { method: "POST", body: form })
+        .then(async (res) => {
+          if (!res.ok) {
+            onErrorRef.current?.(
+              res.status === 503
+                ? "Whisper model unavailable — check backend logs."
+                : `Transcription error (HTTP ${res.status})`,
+            );
+            return;
+          }
+          const data = (await res.json()) as { transcript: string; is_final: boolean };
+          const text = data.transcript?.trim();
+          if (text) onTranscriptRef.current(text, true);
+        })
+        .catch((err: unknown) => {
+          console.error("[STT] fetch error:", err);
+          onErrorRef.current?.("Could not reach transcription server.");
+        })
+        .finally(() => {
+          setStatus("idle");
+        });
+    };
+
+    try { recorder.requestData(); } catch { /* ignore */ }
+    try { recorder.stop(); } catch { /* ignore */ }
+  }, []);
 
   // Keep the ref in sync with the latest stop
   useEffect(() => { stopRef.current = stop; }, [stop]);
@@ -150,78 +205,9 @@ export function useSpeechToText({
     silenceRafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  // ── Send chunk to Moonshine backend ───────────────────────────────────────
-  const sendChunkNow = useCallback(async (blob: Blob, markFinal = false) => {
-    if (blob.size < 100) return;
-    const form = new FormData();
-    const ext = blob.type.includes("ogg") ? "ogg" : blob.type.includes("wav") ? "wav" : "webm";
-    form.append("audio", blob, `chunk.${ext}`);
-    form.append("sample_rate", "16000");
-    try {
-      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
-      if (!res.ok) {
-        onErrorRef.current?.(res.status === 503
-          ? "Whisper model unavailable — check backend logs."
-          : `Transcription error (HTTP ${res.status})`);
-        return;
-      }
-      const data = (await res.json()) as { transcript: string; is_final: boolean };
-      const text = data.transcript?.trim();
-      if (text) { gotSpeechRef.current = true; onTranscriptRef.current(text, markFinal); }
-    } catch (err) {
-      console.error("[STT] fetch error:", err);
-      onErrorRef.current?.("Could not reach transcription server.");
-    }
-  }, []);
-
-  const processQueuedChunk = useCallback(async () => {
-    if (chunkInFlightRef.current) return;
-    const next = queuedChunkRef.current;
-    if (!next) return;
-
-    queuedChunkRef.current = null;
-    chunkInFlightRef.current = true;
-    try {
-      await sendChunkNow(next.blob, next.markFinal);
-    } finally {
-      chunkInFlightRef.current = false;
-      if (queuedChunkRef.current) {
-        void processQueuedChunk();
-      }
-    }
-  }, [sendChunkNow]);
-
-  const enqueueChunk = useCallback((blob: Blob, markFinal = false) => {
-    if (blob.size < 100) return;
-    queuedChunkRef.current = { blob, markFinal }; // keep latest chunk only
-    void processQueuedChunk();
-  }, [processQueuedChunk]);
-
-  const flushFullRecording = useCallback(async () => {
-    if (flushInProgressRef.current) return;
-    if (gotSpeechRef.current) return;
-    if (recordedChunksRef.current.length === 0) return;
-
-    flushInProgressRef.current = true;
-    try {
-      const fullBlob = new Blob(recordedChunksRef.current, {
-        type: recordingMimeTypeRef.current,
-      });
-      await sendChunkNow(fullBlob, true);
-    } finally {
-      flushInProgressRef.current = false;
-    }
-  }, [sendChunkNow]);
-
-  useEffect(() => {
-    flushFullRecordingRef.current = flushFullRecording;
-  }, [flushFullRecording]);
-
   // ── Start ──────────────────────────────────────────────────────────────────
   const start = useCallback(async () => {
-    gotSpeechRef.current = false;
     recordedChunksRef.current = [];
-    flushInProgressRef.current = false;
 
     let stream: MediaStream;
     try {
@@ -281,7 +267,6 @@ export function useSpeechToText({
     recorder.ondataavailable = (e) => {
       if (e.data?.size > 0) {
         recordedChunksRef.current.push(e.data);
-        enqueueChunk(e.data, false);
       }
     };
     recorder.onerror = (e) => {
@@ -296,12 +281,10 @@ export function useSpeechToText({
     startSilenceDetector();
 
     noSpeechTimerRef.current = setTimeout(() => {
-      if (!gotSpeechRef.current) {
-        onNoSpeechRef.current?.();
-        void flushFullRecording().finally(() => stopRef.current());
-      }
+      onNoSpeechRef.current?.();
+      stopRef.current();
     }, NO_SPEECH_TIMEOUT_MS);
-  }, [enqueueChunk, flushFullRecording, startSilenceDetector]);
+  }, [startSilenceDetector]);
 
   // ── Toggle ─────────────────────────────────────────────────────────────────
   const toggle = useCallback(() => {
