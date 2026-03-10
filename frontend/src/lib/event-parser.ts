@@ -29,8 +29,6 @@ export interface Citation {
   header_path?: string | null;
   /** Raw chunk text from the retrieval result. */
   chunk_text?: string;
-  /** Optional verified highlight anchor computed post-generation. */
-  highlight_text?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +160,6 @@ export function parseCustomEvent(dataPart: unknown): CustomEvent | null {
           page: (c["page_number"] as number | null) ?? null,
           header_path: (c["header_path"] as string | null) ?? null,
           chunk_text: (c["chunk_text"] as string | undefined) ?? undefined,
-          highlight_text: (c["highlight_text"] as string | undefined) ?? undefined,
         }));
         return { type: "citations", citations };
       }

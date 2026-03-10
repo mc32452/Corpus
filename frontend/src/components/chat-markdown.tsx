@@ -74,7 +74,7 @@ export function ChatMarkdown({
           ol: ({ children }) => <ol className="list-decimal pl-5 mb-2 space-y-1">{children}</ol>,
           li: ({ children }) => <li>{children}</li>,
           blockquote: ({ children }) => (
-            <blockquote className="border-l-2 border-current/30 pl-3 italic my-2">{children}</blockquote>
+            <blockquote className="border-l-2 border-white/40 pl-3 italic my-2 text-gray-200">{children}</blockquote>
           ),
           pre: ({ children }) => (
             <pre className="bg-zinc-900 rounded-md p-3 overflow-x-auto my-2 text-sm">{children}</pre>

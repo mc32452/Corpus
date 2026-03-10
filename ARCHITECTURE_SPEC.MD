@@ -333,7 +333,6 @@ Central orchestrator consumed by both CLI and API:
 - **Collection handling:** Auto-generates missing summaries on-the-fly; auto-disables citations for collection responses
 - **Collection guard:** Forces COLLECTION intent for multi-source source-selection queries (via `is_source_selection_query()`)
 - **Low-information query bypass:** Skips retrieval for gibberish/vague queries (via `is_low_information_query()`)
-- **Post-hoc citation verification:** After streaming generation completes, runs `compute_highlight_texts()` and emits updated `CitationListEvent`
 - **Output sanitization:** `sanitize_output()` strips instruction leakage ("Important:", "Task:", "Format:", "Tone:"), chatter/filler phrases, deduplicates repeated halves (≥85% similarity via `SequenceMatcher`), truncates at incomplete sentences
 - **Hallucination detection:** `_check_novel_proper_nouns()` logs warning when >3 capitalized words in output are absent from retrieved context
 - **Offline mode:** `_enable_offline_if_cached()` sets `HF_HUB_OFFLINE=1` when all models are cached locally
@@ -427,19 +426,7 @@ Caches full-text snapshots so `/content` endpoint works even if original files a
 - `delete_snapshot()` -- removes cached file
 - **Filename strategy:** Direct `source_id` if filesystem-safe (≤200 chars, alphanumeric + `_-.`), otherwise SHA-256 hash prefix (16 chars) + `.txt`
 
-### 4.14 Citation Verification (`src/citation_verification.py`)
-
-`compute_highlight_texts` -- corrects citation highlight regions when context expansion causes the LLM to cite content from the parent chunk that falls outside the child chunk boundaries.
-
-**Algorithm:**
-1. Parse answer for `[N]` / `[CHUNK N]` markers → extract claim sentences per citation
-2. Extract 6-char prefix stems from claim sentences (filters stopwords, words <4 chars)
-3. Find stem positions in parent text
-4. Sliding window density analysis (window_size=600 chars) for best unique-stem cluster
-5. Check overlap with child chunk span (>70% overlap → skip, highlighting is fine)
-6. Expand to sentence boundaries and return corrected `highlight_text`
-
-### 4.15 Transcription (`src/transcription.py`)
+### 4.14 Transcription (`src/transcription.py`)
 
 `WhisperTranscriber` -- MLX Whisper speech-to-text for voice input:
 
@@ -597,14 +584,14 @@ Multiple coordinated modules handle the full citation lifecycle:
   - `formatFootnotesWithText()` -- renumbers sparse `[N]` markers to sequential `[1], [2], ...` in body text + matching footnotes
   - Source label priority: user-provided citation reference → cleaned source_id (underscores/hyphens → spaces, title-cased)
 - **`group-citations.ts`:** Groups raw `[N]` citation indices by `source_id` into `GroupedReference` objects with deduplication and numeric sorting
-- **`text-highlighter.ts`:** Progressive fuzzy text matching: exact → progressively shorter prefixes (down to 50 chars) → suffix fallback. DOM `TreeWalker` wraps matched text nodes in `<mark class="citation-highlight">`. Normalization-aware offset mapping handles whitespace collapsing.
+- **`text-highlighter.ts`:** Exact substring matching (normalised whitespace). DOM `TreeWalker` wraps matched text nodes in `<mark class="citation-highlight">`. Normalisation-aware offset mapping handles whitespace collapsing.
 
 **Citation UI flow:**
 1. RAG mode: `ChatMarkdownRenderer` converts `[N]`/`[CHUNK N]` patterns to clickable citation badges
 2. Click → dispatches `SET_ACTIVE_CITATION` → `CitationPanelReader` replaces source panel content
 3. `CitationPanelReader` fetches full source content + chunk detail in parallel → `DocumentRenderer` with `HighlightPayload`
 4. `DocumentRenderer` routes by format: `MarkdownRenderer` (for `.md`) or `PlainTextRenderer` (for `.pdf`/`.txt` extracted text)
-5. Highlight pipeline: tries `highlight_text` (corrected by citation verification) → `chunk_text` → `header_path` heading scroll
+5. Highlight pipeline: highlights full `parent_text` (falls back to `chunk_text`) → `header_path` heading scroll on no match
 
 **`MessageReferences` component** (rendered below each assistant message):
 - Green citation badges = cited in answer text; dimmed = retrieved but not used
@@ -807,7 +794,7 @@ The system builds a source legend when source IDs differ from display names.
 
 ### 7.3 Streaming Citation Events
 
-During streaming query execution, a structured citation list is emitted as a `CitationListEvent` (via `data-citations` annotation) so the frontend can bind numbered references to source/chunk metadata. After generation completes, a post-hoc `compute_highlight_texts()` run may emit an updated `CitationListEvent` with corrected `highlight_text` fields.
+During streaming query execution, a structured citation list is emitted as a `CitationListEvent` (via `data-citations` annotation) so the frontend can bind numbered references to source/chunk metadata.
 
 ### 7.4 Citation Reference Metadata
 
@@ -850,10 +837,6 @@ Frontend: useChatRuntime → POST /api/chat (via Next.js proxy route)
         ├── Generation:
         │     MlxGenerator.stream_chat_with_thinking() or generate_chat_stream()
         │     yields: TextTokenEvent / ThinkingTokenEvent (per token)
-        │
-        ├── Post-hoc citation verification:
-        │     compute_highlight_texts() → corrected highlight spans
-        │     yields: CitationListEvent
         │
         └── Output sanitization + finish:
               sanitize_output()
@@ -929,7 +912,6 @@ Frontend: IngestModal → sequential upload queue → POST /api/sources/upload (
 | `metrics.py` | 170 | Retrieval/budget metrics collection (6 dataclasses) |
 | `latency.py` | 107 | Zero-cost wall-clock latency profiler with ASCII chart |
 | `source_cache.py` | 175 | Text snapshot caching with filesystem-safe naming |
-| `citation_verification.py` | 352 | Post-hoc citation highlight correction (sliding window density) |
 | `transcription.py` | 387 | MLX Whisper speech-to-text with VAD |
 | `cli.py` | 383 | CLI entry point (ingest + query commands) |
 
@@ -948,7 +930,7 @@ Frontend: IngestModal → sequential upload queue → POST /api/sources/upload (
 | `lib/backend-url.ts` | Backend URL resolution (`NEXT_PUBLIC_BACKEND_URL` or `127.0.0.1:8000`) |
 | `lib/event-parser.ts` | AI SDK v6 `onData` → typed `CustomEvent` discriminated union parser |
 | `lib/session-store.ts` | IndexedDB session persistence (chat history with reasoning content) |
-| `lib/text-highlighter.ts` | Progressive fuzzy text matching + DOM `<mark>` injection |
+| `lib/text-highlighter.ts` | Exact substring match + DOM `<mark>` injection |
 | `lib/citation-meta-store.ts` | localStorage persistence for user-provided citation reference strings |
 | `lib/format-citations.ts` | Footnote + Harvard citation formatters with marker renumbering |
 | `lib/group-citations.ts` | Citation index grouping by source with deduplication |

@@ -59,6 +59,9 @@ export const ChatMarkdownRenderer: FC = () => {
       containerClassName="text-base leading-[1.65] min-h-[1.5em] break-words [&_ul]:my-3 [&_ul]:space-y-2 [&_ol]:my-3 [&_ol]:space-y-2 [&_li]:pl-1"
       preprocess={(raw) => addCitationLinks(raw, citations)}
       components={{
+        blockquote: ({ children }) => (
+          <blockquote className="border-l-2 border-white/40 pl-3 italic my-2 text-gray-200">{children}</blockquote>
+        ),
         a: ({ href, children, ...props }) => {
           const index = extractCitationIndex(href);
           if (index !== null) {

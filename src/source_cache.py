@@ -149,25 +149,28 @@ def resolve_content(
     """Resolve document content using the fallback chain.
 
     Resolution order:
-    1. Original source_path (if readable)
-    2. Cached snapshot_path (if exists)
+    1. Cached snapshot_path (if exists) — preferred because it is built from
+       the same parent-chunk texts stored in the vector DB, guaranteeing that
+       citation highlight needles can be found verbatim.
+    2. Original source_path (if readable) — fallback for sources that were
+       never snapshotted.
 
     Returns
     -------
     tuple[str, str] | None
-        (content, source_type) where source_type is 'original' or 'snapshot'.
+        (content, source_type) where source_type is 'snapshot' or 'original'.
         Returns None if neither is available.
     """
-    # Try original file first
-    if source_path:
-        content = read_original_file(source_path)
-        if content:
-            return (content, "original")
-
-    # Try cached snapshot
+    # Prefer cached snapshot: text matches the parent_text values in lance
     if snapshot_path:
         content = read_snapshot(snapshot_path)
         if content:
             return (content, "snapshot")
+
+    # Fall back to original file (plain-text sources without a snapshot)
+    if source_path:
+        content = read_original_file(source_path)
+        if content:
+            return (content, "original")
 
     return None

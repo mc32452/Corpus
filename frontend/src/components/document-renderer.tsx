@@ -7,9 +7,10 @@ import { findAndHighlight } from "@/lib/text-highlighter";
 export interface HighlightPayload {
   page_number?: number | null;
   header_path?: string;
+  /** Text to highlight (typically the full parent chunk). */
   chunk_text?: string;
-  /** Corrected highlight passage from parent chunk (post-hoc verification). */
-  highlight_text?: string;
+  /** Text to scroll to within the highlighted region (typically the child chunk). */
+  scroll_to_text?: string;
 }
 
 interface DocumentRendererProps {
@@ -35,16 +36,11 @@ function PlainTextRenderer({
     const el = containerRef.current;
     if (!el) return;
 
-    const searchText = highlight?.chunk_text || highlight?.highlight_text;
-    const needleSource = highlight?.chunk_text ? "chunk_text" : "highlight_text";
+    const searchText = highlight?.chunk_text;
     if (!searchText) return;
 
     const timer = setTimeout(() => {
-      // Try full chunk_text first, then fall back to highlight_text.
-      let mark = findAndHighlight(el, searchText);
-      if (!mark && highlight?.chunk_text && highlight?.highlight_text) {
-        mark = findAndHighlight(el, highlight.highlight_text);
-      }
+      const mark = findAndHighlight(el, searchText, highlight?.scroll_to_text);
       if (mark) {
         mark.scrollIntoView({ behavior: "smooth", block: "center" });
       }
@@ -67,8 +63,8 @@ function PlainTextRenderer({
  * Routes to the appropriate renderer based on document format.
  *
  * - `markdown`: Uses MarkdownRenderer (react-markdown with heading IDs
- *   and fuzzy text highlight).
- * - `pdf` / `text`: Uses PlainTextRenderer (extracted text with fuzzy
+ *   and text highlight).
+ * - `pdf` / `text`: Uses PlainTextRenderer (extracted text with
  *   text highlight).  PDF canvas rendering via react-pdf can be added
  *   later when a `/file` endpoint is available.
  */

@@ -1134,7 +1134,9 @@ def _safe_file_size(path: Optional[str]) -> Optional[int]:
 async def get_source_content(source_id: str):
     """Get the full text content of a source document.
 
-    Resolution order: original file → cached snapshot → 404.
+    Resolution order: cached snapshot → original file → assembled parent texts → 404.
+    The snapshot is preferred because it is built from the same parent-chunk texts
+    stored in the vector DB, ensuring citation highlight needles match exactly.
     """
     from .source_cache import resolve_content
 

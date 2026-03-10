@@ -1,7 +1,7 @@
 /**
  * Text matching and DOM highlighting utilities for citation viewer.
  *
- * Provides fuzzy substring matching against a document and DOM-level
+ * Provides exact substring matching against a document and DOM-level
  * wrapping of matched text in <mark> elements.
  */
 
@@ -19,10 +19,11 @@ export interface MatchResult {
 }
 
 /**
- * Find the best substring match of `needle` inside `haystack`.
+ * Find an exact (normalised) substring match of `needle` inside `haystack`,
+ * with a progressive prefix fallback for robustness against minor whitespace
+ * or encoding differences between stored chunk text and rendered document text.
  *
- * Tries exact match first, then progressively shorter prefixes of the
- * needle (down to 50 characters).  Returns null if no match is found.
+ * Returns null if no match is found.
  */
 export function findBestMatch(
   haystack: string,
@@ -39,31 +40,15 @@ export function findBestMatch(
     return { start: exactIdx, length: n.length };
   }
 
-  // Try progressively shorter prefixes
-  const minLen = Math.min(50, n.length);
-  const step = Math.max(10, Math.floor(n.length / 100));
-  for (let len = n.length - 1; len >= minLen; len -= step) {
+  // Prefix fallback: try progressively shorter prefixes down to 80 chars.
+  // This handles minor whitespace/encoding differences at chunk boundaries.
+  const minLen = Math.max(80, Math.floor(n.length * 0.4));
+  const step = Math.max(20, Math.floor(n.length / 20));
+  for (let len = n.length - step; len >= minLen; len -= step) {
     const sub = n.slice(0, len);
     const idx = h.indexOf(sub);
     if (idx !== -1) {
-      let end = idx + sub.length;
-      while (end < h.length && h[end] !== " " && (end - (idx + sub.length)) < 20) {
-        end++;
-      }
-      return { start: idx, length: end - idx };
-    }
-  }
-
-  // Try progressively shorter suffixes
-  for (let len = n.length - 1; len >= minLen; len -= step) {
-    const sub = n.slice(n.length - len);
-    const idx = h.indexOf(sub);
-    if (idx !== -1) {
-      let end = idx + sub.length;
-      while (end < h.length && h[end] !== " " && (end - (idx + sub.length)) < 20) {
-        end++;
-      }
-      return { start: idx, length: end - idx };
+      return { start: idx, length: sub.length };
     }
   }
 
@@ -147,57 +132,84 @@ export function clearHighlights(container: HTMLElement): void {
   });
 }
 
+/** Build a normalised-index → raw-index mapping for a raw string.
+ * Mirrors `normalise()`: collapses whitespace runs to one space, trims leading whitespace. */
+function buildNormToRaw(raw: string): number[] {
+  const normToRaw: number[] = [];
+  let inWhitespace = false;
+  let rawStart = 0;
+  while (rawStart < raw.length && /\s/.test(raw[rawStart])) {
+    rawStart++;
+  }
+  for (let ri = rawStart; ri < raw.length; ri++) {
+    const ch = raw[ri];
+    if (/\s/.test(ch)) {
+      if (!inWhitespace) {
+        normToRaw.push(ri);
+        inWhitespace = true;
+      }
+    } else {
+      normToRaw.push(ri);
+      inWhitespace = false;
+    }
+  }
+  return normToRaw;
+}
+
 /**
- * High-level helper: find `chunkText` in the container's text and
- * wrap it with `<mark>`.  Returns the first <mark> element (for
- * scrollIntoView) or null if no match.
+ * Find `chunkText` in the container's text, wrap it with `<mark>`, and
+ * return the element to scroll to.
+ *
+ * When `scrollToText` is provided (e.g. the child chunk inside a highlighted
+ * parent chunk), the function highlights `chunkText` in full but returns the
+ * `<mark>` element that covers the start of `scrollToText`.  This lets the
+ * caller scroll to the relevant citation position rather than the top of the
+ * (potentially larger) highlighted region.
  */
 export function findAndHighlight(
   container: HTMLElement,
-  chunkText: string
+  chunkText: string,
+  scrollToText?: string
 ): HTMLElement | null {
   clearHighlights(container);
   const rawText = container.innerText ?? container.textContent ?? "";
   const result = findBestMatch(rawText, chunkText);
   if (!result) return null;
 
-  // Map normalised offsets back to raw text offsets.
-  // Build a mapping: for each index in the normalised string,
-  // track the corresponding index in the raw string.
-  const raw = rawText;
-  const normToRaw: number[] = [];
-  let ri = 0;
-  let inWhitespace = false;
-
-  // Skip leading whitespace (mirrors the .trim() in normalise)
-  let rawStart = 0;
-  while (rawStart < raw.length && /\s/.test(raw[rawStart])) {
-    rawStart++;
-  }
-  ri = rawStart;
-
-  for (; ri < raw.length; ri++) {
-    const ch = raw[ri];
-    if (/\s/.test(ch)) {
-      if (!inWhitespace) {
-        // This whitespace char becomes the single space in normalised text
-        normToRaw.push(ri);
-        inWhitespace = true;
-      }
-      // Additional whitespace chars are collapsed — no normalised index
-    } else {
-      normToRaw.push(ri);
-      inWhitespace = false;
-    }
-  }
+  const normToRaw = buildNormToRaw(rawText);
 
   const rawMatchStart = normToRaw[result.start] ?? 0;
   const rawMatchEnd =
     normToRaw[result.start + result.length - 1] ?? rawMatchStart;
-  // +1 because highlightRange end is exclusive
   const rawLength = rawMatchEnd - rawMatchStart + 1;
+
+  // Compute the raw offset of the scroll target BEFORE mutating the DOM.
+  let scrollRawOffset: number | null = null;
+  if (scrollToText) {
+    const scrollResult = findBestMatch(rawText, scrollToText);
+    if (scrollResult) {
+      scrollRawOffset = normToRaw[scrollResult.start] ?? null;
+    }
+  }
 
   highlightRange(container, rawMatchStart, rawLength);
 
-  return container.querySelector("mark.citation-highlight");
+  // If a scroll target was given, find the <mark> element that covers it.
+  // After highlightRange the marks appear in document order and their
+  // cumulative textContent mirrors the raw character range they span.
+  if (scrollRawOffset !== null) {
+    const marks = Array.from(
+      container.querySelectorAll("mark.citation-highlight")
+    ) as HTMLElement[];
+    let cursor = rawMatchStart;
+    for (const mark of marks) {
+      const markLen = (mark.textContent ?? "").length;
+      if (scrollRawOffset < cursor + markLen) {
+        return mark;
+      }
+      cursor += markLen;
+    }
+  }
+
+  return container.querySelector("mark.citation-highlight") as HTMLElement | null;
 }

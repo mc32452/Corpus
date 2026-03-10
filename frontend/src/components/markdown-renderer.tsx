@@ -8,7 +8,7 @@ interface HighlightPayload {
   page_number?: number | null;
   header_path?: string;
   chunk_text?: string;
-  highlight_text?: string;
+  scroll_to_text?: string;
 }
 
 interface MarkdownRendererProps {
@@ -32,8 +32,8 @@ function slugify(text: string): string {
  *
  * - Heading IDs are generated from heading text (slug) so we can
  *   scroll to sections identified by `header_path`.
- * - After mount, if `highlight.chunk_text` is set, we run a fuzzy
- *   text search in the rendered DOM and wrap the match in `<mark>`.
+ * - After mount, if `highlight.chunk_text` is set, we search for it
+ *   in the rendered DOM and wrap the match in `<mark>`.
  * - Falls back to scrolling to the section heading if text match
  *   fails but `header_path` is available.
  */
@@ -48,19 +48,12 @@ export function MarkdownRenderer({ content, highlight }: MarkdownRendererProps) 
     const timer = setTimeout(() => {
       let scrollTarget: HTMLElement | null = null;
 
-      // 1. Try highlight_text first (corrected passage from parent chunk),
-      //    then fall back to chunk_text
-      const searchText = highlight?.highlight_text || highlight?.chunk_text;
+      // Try to find and highlight the chunk text in the rendered DOM.
+      const searchText = highlight?.chunk_text;
       if (searchText) {
-        const mark = findAndHighlight(el, searchText);
+        const mark = findAndHighlight(el, searchText, highlight?.scroll_to_text);
         if (mark) {
           scrollTarget = mark;
-        } else if (highlight?.highlight_text && highlight?.chunk_text) {
-          // highlight_text didn't match — retry with original chunk_text
-          const fallbackMark = findAndHighlight(el, highlight.chunk_text);
-          if (fallbackMark) {
-            scrollTarget = fallbackMark;
-          }
         }
       }
 

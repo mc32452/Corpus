@@ -50,7 +50,6 @@ from .metrics import (
     BudgetMetrics,
     RetrievalMetrics,
 )
-from .citation_verification import compute_highlight_texts
 from .retrieval import (
     RetrievalEngine,
     RetrievalResult,
@@ -1300,27 +1299,7 @@ class RagEngine:
                 answer_tokens.append(token)
                 yield TextTokenEvent(token=token)
 
-        # -- post-hoc citation highlight verification ----------------------
-        if cite and packed.citation_list and packed.packed_retrieval_results:
-            full_answer = "".join(answer_tokens)
-            try:
-                highlight_map = compute_highlight_texts(full_answer, packed.packed_retrieval_results)
-                if highlight_map:
-                    updated_citations: list[dict[str, object]] = []
-                    for cit in packed.citation_list:
-                        cit_copy = dict(cit)
-                        cit_idx = cit_copy.get("index")
-                        if isinstance(cit_idx, int) and cit_idx in highlight_map:
-                            cit_copy["highlight_text"] = highlight_map[cit_idx]
-                        updated_citations.append(cit_copy)
-                    yield CitationListEvent(citations=updated_citations)
-                    logger.info(
-                        "Citation verification: corrected %d/%d citations",
-                        len(highlight_map),
-                        len(packed.citation_list),
-                    )
-            except Exception as exc:
-                logger.warning("Citation verification failed (non-fatal): %s", exc)
+        # -- end of generation -----------------------------------------------
 
         logger.info(
             "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | thinking=%s | tokens_generated=%d",

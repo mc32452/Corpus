@@ -83,13 +83,16 @@ function CitationPanelReaderInner() {
   const highlightPayload: HighlightPayload = {
     page_number: chunkDetail?.page_number ?? citation.page ?? undefined,
     header_path: chunkDetail?.header_path ?? citation.header_path ?? undefined,
-    chunk_text: chunkDetail?.chunk_text ?? citation.chunk_text,
-    highlight_text: citation.highlight_text,
+    // Highlight the full parent chunk (expanded context); scroll to the child
+    // chunk position within it so the view lands on the cited content.
+    chunk_text: chunkDetail?.parent_text ?? chunkDetail?.chunk_text ?? citation.chunk_text,
+    scroll_to_text: chunkDetail?.parent_text
+      ? (chunkDetail.chunk_text ?? citation.chunk_text)
+      : undefined,
   };
 
   const hasHighlightData = !!(
     highlightPayload.chunk_text ||
-    highlightPayload.highlight_text ||
     highlightPayload.header_path ||
     highlightPayload.page_number
   );
