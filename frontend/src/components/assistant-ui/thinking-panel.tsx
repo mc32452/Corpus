@@ -62,7 +62,7 @@ export const ThinkingPanel: FC = () => {
   return (
     <ReasoningRoot variant="ghost" open={open} onOpenChange={setOpen}>
       <ReasoningTrigger active={active} label={triggerLabel} />
-      <ReasoningContent aria-busy={isRunning} className="rounded-md bg-white/10 backdrop-blur-lg mt-1">
+      <ReasoningContent aria-busy={isRunning} className="rounded-md bg-white/5 backdrop-blur-md mt-1">
         <ReasoningText className="text-foreground/70">
           {/* Pipeline status steps */}
           {thinkingSteps.length > 0 && (

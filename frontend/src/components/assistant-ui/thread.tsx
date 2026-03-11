@@ -464,7 +464,7 @@ const AssistantMessage: FC = () => {
       {/* only render the bubble once text begins to arrive */}
       {messageText.length > 0 && (
         <div
-          className="aui-assistant-message-content wrap-break-word px-4 py-3 text-foreground text-base leading-[1.65] bg-white/10 backdrop-blur-lg [&_p]:my-3 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-7 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-7 [&_li]:leading-relaxed [&_li+li]:mt-2.5 [&_li>p]:my-0"
+          className="aui-assistant-message-content wrap-break-word px-4 py-3 text-foreground text-base leading-[1.65] bg-white/5 backdrop-blur-sm [&_p]:my-3 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-7 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-7 [&_li]:leading-relaxed [&_li+li]:mt-2.5 [&_li>p]:my-0"
           style={{
             borderRadius: "18px 18px 18px 4px",
           }}
