@@ -23,7 +23,7 @@ Humanities researchers increasingly work with AI tools that require uploading do
 
 Corpus runs entirely on your machine. Documents are ingested into a local vector database, queries are answered by a large language model running on your Apple Silicon GPU, and every response is grounded in retrieved passages with inline citations linking to the specific source location and page number. No data leaves your machine, and no internet connection is required after the initial model download.
 
-Developed as part of a final-year Digital Humanities project.
+*Developed as part of a final-year Digital Humanities project.*
 
 ---
 
@@ -67,43 +67,43 @@ Corpus classifies each query into one of twelve research intents before executin
 
 ````mermaid
 graph TB
-    subgraph Frontend["Frontend: Next.js 16 / React 19"]
-        UI["Chat Interface\nRAG + Freeform modes"]
-        SP["Source Panel\nDocument library"]
-        CV["Citation Viewer\nPassage drill-down"]
-        HI["Session History\nIndexedDB"]
+    subgraph Frontend["Frontend — Next.js 16 / React 19"]
+        UI["Chat Interface<br/>RAG + Freeform modes"]
+        SP["Source Panel<br/>Document library"]
+        CV["Citation Viewer<br/>Passage drill-down"]
+        HI["Session History<br/>IndexedDB"]
     end
 
-    subgraph Backend["Backend: FastAPI / Python"]
-        API["REST + SSE API\n/api/chat  /api/query\n/api/sources  /api/transcribe"]
-        RAG["RAG Engine\nCentral orchestrator"]
-        IC["Intent Classifier\n12 research intents"]
-        RT["Retrieval Engine\n7-stage pipeline"]
-        GEN["Generator\nStreaming LLM"]
+    subgraph Backend["Backend — FastAPI / Python"]
+        API["REST + SSE API<br/>/api/chat · /api/query<br/>/api/sources · /api/transcribe"]
+        RAG["RAG Engine<br/>Central orchestrator"]
+        IC["Intent Classifier<br/>12 research intents"]
+        RT["Retrieval Engine<br/>5-stage pipeline"]
+        GEN["Generator<br/>Streaming LLM"]
     end
 
-    subgraph Models["On-Device Models: MLX / Metal"]
-        LLM["Qwen3.5-35B MoE\nLanguage model"]
-        EMB["Qwen3-Embedding-0.6B\nSemantic encoding"]
-        RNK["Jina Reranker v3\nNeural reranking"]
-        WSP["Whisper large-v3\nSpeech to text"]
-        INT["LFM2-8B MoE\nIntent fallback"]
+    subgraph Models["On-Device Models — MLX / Metal"]
+        LLM["Qwen3.5-35B MoE<br/>Language model"]
+        EMB["Qwen3-Embedding-0.6B<br/>Semantic encoding"]
+        RNK["Jina Reranker v3<br/>Neural reranking"]
+        WSP["Whisper large-v3<br/>Speech to text"]
+        INT["LFM2-8B MoE<br/>Intent fallback"]
     end
 
-    subgraph Storage["Local Storage: LanceDB"]
-        VEC["Child Chunks\nVector + BM25 index"]
-        PAR["Parent Chunks\nFull context blocks"]
-        SUM["Source Summaries\nDocument metadata"]
+    subgraph Storage["Local Storage — LanceDB"]
+        VEC["Child Chunks<br/>Vector + BM25 index"]
+        PAR["Parent Chunks<br/>Full context blocks"]
+        SUM["Source Summaries<br/>Document metadata"]
     end
 
-    UI <-->|"AI SDK v6\nSSE stream"| API
+    UI <-->|"AI SDK v6 / SSE"| API
     SP & CV & HI --> API
     API --> RAG
     RAG --> IC & RT & GEN
     RT <--> EMB & RNK
     RT <--> VEC & PAR & SUM
     GEN <--> LLM
-    IC -.->|"low confidence\nfallback"| INT
+    IC -.->|"low-confidence fallback"| INT
 ````
 
 ### Query Pipeline
@@ -167,7 +167,7 @@ flowchart LR
     end
 
     DOC --> Parse --> Chunk --> Index
-    Chunk -.->|"if summarise\nenabled"| Opt
+    Chunk -.->|"if summarise enabled"| Opt
 
     style DOC fill:#7c3aed,color:#fff,stroke:none
 ````
@@ -194,12 +194,12 @@ graph LR
     subgraph DR["Deep Research Mode"]
         D1["64K token context window"]
         D2["40K token retrieval budget"]
-        D3["4x more retrieval candidates"]
-        D4["Chain-of-thought reasoning\nfor ANALYZE, COMPARE, CRITIQUE, EXPLAIN"]
+        D3["4× more retrieval candidates"]
+        D4["Chain-of-thought reasoning<br/>ANALYZE · COMPARE · CRITIQUE · EXPLAIN"]
     end
 ````
 
-Mode is detected automatically from available system RAM. In Deep Research mode, analytical intents (ANALYZE, COMPARE, CRITIQUE, EXPLAIN) activate the model's internal reasoning chain using Qwen3.5's official thinking-mode sampling (temp=1.0, top_p=0.95); the reasoning is not included in the visible response but substantially improves output quality on complex questions. Non-analytical intents use standard sampling in both modes.
+Mode is detected automatically from system RAM. In Deep Research mode the four analytical intents (ANALYZE, COMPARE, CRITIQUE, EXPLAIN) activate Qwen3.5's chain-of-thought reasoning; the thinking is hidden from the visible output but substantially improves quality on complex questions.
 
 ---
 
@@ -236,9 +236,9 @@ When citations are enabled, each retrieved passage is wrapped at prompt-construc
 [PASSAGE END]
 ```
 
-The model is instructed to cite passages inline as [N]. After generation, a CitationListEvent is emitted over the SSE stream carrying the full citation metadata. The frontend binds each [N] marker to a Citation object containing the source ID, chunk ID, and page number.
-Clicking a citation badge opens the citation viewer, which fetches full document content and the specific chunk text in parallel, then scrolls to and highlights the cited passage using a DOM TreeWalker exact-substring matcher with whitespace-normalisation-aware offset mapping.
-An optional citation reference string can be entered per source at ingest time. This is stored in localStorage and used when exporting responses as footnotes or Harvard-style bibliography entries.
+The model is instructed to cite passages inline as `[N]`. After generation, a `CitationListEvent` is emitted over SSE carrying the full citation metadata; the frontend binds each marker to a Citation object with source ID, chunk ID, and page number.
+
+Clicking a citation badge opens the citation viewer: the full document and the cited chunk are fetched in parallel, and the passage is highlighted in context. An optional citation reference string can be entered per source at ingest time and used when exporting responses as formatted footnotes or Harvard bibliography entries.
 
 ---
 
@@ -357,18 +357,7 @@ python -c "from mlx_lm import load; load('jinaai/jina-reranker-v3-mlx')"
 python -c "import mlx_whisper; print('Whisper ready')"
 ```
 
-> **Total download: approximately 26 GB.** The primary language model accounts for the bulk of this. Estimated download times by connection speed:
->
-> | Connection | Speed | Estimated time |
-> |---|---|---|
-> | Fast university / office network | 200 Mbps | ~18 minutes |
-> | Fast home broadband | 100 Mbps | ~35 minutes |
-> | Standard home broadband | 50 Mbps | ~1 hour 10 minutes |
-> | Moderate connection | 20 Mbps | ~3 hours |
-> | Slow connection | 10 Mbps | ~6 hours |
-> | Mobile hotspot / very slow | 5 Mbps | ~12 hours |
->
-> Once downloaded, models are cached locally by Hugging Face (`~/.cache/huggingface/`) and no further internet access is needed.
+> **Total download: approximately 26 GB**, of which the primary language model (~20 GB) accounts for the bulk. Models are cached in `~/.cache/huggingface/` — no further internet access is needed after this one-time download.
 
 
 ---
@@ -433,24 +422,24 @@ curl -F "file=@paper.pdf" -F "source_id=my_paper" -F "summarize=true" \
 
 | File | Lines | Purpose |
 |---|---|---|
-| api.py | 1,310 | FastAPI endpoints, SSE streaming, engine hot-swap, freeform chat |
-| rag_engine.py | 1,690 | Central orchestrator: query pipeline, ingest pipeline, output sanitisation |
-| retrieval.py | 680 | 7-stage hybrid retrieval pipeline with intent-scaled parameters |
-| generator.py | 930 | MLX text generation, streaming, token budget packing, presence penalty |
-| intent.py | 965 | Heuristic and LLM intent classifier: 12 intents, typo tolerance |
-| generation.py | 560 | Intent-aware prompt construction: 12 instruction profiles across 2 mode variants |
-| storage.py | 655 | LanceDB vector and FTS storage, schema migration, cascading delete |
-| ingest.py | 530 | PDF and Markdown parsing, hierarchical parent/child chunking |
-| reranker.py | 425 | Jina v3 MLX listwise reranker with MLP projector |
-| config.py | 365 | Mode configurations, RAM detection, per-intent retrieval and generation overrides |
-| transcription.py | 387 | MLX Whisper with pure-NumPy voice activity detection |
-| embeddings.py | 155 | MLX embedding model wrapper: mean pooling, L2 normalisation |
-| stream_protocol.py | 252 | AI SDK v6 UI Message Stream encoder (SSE frames) |
+| api.py | 1,317 | FastAPI endpoints, SSE streaming, engine hot-swap, freeform chat |
+| rag_engine.py | 1,671 | Central orchestrator: query pipeline, ingest pipeline, output sanitisation |
+| retrieval.py | 697 | 5-stage hybrid retrieval pipeline with intent-scaled parameters |
+| generator.py | 945 | MLX text generation, streaming, token budget packing, presence penalty |
+| intent.py | 963 | Heuristic and LLM intent classifier: 12 intents, typo tolerance |
+| generation.py | 573 | Intent-aware prompt construction: 12 instruction profiles across 2 mode variants |
+| storage.py | 737 | LanceDB vector and FTS storage, schema migration, cascading delete |
+| ingest.py | 557 | PDF and Markdown parsing, hierarchical parent/child chunking |
+| reranker.py | 423 | Jina v3 MLX listwise reranker with MLP projector |
+| config.py | 364 | Mode configurations, RAM detection, per-intent retrieval and generation overrides |
+| transcription.py | 590 | MLX Whisper with pure-NumPy voice activity detection |
+| embeddings.py | 173 | MLX embedding model wrapper: mean pooling, L2 normalisation |
+| stream_protocol.py | 251 | AI SDK v6 UI Message Stream encoder (SSE frames) |
 | query_events.py | 96 | Pipeline event dataclasses: 8 event types |
-| source_cache.py | 175 | Full-text snapshot caching for the citation viewer |
+| source_cache.py | 176 | Full-text snapshot caching for the citation viewer |
 | metrics.py | 170 | Retrieval and budget metrics: 6 dataclasses |
 | latency.py | 107 | Zero-cost latency profiler with ASCII chart output |
-| cli.py | 383 | CLI entry point: ingest and query commands |
+| cli.py | 390 | CLI entry point: ingest and query commands |
 
 </details>
 
