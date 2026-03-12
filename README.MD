@@ -148,9 +148,9 @@ flowchart LR
         P2["pdfminer.six<br/>Fallback"]
         P3["PyMuPDF<br/>Fallback"]
         P4["OCR<br/>Rasterise + pytesseract<br/>for scanned pages"]
-        P1 -->|"no text"| P2
-        P2 -->|"no text"| P3
-        P3 -->|"no text"| P4
+        P1 --> P2
+        P2 --> P3
+        P3 --> P4
     end
 
     subgraph Chunk["Chunk"]
