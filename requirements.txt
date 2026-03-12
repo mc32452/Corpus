@@ -1,25 +1,25 @@
-lancedb
-pyarrow
-pydantic
-safetensors
-mlx-lm
-pypdf
-pdfminer.six
-PyMuPDF
-pytesseract
-pdf2image
+lancedb==0.29.2
+pyarrow==23.0.0
+pydantic==2.12.5
+safetensors==0.7.0
+mlx-lm==0.30.7
+pypdf==6.7.0
+pdfminer.six==20260107
+PyMuPDF==1.27.1
+pytesseract==0.3.13
+pdf2image==1.17.0
 
 # Optional: RAM detection and bench_memory script
-psutil
+psutil==7.2.2
 
 # API layer
-fastapi
-uvicorn
-httpx
-python-multipart
+fastapi==0.128.8
+uvicorn==0.40.0
+httpx==0.28.1
+python-multipart==0.0.22
 
 # Offline Speech-to-Text (MLX Whisper)
-mlx-whisper
-soundfile          # audio decoding (WAV, WebM, OGG)
-scipy              # resampling + WAV fallback decoder
-av                 # robust WebM/OGG/Opus decode fallback (PyAV)
+mlx-whisper==0.4.3
+soundfile==0.13.1   # audio decoding (WAV, WebM, OGG)
+scipy==1.17.0       # resampling + WAV fallback decoder
+av==16.1.0          # robust WebM/OGG/Opus decode fallback (PyAV)
