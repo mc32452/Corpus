@@ -276,6 +276,8 @@ class ChunkDetailResponse(BaseModel):
     chunk_text: str
     parent_text: Optional[str] = None
     page_number: Optional[int] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
     display_page: Optional[str] = None
     header_path: str = ""
     format: str = Field(
@@ -294,6 +296,8 @@ class ChunkBatchItem(BaseModel):
     chunk_id: str
     chunk_text: str
     page_number: Optional[int] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
     display_page: Optional[str] = None
     header_path: str = ""
     format: str = Field(

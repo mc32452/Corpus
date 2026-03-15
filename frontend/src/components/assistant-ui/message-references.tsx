@@ -4,7 +4,11 @@ import { useState, useMemo, useCallback } from "react";
 import { useAuiState } from "@assistant-ui/react";
 import { useAppState, useAppDispatch } from "@/context/app-context";
 import { groupCitations } from "@/lib/group-citations";
-import { formatFootnotesWithText, formatHarvardBibliography } from "@/lib/format-citations";
+import {
+    extractInlineCitationMarkers,
+    formatFootnotesWithText,
+    formatHarvardBibliography,
+} from "@/lib/format-citations";
 import { sourceApi } from "@/lib/api-client";
 import { ChevronDownIcon, ChevronRightIcon, Copy, CheckCheck } from "lucide-react";
 
@@ -17,27 +21,48 @@ export function MessageReferences() {
     const dispatch = useAppDispatch();
     const citations = citationsByMessage[messageId] || [];
 
-    // Build a set of citation numbers that appear in the answer text (e.g. [1], [2])
-    const citedNumbers = useMemo(() => {
-        const nums = new Set<number>();
-        const text = (messageParts ?? [])
+    const answerText = useMemo(() => {
+        return (messageParts ?? [])
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             .filter((p: any) => p.type === "text")
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             .map((p: any) => p.text ?? "")
             .join("");
-        for (const m of text.matchAll(/\[(\d+)\]/g)) {
-            nums.add(parseInt(m[1], 10));
+    }, [messageParts]);
+
+    // Build a set of citation numbers that appear in the answer text (e.g. [1], [2])
+    const citedNumbers = useMemo(() => {
+        const nums = new Set<number>();
+        for (const marker of extractInlineCitationMarkers(answerText)) {
+            nums.add(marker.number);
         }
         return nums;
-    }, [messageParts]);
+    }, [answerText]);
+
+    const markerPageByNumber = useMemo(() => {
+        const pageByNumber = new Map<number, number>();
+        for (const marker of extractInlineCitationMarkers(answerText)) {
+            if (marker.page != null && !pageByNumber.has(marker.number)) {
+                pageByNumber.set(marker.number, marker.page);
+            }
+        }
+        return pageByNumber;
+    }, [answerText]);
+
+    const citationsWithMarkerPages = useMemo(
+        () => citations.map((citation) => {
+            const markerPage = markerPageByNumber.get(citation.number);
+            return markerPage != null ? { ...citation, page: markerPage } : citation;
+        }),
+        [citations, markerPageByNumber]
+    );
 
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
     const [chunkCache, setChunkCache] = useState<Record<string, string>>({});
     const [loadingSources, setLoadingSources] = useState<Set<string>>(new Set());
 
-    const grouped = useMemo(() => groupCitations(citations), [citations]);
+    const grouped = useMemo(() => groupCitations(citationsWithMarkerPages), [citationsWithMarkerPages]);
 
     const toggleDrawer = () => setIsDrawerOpen((prev) => !prev);
 
@@ -86,8 +111,8 @@ export function MessageReferences() {
 
     // Only the green (actually-cited) citations, in citation-number order
     const citedCitations = useMemo(
-        () => citations.filter((c) => citedNumbers.size === 0 || citedNumbers.has(c.number)),
-        [citations, citedNumbers]
+        () => citationsWithMarkerPages.filter((c) => citedNumbers.size === 0 || citedNumbers.has(c.number)),
+        [citationsWithMarkerPages, citedNumbers]
     );
 
     const totalChunks = citations.length;
@@ -99,14 +124,7 @@ export function MessageReferences() {
     function handleCopy(style: "footnote" | "harvard") {
         let text: string;
         if (style === "footnote") {
-            // Extract the raw message body text (same approach as citedNumbers above)
-            const bodyText = (messageParts ?? [])
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                .filter((p: any) => p.type === "text")
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                .map((p: any) => p.text ?? "")
-                .join("");
-            text = formatFootnotesWithText(bodyText, citedCitations);
+            text = formatFootnotesWithText(answerText, citedCitations);
         } else {
             text = formatHarvardBibliography(citedCitations);
         }
@@ -193,7 +211,7 @@ export function MessageReferences() {
                                             <div key={cit.index} className="flex items-center gap-1.5 whitespace-nowrap">
                                                 <button
                                                     onClick={() => {
-                                                        const matchingCitation = citations.find((c) => c.number === cit.index);
+                                                        const matchingCitation = citationsWithMarkerPages.find((c) => c.number === cit.index);
                                                         if (matchingCitation) {
                                                             dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
                                                         }
@@ -254,7 +272,7 @@ export function MessageReferences() {
                                                                         <button
                                                                             type="button"
                                                                             onClick={() => {
-                                                                                const matchingCitation = citations.find((c) => c.number === cit.index);
+                                                                                const matchingCitation = citationsWithMarkerPages.find((c) => c.number === cit.index);
                                                                                 if (matchingCitation) {
                                                                                     dispatch({ type: "SET_ACTIVE_CITATION", citation: matchingCitation });
                                                                                 }

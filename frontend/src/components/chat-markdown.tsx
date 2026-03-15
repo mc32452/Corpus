@@ -23,16 +23,18 @@ function addCitationLinks(content: string, citations?: Citation[]): string {
     return `[${numberText}](citation:${numberText})`;
   });
 
-  return withChunkMarkersLinked.replace(/\[(\d+)\](?!\()/g, (fullMatch, numberText) => {
+  return withChunkMarkersLinked.replace(/\[(\d+)(?:\s*,\s*p\.?\s*(\d+))?\](?!\()/gi, (fullMatch, numberText, pageText) => {
     const index = Number.parseInt(numberText, 10) - 1;
     if (!Number.isInteger(index) || index < 0 || index >= citations.length) {
       return fullMatch;
     }
-    return `[${numberText}](citation:${numberText})`;
+    const label = pageText ? `${numberText}, p.${pageText}` : `${numberText}`;
+    const href = pageText ? `citation:${numberText}?p=${pageText}` : `citation:${numberText}`;
+    return `[${label}](${href})`;
   });
 }
 
-function extractCitationIndex(href?: string): number | null {
+function extractCitationTarget(href?: string): { index: number; page: number | null } | null {
   if (!href) return null;
 
   const decodedHref = (() => {
@@ -44,12 +46,22 @@ function extractCitationIndex(href?: string): number | null {
   })();
 
   const citationMatch =
-    decodedHref.match(/(?:^|\/)citation:(\d+)(?:$|[/?#])/i) ??
-    decodedHref.match(/citation:(\d+)/i);
+    decodedHref.match(/(?:^|\/)citation:(\d+)(?:\?p=(\d+))?(?:$|[/?#])/i) ??
+    decodedHref.match(/citation:(\d+)(?:\?p=(\d+))?/i);
   if (!citationMatch) return null;
 
   const index = Number.parseInt(citationMatch[1], 10) - 1;
-  return Number.isInteger(index) && index >= 0 ? index : null;
+  if (!Number.isInteger(index) || index < 0) return null;
+
+  let page: number | null = null;
+  if (citationMatch[2] != null) {
+    const parsed = Number.parseInt(citationMatch[2], 10);
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      page = parsed;
+    }
+  }
+
+  return { index, page };
 }
 
 export function ChatMarkdown({
@@ -83,12 +95,16 @@ export function ChatMarkdown({
             <code className="font-mono text-[0.9em] bg-zinc-900 px-1 py-0.5 rounded">{children}</code>
           ),
           a: ({ href, children }) => {
-            const index = extractCitationIndex(href);
-            if (index !== null) {
+            const target = extractCitationTarget(href);
+            if (target !== null) {
               // Look up citation by 1-based number (index is already 0-based, so add 1)
               const citation: Citation | undefined = citations.find(
-                (c) => c.number === index + 1,
+                (c) => c.number === target.index + 1,
               );
+
+              const citationForDispatch: Citation | undefined = citation
+                ? (target.page != null ? { ...citation, page: target.page } : citation)
+                : undefined;
 
               return (
                 <span className="inline-flex items-center mx-0.5 align-middle">
@@ -97,13 +113,13 @@ export function ChatMarkdown({
                     onClick={(event) => {
                       event.preventDefault();
                       event.stopPropagation();
-                      if (citation) {
-                        dispatch({ type: "SET_ACTIVE_CITATION", citation });
+                      if (citationForDispatch) {
+                        dispatch({ type: "SET_ACTIVE_CITATION", citation: citationForDispatch });
                       }
                     }}
                     className="inline-flex items-center justify-center min-w-4.5 h-4.5 px-1 text-[10px] font-semibold text-black rounded-full cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-not-allowed bg-white/90 border border-white/80 hover:bg-white"
                     title={citation ? `View source: ${citation.source_id}` : "Source (no metadata)"}
-                    disabled={!citation}
+                    disabled={!citationForDispatch}
                   >
                     {children}
                   </button>

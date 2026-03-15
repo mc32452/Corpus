@@ -46,6 +46,8 @@ _WORD_TO_TOKEN_RATIO: float = 1.35
 # candidates are discarded. Lower values keep more marginal results.
 _ADAPTIVE_THRESHOLD_FACTOR: float = 0.15
 
+_PAGE_MARKER_RE = re.compile(r"\[Page\s+\d+\]", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class _SubThresholdPolicy:
@@ -109,29 +111,69 @@ def format_chunk_for_citation(
     text: str,
     source_id: str,
     display_page: Optional[str] = None,
+    page_number: Optional[int] = None,
+    start_page: Optional[int] = None,
+    end_page: Optional[int] = None,
+    chunk_id: Optional[str] = None,
     chunk_index: int = 1,
 ) -> str:
     """Format a retrieved passage with citation markers for Academic Mode.
 
     Passages are numbered sequentially so the LLM can cite by number [1], [2].
-    When a page number is available the marker includes ``PAGE: X``.
-    When page metadata is missing the PAGE field is omitted so the LLM
-    cites as ``[SourceID]`` or ``[N]`` instead of ``[SourceID, p. Unknown]``.
+    The block header always includes source and, when available, page and chunk
+    metadata to reduce page attribution ambiguity.
     """
-    if display_page:
-        header = f"[PASSAGE {chunk_index} | SOURCE: {source_id} | PAGE: {display_page}]"
-    else:
-        header = f"[PASSAGE {chunk_index} | SOURCE: {source_id}]"
-    return f"{header}\n{text.strip()}\n[PASSAGE END]"
+    page_label: Optional[str] = None
+    if isinstance(start_page, int) and isinstance(end_page, int) and start_page != end_page:
+        page_label = f"{start_page}-{end_page}"
+    elif display_page:
+        page_label = str(display_page).strip()
+    elif isinstance(page_number, int):
+        page_label = str(page_number)
+    elif isinstance(start_page, int):
+        page_label = str(start_page)
+
+    marker_page: Optional[int] = None
+    if isinstance(page_number, int):
+        marker_page = page_number
+    elif isinstance(start_page, int):
+        marker_page = start_page
+    elif display_page:
+        try:
+            marker_page = int(str(display_page).strip())
+        except (TypeError, ValueError):
+            marker_page = None
+
+    body = text.strip()
+    if marker_page is not None and body and not _PAGE_MARKER_RE.search(body):
+        body = f"[Page {marker_page}]\n{body}"
+
+    block_parts = [f"Source: {source_id}"]
+    if page_label:
+        block_parts.append(f"Page {page_label}")
+    if chunk_id:
+        block_parts.append(f"Chunk {chunk_id}")
+    source_block_header = " | ".join(block_parts)
+
+    return (
+        f"[PASSAGE {chunk_index}]\n"
+        f"[{source_block_header}]\n"
+        f"{body}\n"
+        f"[/Source]\n"
+        f"[PASSAGE END]"
+    )
 
 
 def format_context_with_citations(
     texts: list[str],
     metadatas: list[dict[str, Any]],
+    chunk_ids: Optional[list[str]] = None,
 ) -> tuple[str, dict[str, str]]:
     """Format passages with citation markers and build source mapping."""
     if len(texts) != len(metadatas):
         raise ValueError(f"texts and metadatas must have same length, got {len(texts)} vs {len(metadatas)}")
+    if chunk_ids is not None and len(chunk_ids) != len(texts):
+        raise ValueError(f"chunk_ids must have same length as texts, got {len(chunk_ids)} vs {len(texts)}")
 
     formatted_chunks: list[str] = []
     source_mapping: dict[str, str] = {}
@@ -139,13 +181,33 @@ def format_context_with_citations(
     for idx, (text, meta) in enumerate(zip(texts, metadatas), start=1):
         source_id = meta.get("source_id", "Unknown")
         display_page = meta.get("display_page")
+        page_number = meta.get("page_number")
+        start_page = meta.get("start_page")
+        end_page = meta.get("end_page")
+
+        resolved_chunk_id: Optional[str] = None
+        if chunk_ids is not None:
+            value = chunk_ids[idx - 1]
+            if isinstance(value, str) and value:
+                resolved_chunk_id = value
+        if resolved_chunk_id is None:
+            maybe_chunk_id = meta.get("chunk_id")
+            if isinstance(maybe_chunk_id, str) and maybe_chunk_id:
+                resolved_chunk_id = maybe_chunk_id
 
         doc_name = meta.get("doc_name") or meta.get("filename")
         if doc_name and doc_name != source_id and source_id not in source_mapping:
             source_mapping[source_id] = doc_name
 
         formatted_chunks.append(format_chunk_for_citation(
-            text=text, source_id=source_id, display_page=display_page, chunk_index=idx,
+            text=text,
+            source_id=source_id,
+            display_page=display_page,
+            page_number=page_number,
+            start_page=start_page,
+            end_page=end_page,
+            chunk_id=resolved_chunk_id,
+            chunk_index=idx,
         ))
     
     context = "\n\n".join(formatted_chunks)

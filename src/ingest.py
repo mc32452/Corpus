@@ -65,12 +65,42 @@ CHILD_OVERLAP_SENTENCES = 2
 
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 CLAUSE_BOUNDARY_RE = re.compile(r";\s+|,\s+(?:and|but|which|or)\s+", re.IGNORECASE)
+PAGE_MARKER_RE = re.compile(r"\[Page\s+(\d+)\]", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class _Section:
     header_path: str
     text: str
+
+
+def _format_page_marker(page_number: int) -> str:
+    page = int(page_number)
+    if page < 1:
+        page = 1
+    return f"[Page {page}]"
+
+
+def _parse_page_markers(text: str) -> list[int]:
+    if not text:
+        return []
+
+    pages: list[int] = []
+    for match in PAGE_MARKER_RE.finditer(text):
+        try:
+            page = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if page >= 1:
+            pages.append(page)
+    return pages
+
+
+def _marker_page_range(text: str) -> tuple[Optional[int], Optional[int]]:
+    pages = _parse_page_markers(text)
+    if not pages:
+        return None, None
+    return pages[0], pages[-1]
 
 
 def _tokenize(text: str) -> list[str]:
@@ -198,11 +228,18 @@ def _split_parent_chunks(
     parents: list[ParentChunk] = []
     for chunk_tokens in token_chunks:
         text = _detokenize(chunk_tokens)
+        start_page, end_page = _marker_page_range(text)
+        resolved_page_number = start_page if start_page is not None else page_number
+        resolved_display_page = display_page if display_page is not None else (
+            str(start_page) if start_page is not None else None
+        )
         metadata = Metadata(
             source_id=source_id,
-            page_number=page_number,
+            page_number=resolved_page_number,
+            start_page=start_page,
+            end_page=end_page,
             page_label=page_label,
-            display_page=display_page,
+            display_page=resolved_display_page,
             header_path=section.header_path,
             parent_id=None,
         )
@@ -243,6 +280,29 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
     _merge_count = 0
     _sole_child_count = 0
 
+    def _build_child_metadata(child_text: str) -> Metadata:
+        inferred_start, inferred_end = _marker_page_range(child_text)
+        start_page = inferred_start if inferred_start is not None else parent.metadata.start_page
+        end_page = inferred_end if inferred_end is not None else parent.metadata.end_page
+
+        if inferred_start is not None:
+            resolved_page_number = inferred_start
+            resolved_display_page = str(inferred_start)
+        else:
+            resolved_page_number = parent.metadata.page_number
+            resolved_display_page = parent.metadata.display_page
+
+        return Metadata(
+            source_id=parent.metadata.source_id,
+            page_number=resolved_page_number,
+            start_page=start_page,
+            end_page=end_page,
+            page_label=parent.metadata.page_label,
+            display_page=resolved_display_page,
+            header_path=parent.metadata.header_path,
+            parent_id=parent.id,
+        )
+
     for chunk_sentences in sentence_chunks:
         text = " ".join(chunk_sentences).strip()
         token_count = _token_count(text)
@@ -252,33 +312,20 @@ def _split_child_chunks(parent: ParentChunk) -> list[ChildChunk]:
                 # Merge into previous child's text
                 prev = child_chunks[-1]
                 merged_text = prev.text + " " + text
+                merged_metadata = _build_child_metadata(merged_text)
                 # Re-create with same id and metadata (frozen model)
                 child_chunks[-1] = ChildChunk.model_construct(
-                    id=prev.id, text=merged_text, metadata=prev.metadata,
+                    id=prev.id, text=merged_text, metadata=merged_metadata,
                 )
                 _merge_count += 1
             else:
                 # No previous child — create a sole child (short but searchable)
-                metadata = Metadata(
-                    source_id=parent.metadata.source_id,
-                    page_number=parent.metadata.page_number,
-                    page_label=parent.metadata.page_label,
-                    display_page=parent.metadata.display_page,
-                    header_path=parent.metadata.header_path,
-                    parent_id=parent.id,
-                )
+                metadata = _build_child_metadata(text)
                 child_chunks.append(ChildChunk(text=text, metadata=metadata))
                 _sole_child_count += 1
             continue
 
-        metadata = Metadata(
-            source_id=parent.metadata.source_id,
-            page_number=parent.metadata.page_number,
-            page_label=parent.metadata.page_label,
-            display_page=parent.metadata.display_page,
-            header_path=parent.metadata.header_path,
-            parent_id=parent.id,
-        )
+        metadata = _build_child_metadata(text)
         child_chunks.append(ChildChunk(text=text, metadata=metadata))
 
     if _merge_count or _sole_child_count:
@@ -383,24 +430,35 @@ def _extract_pypdf(reader, *, page_offset: int = 1, **_kw) -> list[_PageData]:
             pass
         page_number = (index - 1) + page_offset
         display_page = str(page_number) if page_offset != 1 else (page_label if page_label else str(index))
-        pages.append(_PageData(page_text, page_number, page_label, display_page))
+        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
+        pages.append(_PageData(marked_text, page_number, page_label, display_page))
     return pages
 
 
-def _extract_pdfminer(path: Path, **_kw) -> list[_PageData]:
-    """Strategy 2: pdfminer whole-document fallback.
-
-    # Page offset is not applied here: pdfminer is a whole-document fallback
-    # that produces a single block with no per-page metadata (all page fields are None).
-    """
+def _extract_pdfminer(path: Path, *, reader, page_offset: int = 1, **_kw) -> list[_PageData]:
+    """Strategy 2: pdfminer per-page fallback."""
     try:
         from pdfminer.high_level import extract_text
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("pdfminer.six is required for fallback PDF extraction.") from exc
-    fallback_text = clean_ocr_artifacts((extract_text(str(path)) or "").strip())
-    if fallback_text:
-        return [_PageData(fallback_text, None, None, None)]
-    return []
+
+    pages: list[_PageData] = []
+    page_count = len(reader.pages)
+    for index in range(page_count):
+        try:
+            raw_text = extract_text(str(path), page_numbers=[index])
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            logger.warning("pdfminer page extraction failed on page %d: %s", index + 1, exc)
+            continue
+
+        page_text = clean_ocr_artifacts((raw_text or "").strip())
+        if not page_text:
+            continue
+
+        page_number = index + page_offset
+        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
+        pages.append(_PageData(marked_text, page_number, None, str(page_number)))
+    return pages
 
 
 def _extract_pymupdf(path: Path, *, page_offset: int = 1, **_kw) -> list[_PageData]:
@@ -424,7 +482,8 @@ def _extract_pymupdf(path: Path, *, page_offset: int = 1, **_kw) -> list[_PageDa
             pass
         page_number = index + page_offset
         display_page = str(page_number) if page_offset != 1 else (page_label if page_label else str(page_number))
-        pages.append(_PageData(page_text, page_number, page_label, display_page))
+        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
+        pages.append(_PageData(marked_text, page_number, page_label, display_page))
     return pages
 
 
@@ -448,7 +507,8 @@ def _extract_ocr(reader, path: Path, *, page_offset: int = 1, **_kw) -> list[_Pa
         if not page_text:
             continue
         page_number = (index - 1) + page_offset
-        pages.append(_PageData(page_text, page_number, None, str(page_number)))
+        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
+        pages.append(_PageData(marked_text, page_number, None, str(page_number)))
     return pages
 
 

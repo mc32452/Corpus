@@ -79,12 +79,26 @@ _SYSTEM_MESSAGE = """You are a research assistant. Follow these rules strictly:
 
 _CITATION_RULES = """
 CITATION REQUIREMENTS (MANDATORY):
-- Context passages are numbered [PASSAGE 1 | SOURCE: ...], [PASSAGE 2 | SOURCE: ...], etc.
-- You MUST cite every factual claim using the passage number: [1], [2], [3], etc.
-- Place the citation immediately after the sentence it supports, before the period when possible.
-- Example: "The unemployment rate rose to 5.2% [1]. Housing starts declined by 12% [2]."
-- If multiple passages support one claim, cite all of them: [1][3].
-- Do NOT omit citations. Every statement derived from the context MUST have at least one [N] marker."""
+- Context is provided as numbered [PASSAGE N] blocks with headers like [Source: ... | Page ... | Chunk ...].
+- You MUST cite the primary supporting passage for each distinct claim using passage numbers: [1], [2], [3], etc.
+- Cite the specific page whose chunk text supports the claim. Do not guess adjacent pages.
+- If a claim is supported by the chunk labeled Page 34, cite that passage for Page 34, not Page 33 or 35.
+- If multiple passages support one claim, cite all relevant passages: [1][3].
+- Place citations inline immediately after the supported sentence (not as one citation block at the end).
+- Do NOT omit source grounding. Every evidence-backed claim should include at least one [N] marker."""
+
+_BENCHMARK_CITATION_RULES = """
+CITATION REQUIREMENTS (MANDATORY):
+- Context is provided as numbered [PASSAGE N] blocks with headers like [Source: ... | Page ... | Chunk ...].
+- Every factual claim MUST use inline citations in this exact format: [N, p.XX].
+- XX MUST be the nearest preceding [Page N] marker in that passage's text.
+- If a claim is supported by a passage section marked [Page 34], cite [N, p.34], not [N, p.33] or [N, p.35].
+- If multiple passages support one claim, cite all of them, e.g. [1, p.12][3, p.14].
+- Place citations inline immediately after each supported sentence, not as an end-of-answer citation list.
+- Do NOT omit source grounding. Every evidence-backed claim should include at least one [N, p.XX] marker."""
+
+_CITATION_OUTPUT_DEFAULT = "default"
+_CITATION_OUTPUT_BENCHMARK_PAGE = "benchmark_page"
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +512,8 @@ def _prepare_config(
     intent: Optional[Intent],
     citations_enabled: bool,
     extra_instructions: Optional[str],
-    mode: Optional[str] = None
+    mode: Optional[str] = None,
+    citation_output_mode: str = _CITATION_OUTPUT_DEFAULT,
 ) -> tuple[dict[str, str], str, str]:
     intent = intent or Intent.SUMMARIZE
     instructions = _get_intent_instructions(mode)
@@ -514,11 +529,47 @@ def _prepare_config(
     )
     citation_block = ""
     if citations_enabled:
-        citation_block = f"\n{_CITATION_RULES}"
-        cfg["format"] += (
-            " Include numbered inline citations [1], [2], etc. after every factual claim. "
-            "Treat citation numbers as references to provided passages; do not use words like 'chunk' or mention retrieval internals."
-        )
+        benchmark_mode = citation_output_mode == _CITATION_OUTPUT_BENCHMARK_PAGE
+        if citation_output_mode not in {
+            _CITATION_OUTPUT_DEFAULT,
+            _CITATION_OUTPUT_BENCHMARK_PAGE,
+        }:
+            logger.warning(
+                "Unknown citation_output_mode '%s'; falling back to default",
+                citation_output_mode,
+            )
+            benchmark_mode = False
+
+        citation_rules = _BENCHMARK_CITATION_RULES if benchmark_mode else _CITATION_RULES
+        citation_block = f"\n{citation_rules}"
+        if benchmark_mode:
+            cfg["format"] += (
+                " Include benchmark citations as [N, p.XX] after every factual claim. "
+                "Use XX from the nearest preceding [Page N] marker in that passage text."
+            )
+        else:
+            cfg["format"] += (
+                " Include numbered inline citations [1], [2], etc. after every factual claim. "
+                "Treat citation numbers as references to provided passages; do not use words like 'chunk' or mention retrieval internals."
+            )
+
+        if intent == Intent.COMPARE:
+            cfg["format"] += (
+                " When comparing positions, cite each side separately within the same sentence. "
+                "Do not batch multiple page citations at the end of a paragraph. "
+                "Each distinct claim gets its own inline citation immediately after the supporting clause."
+            )
+        elif intent == Intent.OVERVIEW:
+            cfg["format"] += (
+                " Even though you are summarizing broadly, cite the specific page for each main point individually. "
+                "Do not group citations at the end of a paragraph. "
+                "If one sentence covers multiple topics from different pages, split it into separate sentences with individual citations."
+            )
+        elif intent == Intent.ANALYZE:
+            cfg["format"] += (
+                " Cite at the clause level, not the paragraph level. "
+                "Each analytical claim should carry its own inline citation immediately after the supporting clause."
+            )
     return cfg, citation_block, extra_block
 
 
@@ -531,10 +582,15 @@ def build_messages(
     source_legend: Optional[str] = None,
     mode: Optional[str] = None,
     retrieval_budget: Optional[int] = None,
+    citation_output_mode: str = _CITATION_OUTPUT_DEFAULT,
 ) -> list[dict[str, str]]:
     """Build intent-aware chat messages for the LLM."""
     cfg, citation_block, extra_block = _prepare_config(
-        intent, citations_enabled, extra_instructions, mode=mode
+        intent,
+        citations_enabled,
+        extra_instructions,
+        mode=mode,
+        citation_output_mode=citation_output_mode,
     )
     system_block = _build_system_block(cfg, citation_block, extra_block)
 
@@ -561,11 +617,19 @@ def build_messages(
     # Reminder injected at the end of the user message — at the generation trigger
     # point where model attention peaks — to reinforce citation rules already stated
     # in the system prompt.
-    citation_reminder = (
-        "\n\nIMPORTANT: You MUST include inline citation numbers [1], [2], etc. "
-        "after every factual claim. Use the PASSAGE numbers from the context above."
-        if citations_enabled else ""
-    )
+    citation_reminder = ""
+    if citation_output_mode == _CITATION_OUTPUT_BENCHMARK_PAGE and citations_enabled:
+        citation_reminder = (
+            "\n\nIMPORTANT: You MUST include inline citations as [N, p.XX] after every factual claim. "
+            "N is the PASSAGE number, XX is the nearest preceding [Page N] marker in that passage's text."
+        )
+    elif citations_enabled:
+        citation_reminder = (
+            "\n\nIMPORTANT: You MUST include inline citation numbers [1], [2], etc. "
+            "after every factual claim. Use the PASSAGE numbers from the context above."
+        )
+    else:
+        citation_reminder = ""
     user_block = f"Context:\n{context}{legend_block}\n\nQuestion: {question}{citation_reminder}"
     return [
         {"role": "system", "content": system_block},

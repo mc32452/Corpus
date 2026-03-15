@@ -30,6 +30,9 @@ from src.ingest import (
     clean_ocr_artifacts,
     ingest_markdown,
     _sample_context,
+    _format_page_marker,
+    _parse_page_markers,
+    _marker_page_range,
 )
 from tests.conftest import Timer, get_test_logger
 
@@ -51,14 +54,28 @@ class TestMetadata:
         m = Metadata(
             source_id="doc1",
             page_number=5,
+            start_page=5,
+            end_page=6,
             page_label="v",
             display_page="v",
             header_path="Ch1 > Sec2",
             parent_id="pid-123",
         )
         assert m.page_number == 5
+        assert m.start_page == 5
+        assert m.end_page == 6
         assert m.display_page == "v"
         assert m.parent_id == "pid-123"
+
+    def test_invalid_page_range_rejected(self):
+        with pytest.raises(Exception):
+            Metadata(
+                source_id="doc1",
+                page_number=5,
+                start_page=9,
+                end_page=7,
+                header_path="Doc",
+            )
 
     def test_empty_source_id_rejected(self):
         with pytest.raises(Exception):
@@ -184,6 +201,19 @@ class TestOCRCleanup:
         assert clean_ocr_artifacts(None) is None  # type: ignore[arg-type]
 
 
+class TestPageMarkers:
+    def test_format_page_marker(self):
+        assert _format_page_marker(7) == "[Page 7]"
+
+    def test_parse_page_markers(self):
+        text = "[Page 3] intro [Page 4] body [PAGE 5] tail"
+        assert _parse_page_markers(text) == [3, 4, 5]
+
+    def test_marker_page_range(self):
+        assert _marker_page_range("No markers here") == (None, None)
+        assert _marker_page_range("[Page 10] text [Page 12]") == (10, 12)
+
+
 # ===========================================================================
 # Markdown section parsing
 # ===========================================================================
@@ -264,6 +294,25 @@ class TestParentChunkSplitting:
         section = _Section(header_path="Test", text="")
         parents = _split_parent_chunks(section, source_id="doc1", page_number=1)
         assert parents == []
+
+    def test_parent_chunk_derives_range_from_marker(self):
+        section = _Section(
+            header_path="Test",
+            text="[Page 11] " + " ".join(["word"] * 250),
+        )
+        parents = _split_parent_chunks(
+            section,
+            source_id="doc1",
+            page_number=3,
+            display_page="iii",
+        )
+        assert len(parents) == 1
+        parent = parents[0]
+        assert parent.metadata.start_page == 11
+        assert parent.metadata.end_page == 11
+        assert parent.metadata.page_number == 11
+        # Keep legacy display-page semantics when provided by extractor.
+        assert parent.metadata.display_page == "iii"
 
 
 # ===========================================================================
@@ -358,6 +407,44 @@ class TestChildChunkSplitting:
         # Short text below min tokens should produce a sole child chunk
         assert len(children) == 1
         assert children[0].text == text
+
+    def test_child_chunk_derives_page_range_from_marker(self):
+        text = "[Page 12] " + " ".join(["word"] * (CHILD_MIN_TOKENS + 20))
+        meta = Metadata(
+            source_id="doc1",
+            page_number=2,
+            start_page=2,
+            end_page=2,
+            header_path="Test",
+            parent_id=None,
+        )
+        parent = ParentChunk(text=text, metadata=meta)
+        children = _split_child_chunks(parent)
+        assert children
+        child = children[0]
+        assert child.metadata.start_page == 12
+        assert child.metadata.end_page == 12
+        assert child.metadata.page_number == 12
+        assert child.metadata.display_page == "12"
+
+    def test_child_chunk_falls_back_to_parent_range_when_marker_missing(self):
+        text = " ".join(["word"] * (CHILD_MIN_TOKENS + 20))
+        meta = Metadata(
+            source_id="doc1",
+            page_number=6,
+            start_page=6,
+            end_page=7,
+            display_page="6",
+            header_path="Test",
+            parent_id=None,
+        )
+        parent = ParentChunk(text=text, metadata=meta)
+        children = _split_child_chunks(parent)
+        assert children
+        for child in children:
+            assert child.metadata.start_page == 6
+            assert child.metadata.end_page == 7
+            assert child.metadata.page_number == 6
 
 
 # ===========================================================================

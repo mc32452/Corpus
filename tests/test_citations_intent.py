@@ -41,15 +41,19 @@ class TestCitationFormatting:
         result = format_chunk_for_citation(
             "Some text here.", source_id="doc1", display_page="5"
         )
-        assert "[PASSAGE 1 | SOURCE: doc1 | PAGE: 5]" in result
+        assert "[PASSAGE 1]" in result
+        assert "[Source: doc1 | Page 5]" in result
+        assert "[Page 5]" in result
         assert "Some text here." in result
+        assert "[/Source]" in result
         assert "[PASSAGE END]" in result
 
     def test_format_chunk_without_page(self):
         result = format_chunk_for_citation(
             "Some text.", source_id="doc1", display_page=None
         )
-        assert "[PASSAGE 1 | SOURCE: doc1]" in result
+        assert "[PASSAGE 1]" in result
+        assert "[Source: doc1]" in result
         assert "PAGE" not in result
 
     def test_format_chunk_empty_page(self):
@@ -66,8 +70,8 @@ class TestCitationFormatting:
             {"source_id": "doc2", "display_page": "3"},
         ]
         context, mapping = format_context_with_citations(texts, metadatas)
-        assert "SOURCE: doc1" in context
-        assert "SOURCE: doc2" in context
+        assert "Source: doc1" in context
+        assert "Source: doc2" in context
         assert "Content A." in context
         assert "Content B." in context
 
@@ -164,6 +168,49 @@ class TestCitationToggle:
         )
         user_msg = messages[1]["content"]
         assert "SOURCE LEGEND" not in user_msg
+
+    def test_default_citation_rules_include_page_marker_grounding(self):
+        messages = build_messages(
+            context="[Page 12]\nContext text",
+            question="What is this?",
+            intent=Intent.OVERVIEW,
+            citations_enabled=True,
+        )
+        system_msg = messages[0]["content"]
+        assert "Do not guess adjacent pages" in system_msg
+        assert "exact format: [N, p.XX]" not in system_msg
+
+    def test_benchmark_citation_mode_requires_page_format(self):
+        messages = build_messages(
+            context="[Page 12]\nContext text",
+            question="What is this?",
+            intent=Intent.OVERVIEW,
+            citations_enabled=True,
+            citation_output_mode="benchmark_page",
+        )
+        system_msg = messages[0]["content"]
+        user_msg = messages[1]["content"]
+        assert "exact format: [N, p.XX]" in system_msg
+        assert "nearest preceding [Page N] marker" in system_msg
+        assert "nearest preceding [Page N] marker" in user_msg
+
+    @pytest.mark.parametrize(
+        "intent,expected_phrase",
+        [
+            (Intent.COMPARE, "cite each side separately within the same sentence"),
+            (Intent.OVERVIEW, "split it into separate sentences with individual citations"),
+            (Intent.ANALYZE, "cite at the clause level, not the paragraph level"),
+        ],
+    )
+    def test_synthesis_intents_get_specific_citation_guidance(self, intent: Intent, expected_phrase: str):
+        messages = build_messages(
+            context="[Page 12]\nContext text",
+            question="Explain what this means.",
+            intent=intent,
+            citations_enabled=True,
+        )
+        system_msg = messages[0]["content"].lower()
+        assert expected_phrase in system_msg
 
 
 # ===========================================================================
@@ -366,7 +413,7 @@ class TestMessageBuilding:
         assert "Be very concise" in system
 
     def test_citation_rules_format(self):
-        assert "[1], [2], [3]" in _CITATION_RULES
+        assert "[1]" in _CITATION_RULES
         assert "MUST cite" in _CITATION_RULES.upper() or "MUST CITE" in _CITATION_RULES.upper()
 
 

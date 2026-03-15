@@ -54,6 +54,8 @@ export interface CitationPayload {
   source_id: string;
   chunk_id?: string;
   page_number?: number | null;
+  start_page?: number | null;
+  end_page?: number | null;
   display_page?: string | null;
   header_path?: string;
   chunk_text?: string;
@@ -65,6 +67,8 @@ export interface ChunkDetailResponse {
   chunk_text: string;
   parent_text?: string | null;
   page_number?: number | null;
+  start_page?: number | null;
+  end_page?: number | null;
   display_page?: string | null;
   header_path: string;
   format: "pdf" | "markdown" | "text";
@@ -76,6 +80,8 @@ export interface ChunkBatchItem {
   chunk_id: string;
   chunk_text: string;
   page_number?: number | null;
+  start_page?: number | null;
+  end_page?: number | null;
   display_page?: string | null;
   header_path: string;
   format: "pdf" | "markdown" | "text";

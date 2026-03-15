@@ -15,6 +15,31 @@
 import type { Citation } from "./event-parser";
 import { getCitationMeta } from "./citation-meta-store";
 
+const INLINE_CITATION_PATTERN = "\\[(\\d+)(?:\\s*,\\s*p\\.?\\s*(\\d+))?\\]";
+
+export type InlineCitationMarker = {
+  number: number;
+  page: number | null;
+};
+
+export function extractInlineCitationMarkers(messageText: string): InlineCitationMarker[] {
+  const markers: InlineCitationMarker[] = [];
+  if (!messageText) return markers;
+
+  const regex = new RegExp(INLINE_CITATION_PATTERN, "gi");
+  for (const match of messageText.matchAll(regex)) {
+    const number = Number.parseInt(match[1], 10);
+    if (!Number.isInteger(number) || number < 1) continue;
+
+    const pageRaw = match[2];
+    const parsedPage = pageRaw != null ? Number.parseInt(pageRaw, 10) : Number.NaN;
+    const page = Number.isInteger(parsedPage) && parsedPage >= 1 ? parsedPage : null;
+    markers.push({ number, page });
+  }
+
+  return markers;
+}
+
 // ---------------------------------------------------------------------------
 // Internal helper
 // ---------------------------------------------------------------------------
@@ -126,14 +151,19 @@ export function formatFootnotesWithText(
   messageText: string,
   citedCitations: Citation[]
 ): string {
-  // 1. Collect original [N] numbers in first-appearance order
+  // 1. Collect original citation numbers in first-appearance order.
+  const markers = extractInlineCitationMarkers(messageText);
   const seen = new Set<number>();
   const ordered: number[] = [];
-  for (const m of messageText.matchAll(/\[(\d+)\]/g)) {
-    const n = parseInt(m[1], 10);
+  const markerPageByOriginal = new Map<number, number>();
+  for (const marker of markers) {
+    const n = marker.number;
     if (!seen.has(n)) {
       seen.add(n);
       ordered.push(n);
+    }
+    if (marker.page != null && !markerPageByOriginal.has(n)) {
+      markerPageByOriginal.set(n, marker.page);
     }
   }
 
@@ -141,11 +171,14 @@ export function formatFootnotesWithText(
   const renumberMap = new Map<number, number>();
   ordered.forEach((orig, idx) => renumberMap.set(orig, idx + 1));
 
-  // 3. Replace [N] in body text with renumbered equivalents
-  const renumberedText = messageText.replace(/\[(\d+)\]/g, (_, digits) => {
+  // 3. Replace [N] and [N, p.XX] in body text with renumbered equivalents.
+  const renumberedText = messageText.replace(new RegExp(INLINE_CITATION_PATTERN, "gi"), (_, digits, pageDigits) => {
     const orig = parseInt(digits, 10);
     const newN = renumberMap.get(orig);
-    return newN !== undefined ? `[${newN}]` : `[${digits}]`;
+    if (newN === undefined) {
+      return pageDigits ? `[${digits}, p.${pageDigits}]` : `[${digits}]`;
+    }
+    return pageDigits ? `[${newN}, p.${pageDigits}]` : `[${newN}]`;
   });
 
   // 4. Build footnote list — look up each original number in citedCitations
@@ -160,7 +193,9 @@ export function formatFootnotesWithText(
     const c = citationsByOriginal.get(orig);
     if (!c) return `${newN}. [${orig}].`;
     const label = sourceLabel(c.source_id);
-    const page = c.page != null ? `, p.${c.page}` : "";
+    const markerPage = markerPageByOriginal.get(orig);
+    const pageValue = markerPage ?? c.page ?? null;
+    const page = pageValue != null ? `, p.${pageValue}` : "";
     return `${newN}. ${label}${page}.`;
   });
 

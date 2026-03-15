@@ -33,6 +33,13 @@ __pycache__/
 /testing/
 *.pdf
 *.txt
+*.csv
+
+# Benchmark work (local-only)
+/benchmarks/runs/
+/benchmarks/retrieval_runs/
+/src/benchmark/
+/tests/test_benchmark_*.py
 
 # User workspace data (sqlite, ocr cache, etc.)
 /storage/workspaces/

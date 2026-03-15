@@ -5,6 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
+import lancedb
 import pytest
 
 from src.models import ChildChunk, Metadata, ParentChunk
@@ -197,6 +198,95 @@ class TestChildStore:
         sources = engine2.list_source_ids()
         assert len(sources) > 0, "Data should persist across sessions"
         engine2.close()
+
+    def test_range_metadata_round_trip(self, tmp_path: Path, mock_embedder: MockEmbeddingModel):
+        config = StorageConfig(lance_dir=tmp_path / "lance")
+        engine = StorageEngine(config)
+
+        parent = ParentChunk(
+            id="p-range",
+            text="[Page 10] Parent context",
+            metadata=Metadata(
+                source_id="doc-range",
+                page_number=10,
+                start_page=10,
+                end_page=12,
+                page_label="10",
+                display_page="10",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        child = ChildChunk(
+            id="c-range",
+            text="[Page 10] child chunk",
+            metadata=Metadata(
+                source_id="doc-range",
+                page_number=10,
+                start_page=10,
+                end_page=11,
+                page_label="10",
+                display_page="10",
+                header_path="Document",
+                parent_id=parent.id,
+            ),
+        )
+
+        engine.add_parents([parent])
+        embedding = mock_embedder.encode([child.text], normalize_embeddings=True)
+        engine.add_children([child], embeddings=embedding)
+
+        fetched = engine.get_children_by_ids([child.id])
+        assert child.id in fetched
+        meta = fetched[child.id]["metadata"]
+        assert meta["start_page"] == 10
+        assert meta["end_page"] == 11
+
+        engine.close()
+
+    def test_existing_tables_migrate_range_columns(self, tmp_path: Path):
+        lance_dir = tmp_path / "lance"
+        db = lancedb.connect(str(lance_dir))
+
+        db.create_table(
+            "child_chunks",
+            [
+                {
+                    "id": "c1",
+                    "text": "legacy child",
+                    "source_id": "doc-legacy",
+                    "page_number": 1,
+                    "page_label": "1",
+                    "display_page": "1",
+                    "header_path": "Document",
+                    "parent_id": "p1",
+                    "vector": [0.1, 0.2, 0.3],
+                }
+            ],
+        )
+        db.create_table(
+            "parent_chunks",
+            [
+                {
+                    "parent_id": "p1",
+                    "source_id": "doc-legacy",
+                    "page_number": 1,
+                    "page_label": "1",
+                    "display_page": "1",
+                    "header_path": "Document",
+                    "text": "legacy parent",
+                }
+            ],
+        )
+
+        engine = StorageEngine(StorageConfig(lance_dir=lance_dir))
+        assert engine._table is not None
+        assert engine._parents is not None
+        assert "start_page" in engine._table.schema.names
+        assert "end_page" in engine._table.schema.names
+        assert "start_page" in engine._parents.schema.names
+        assert "end_page" in engine._parents.schema.names
+        engine.close()
 
 
 # ===========================================================================

@@ -60,6 +60,7 @@ class StorageEngine:
         self._table: Optional[lancedb.table.Table] = None
         try:
             self._table = self._db.open_table(self._table_name)
+            self._migrate_children_schema()
             logger.info("Opened LanceDB table '%s'", self._table_name)
         except ValueError:
             logger.info(
@@ -73,6 +74,7 @@ class StorageEngine:
         self._parents: Optional[lancedb.table.Table] = None
         try:
             self._parents = self._db.open_table(self._PARENTS_TABLE)
+            self._migrate_parents_schema()
         except ValueError:
             pass  # Table does not exist yet
 
@@ -93,6 +95,47 @@ class StorageEngine:
 
     _SUMMARIES_V2_COLUMNS = ("source_path", "snapshot_path")
     _SUMMARIES_V3_COLUMNS = ("page_offset",)  # int32; absence treated as 1 at read time
+    _RANGE_COLUMNS = ("start_page", "end_page")
+
+    def _migrate_children_schema(self) -> None:
+        """Add range columns to child chunk table if missing."""
+        if self._table is None:
+            return
+        existing = set(self._table.schema.names)
+        missing: list[pa.Field] = [
+            pa.field(col, pa.int32())
+            for col in self._RANGE_COLUMNS
+            if col not in existing
+        ]
+        if not missing:
+            return
+        self._table.add_columns(missing)
+        self._table = self._db.open_table(self._table_name)
+        logger.info(
+            "Migrated '%s' table: added columns %s",
+            self._table_name,
+            [f.name for f in missing],
+        )
+
+    def _migrate_parents_schema(self) -> None:
+        """Add range columns to parent chunk table if missing."""
+        if self._parents is None:
+            return
+        existing = set(self._parents.schema.names)
+        missing: list[pa.Field] = [
+            pa.field(col, pa.int32())
+            for col in self._RANGE_COLUMNS
+            if col not in existing
+        ]
+        if not missing:
+            return
+        self._parents.add_columns(missing)
+        self._parents = self._db.open_table(self._PARENTS_TABLE)
+        logger.info(
+            "Migrated '%s' table: added columns %s",
+            self._PARENTS_TABLE,
+            [f.name for f in missing],
+        )
 
     def _migrate_summaries_schema(self) -> None:
         """Add v2 and v3 columns to the source_summaries table if missing."""
@@ -224,6 +267,8 @@ class StorageEngine:
                 "parent_id": p.id,
                 "source_id": p.metadata.source_id,
                 "page_number": p.metadata.page_number or 0,
+                "start_page": p.metadata.start_page,
+                "end_page": p.metadata.end_page,
                 "page_label": p.metadata.page_label or "",
                 "display_page": p.metadata.display_page or "",
                 "header_path": p.metadata.header_path,
@@ -284,6 +329,16 @@ class StorageEngine:
                 raise
 
     @staticmethod
+    def _normalize_positive_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            page = int(value)
+        except (TypeError, ValueError):
+            return None
+        return page if page >= 1 else None
+
+    @staticmethod
     def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         return {
             key: value
@@ -296,7 +351,9 @@ class StorageEngine:
         """Extract and clean standard metadata fields from a LanceDB row."""
         meta = {
             "source_id": row.get("source_id", ""),
-            "page_number": row.get("page_number"),
+            "page_number": StorageEngine._normalize_positive_int(row.get("page_number")),
+            "start_page": StorageEngine._normalize_positive_int(row.get("start_page")),
+            "end_page": StorageEngine._normalize_positive_int(row.get("end_page")),
             "page_label": row.get("page_label"),
             "display_page": row.get("display_page"),
             "header_path": row.get("header_path", ""),
@@ -324,6 +381,8 @@ class StorageEngine:
                 "text": child.text,
                 "source_id": child.metadata.source_id,
                 "page_number": child.metadata.page_number or 0,
+                "start_page": child.metadata.start_page,
+                "end_page": child.metadata.end_page,
                 "page_label": child.metadata.page_label or "",
                 "display_page": child.metadata.display_page or "",
                 "header_path": child.metadata.header_path,
@@ -397,7 +456,7 @@ class StorageEngine:
             return {}
         _NON_VECTOR_COLS = [
             "id", "text", "source_id", "page_number",
-            "page_label", "display_page", "header_path", "parent_id",
+            "start_page", "end_page", "page_label", "display_page", "header_path", "parent_id",
         ]
 
         unique_ids = list(dict.fromkeys(child_id for child_id in ids if child_id))

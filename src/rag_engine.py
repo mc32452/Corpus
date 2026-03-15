@@ -753,6 +753,7 @@ class RagEngine:
         source_id: Optional[str] = None,
         intent_override: Optional[str] = None,
         citations_enabled: Optional[bool] = None,
+        citation_output_mode: str = "default",
         no_generate: bool = False,
         dump_prompt: bool = False,
     ) -> QueryResult:
@@ -887,6 +888,7 @@ class RagEngine:
                 source_legend=packed.source_legend,
                 mode=config.mode,
                 retrieval_budget=config.retrieval_budget,
+                citation_output_mode=citation_output_mode,
             )
 
         # -- dump-prompt path (no LLM generation) --------------------------
@@ -962,6 +964,7 @@ class RagEngine:
         source_id: Optional[str] = None,
         intent_override: Optional[str] = None,
         citations_enabled: Optional[bool] = None,
+        citation_output_mode: str = "default",
         should_stop: Optional[Callable[[], bool]] = None,
         enable_thinking: Optional[bool] = None,
     ) -> Iterable[QueryEvent]:
@@ -998,6 +1001,7 @@ class RagEngine:
                 source_id=source_id,
                 intent_override=intent_override,
                 citations_enabled=citations_enabled,
+                citation_output_mode=citation_output_mode,
                 should_stop=_stop,
                 enable_thinking=enable_thinking,
             )
@@ -1020,6 +1024,7 @@ class RagEngine:
         source_id: Optional[str],
         intent_override: Optional[str],
         citations_enabled: Optional[bool],
+        citation_output_mode: str,
         should_stop: Callable[[], bool],
         enable_thinking: Optional[bool] = None,
     ) -> Iterable[QueryEvent]:
@@ -1210,6 +1215,7 @@ class RagEngine:
             source_legend=packed.source_legend,
             mode=config.mode,
             retrieval_budget=config.retrieval_budget,
+            citation_output_mode=citation_output_mode,
         )
 
         # -- generate with streaming tokens --------------------------------
@@ -1528,10 +1534,20 @@ class RagEngine:
                 for i in pack_result_obj.packed_indices
                 if i < len(result_metadatas)
             ]
+            packed_chunk_ids = [
+                (
+                    retrieved.results[i].child_id
+                    if i < len(retrieved.results)
+                    else ""
+                )
+                for i in pack_result_obj.packed_indices
+            ]
 
             if cite and packed_metadatas:
                 context, source_mapping = format_context_with_citations(
-                    texts=pack_result_obj.packed_docs, metadatas=packed_metadatas
+                    texts=pack_result_obj.packed_docs,
+                    metadatas=packed_metadatas,
+                    chunk_ids=packed_chunk_ids,
                 )
                 source_legend = build_source_legend(source_mapping)
 
@@ -1547,6 +1563,8 @@ class RagEngine:
                             "chunk_id": r.child_id,
                             "page_number": r.metadata.get("page_number"),
                             "display_page": r.metadata.get("display_page"),
+                            "start_page": r.metadata.get("start_page"),
+                            "end_page": r.metadata.get("end_page"),
                             "header_path": r.metadata.get("header_path", ""),
                             "chunk_text": r.text if r.text else "",
                         }
@@ -1580,8 +1598,11 @@ class RagEngine:
         elif retrieved.context_docs:
             # no_generate=True path: format context without token budgeting.
             if cite and result_metadatas:
+                context_chunk_ids = [r.child_id for r in retrieved.results]
                 context, source_mapping = format_context_with_citations(
-                    texts=retrieved.context_docs, metadatas=result_metadatas
+                    texts=retrieved.context_docs,
+                    metadatas=result_metadatas,
+                    chunk_ids=context_chunk_ids,
                 )
                 source_legend = build_source_legend(source_mapping)
             elif cite:

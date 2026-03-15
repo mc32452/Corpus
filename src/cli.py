@@ -11,6 +11,7 @@ import logging
 import os
 from typing import Optional
 
+from .benchmark import BenchmarkRunner, BenchmarkRunnerConfig
 from .metrics import format_metrics_summary, log_metrics
 from .rag_engine import RagEngine, RagEngineConfig
 
@@ -233,6 +234,93 @@ def run() -> None:
         ),
     )
 
+    # ---- benchmark subcommand -------------------------------------------
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run offline benchmark suite",
+    )
+    benchmark_parser.add_argument(
+        "ground_truth",
+        help="Ground-truth JSON (or YAML with PyYAML installed)",
+    )
+    benchmark_parser.add_argument(
+        "--output-root",
+        default="benchmarks",
+        help="Benchmark output root directory (default: benchmarks)",
+    )
+    benchmark_parser.add_argument(
+        "--warmup-query",
+        default=None,
+        help="Optional warmup query override (unmeasured)",
+    )
+    benchmark_parser.add_argument(
+        "--source-id",
+        default=None,
+        help="Optional source filter for all benchmark queries",
+    )
+    benchmark_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional max number of benchmark queries to run",
+    )
+    benchmark_parser.add_argument(
+        "--lance",
+        default="data/lance",
+        help="LanceDB directory",
+    )
+    benchmark_parser.add_argument(
+        "--collection",
+        default="child_chunks",
+        help="LanceDB table name",
+    )
+    benchmark_parser.add_argument(
+        "--fts-rebuild-policy",
+        choices=list(_VALID_FTS_POLICIES),
+        default=fts_policy_default,
+        help="FTS index rebuild policy (default: %(default)s)",
+    )
+    benchmark_parser.add_argument(
+        "--fts-rebuild-batch-size",
+        type=int,
+        default=fts_batch_size_default,
+        help="Row threshold for batch FTS rebuild (default: %(default)s)",
+    )
+    benchmark_parser.add_argument(
+        "--mode",
+        choices=["regular", "deep-research"],
+        default=None,
+        help="Operating mode",
+    )
+    benchmark_parser.add_argument(
+        "--model",
+        default=None,
+        help="LLM model path/ID override",
+    )
+    benchmark_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Verbose logging",
+    )
+    benchmark_parser.add_argument(
+        "--intent-routing",
+        choices=["annotated", "auto"],
+        default="annotated",
+        help=(
+            "Benchmark intent routing policy: 'annotated' uses the ground-truth intent "
+            "for each query, 'auto' uses runtime intent classification (default: annotated)"
+        ),
+    )
+    benchmark_parser.add_argument(
+        "--citation-verification",
+        action="store_true",
+        help=(
+            "Enable post-generation citation page verification. "
+            "Rewrites [N, p.XX] pages when claim-to-chunk matching indicates a stronger page."
+        ),
+    )
+
     args = parser.parse_args()
 
     if getattr(args, "cite", None) and getattr(args, "no_cite", None):
@@ -241,6 +329,29 @@ def run() -> None:
         parser.error("--fts-rebuild-batch-size must be >= 0.")
     if getattr(args, "dump_prompt", False) and getattr(args, "no_generate", False):
         parser.error("Conflicting flags: --dump-prompt and --no-generate are mutually exclusive.")
+    if args.command == "benchmark" and getattr(args, "limit", None) is not None and args.limit < 0:
+        parser.error("--limit must be >= 0.")
+
+    if args.command == "benchmark":
+        runner_cfg = BenchmarkRunnerConfig(
+            ground_truth_file=args.ground_truth,
+            output_root=args.output_root,
+            warmup_query=args.warmup_query,
+            source_id=args.source_id,
+            lance_dir=args.lance,
+            collection=args.collection,
+            mode=args.mode,
+            model=args.model,
+            fts_rebuild_policy=args.fts_rebuild_policy,
+            fts_rebuild_batch_size=args.fts_rebuild_batch_size,
+            verbose=args.verbose,
+            limit=args.limit,
+            lock_intent_to_annotation=(args.intent_routing == "annotated"),
+            citation_verification=bool(args.citation_verification),
+        )
+        run_dir = BenchmarkRunner(runner_cfg).run()
+        print(f"Benchmark completed: {run_dir}")
+        return
 
     verbose = getattr(args, "verbose", False)
 

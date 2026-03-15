@@ -38,9 +38,10 @@ class MockEngineWithStorage:
     def storage(self) -> StorageEngine:
         return self._storage
 
-    def ingest(self, file_path, *, source_id, summarize=True, page_number=None):
+    def ingest(self, file_path, *, source_id, summarize=True, page_number=None, page_offset=1):
         """Simulate ingest by storing parent chunks and a summary."""
         from src.models import Metadata, ParentChunk
+        _ = page_offset
 
         # Read the file content
         text = Path(file_path).read_text(encoding="utf-8")
@@ -419,10 +420,10 @@ class TestNegativePath:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
             ) as client:
-                # Step 2: Verify original file serves content
+                # Step 2: Snapshot is preferred when available
                 resp = await client.get("/api/sources/neg_test/content")
                 assert resp.status_code == 200
-                assert resp.json()["content_source"] == "original"
+                assert resp.json()["content_source"] == "snapshot"
 
                 # Step 3: Move (delete) original file
                 original.unlink()
@@ -443,3 +444,106 @@ class TestNegativePath:
                 resp = await client.get("/api/sources/neg_test/content")
                 assert resp.status_code == 404
                 assert resp.json()["error"]["code"] == "SOURCE_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# Chunk endpoints include page range fields
+# ---------------------------------------------------------------------------
+
+
+class TestChunkRangeEndpoints:
+    @pytest.mark.anyio
+    async def test_chunk_detail_includes_range_fields(self, mock_engine, tmp_storage, mock_embedder) -> None:
+        from src.models import ChildChunk, Metadata, ParentChunk
+
+        parent = ParentChunk(
+            id="p-api-range",
+            text="[Page 20] Parent text",
+            metadata=Metadata(
+                source_id="api-range-doc",
+                page_number=20,
+                start_page=20,
+                end_page=21,
+                page_label="20",
+                display_page="20",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        child = ChildChunk(
+            id="c-api-range",
+            text="[Page 20] Child text",
+            metadata=Metadata(
+                source_id="api-range-doc",
+                page_number=20,
+                start_page=20,
+                end_page=20,
+                page_label="20",
+                display_page="20",
+                header_path="Document",
+                parent_id=parent.id,
+            ),
+        )
+
+        tmp_storage.add_parents([parent])
+        emb = mock_embedder.encode([child.text], normalize_embeddings=True)
+        tmp_storage.add_children([child], embeddings=emb)
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/api-range-doc/chunk/c-api-range")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["page_number"] == 20
+        assert data["start_page"] == 20
+        assert data["end_page"] == 20
+
+    @pytest.mark.anyio
+    async def test_chunk_batch_includes_range_fields(self, mock_engine, tmp_storage, mock_embedder) -> None:
+        from src.models import ChildChunk, Metadata, ParentChunk
+
+        parent = ParentChunk(
+            id="p-api-batch",
+            text="Parent batch text",
+            metadata=Metadata(
+                source_id="api-batch-doc",
+                page_number=30,
+                start_page=30,
+                end_page=31,
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        child = ChildChunk(
+            id="c-api-batch",
+            text="Batch child text",
+            metadata=Metadata(
+                source_id="api-batch-doc",
+                page_number=31,
+                start_page=31,
+                end_page=31,
+                header_path="Document",
+                parent_id=parent.id,
+            ),
+        )
+
+        tmp_storage.add_parents([parent])
+        emb = mock_embedder.encode([child.text], normalize_embeddings=True)
+        tmp_storage.add_children([child], embeddings=emb)
+
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/api/sources/api-batch-doc/chunks?ids=c-api-batch")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["chunks"]) == 1
+        row = data["chunks"][0]
+        assert row["page_number"] == 31
+        assert row["start_page"] == 31
+        assert row["end_page"] == 31

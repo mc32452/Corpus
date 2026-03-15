@@ -80,8 +80,13 @@ function CitationPanelReaderInner() {
   const format: "pdf" | "markdown" | "text" =
     chunkDetail?.format ?? content?.format ?? "text";
 
+  const resolvedPageNumber = citation.page ?? chunkDetail?.page_number ?? undefined;
+  const resolvedDisplayPage = citation.page != null
+    ? String(citation.page)
+    : (chunkDetail?.display_page ?? chunkDetail?.page_number ?? undefined);
+
   const highlightPayload: HighlightPayload = {
-    page_number: chunkDetail?.page_number ?? citation.page ?? undefined,
+    page_number: resolvedPageNumber,
     header_path: chunkDetail?.header_path ?? citation.header_path ?? undefined,
     // Highlight the full parent chunk (expanded context); scroll to the child
     // chunk position within it so the view lands on the cited content.
@@ -122,9 +127,9 @@ function CitationPanelReaderInner() {
           <span className={`shrink-0 px-1.5 py-0.5 text-[10px] rounded border ${formatBadgeColors[format] ?? formatBadgeColors.text}`}>
             {format.toUpperCase()}
           </span>
-          {(chunkDetail?.page_number ?? citation.page) != null && (
+          {resolvedPageNumber != null && (
             <span className="shrink-0 px-1.5 py-0.5 text-[10px] rounded border bg-gray-800 text-gray-400 border-gray-700">
-              p.{chunkDetail?.display_page ?? chunkDetail?.page_number ?? citation.page}
+              p.{resolvedDisplayPage}
             </span>
           )}
         </div>

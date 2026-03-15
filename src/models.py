@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Metadata(BaseModel):
@@ -29,10 +29,22 @@ class Metadata(BaseModel):
 
     source_id: str = Field(..., min_length=1)
     page_number: Optional[int] = Field(default=None, ge=1)
+    start_page: Optional[int] = Field(default=None, ge=1)
+    end_page: Optional[int] = Field(default=None, ge=1)
     page_label: Optional[str] = Field(default=None, description="Logical page label from PDF")
     display_page: Optional[str] = Field(default=None, description="Human-readable page for citations")
     header_path: str = Field(..., min_length=1)
     parent_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_page_range(self) -> "Metadata":
+        if (
+            self.start_page is not None
+            and self.end_page is not None
+            and self.start_page > self.end_page
+        ):
+            raise ValueError("start_page must be <= end_page")
+        return self
 
 
 class ParentChunk(BaseModel):

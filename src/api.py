@@ -1130,6 +1130,16 @@ def _safe_file_size(path: Optional[str]) -> Optional[int]:
         return None
 
 
+def _coerce_positive_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
 @app.get("/api/sources/{source_id}/content", response_model=SourceContentResponse)
 async def get_source_content(source_id: str):
     """Get the full text content of a source document.
@@ -1225,7 +1235,9 @@ async def get_chunk_batch(source_id: str, ids: str):
                 continue
 
             page_num_raw = meta.get("page_number") if isinstance(meta, dict) else None
-            page_number = int(page_num_raw) if page_num_raw is not None else None
+            page_number = _coerce_positive_int(page_num_raw)
+            start_page = _coerce_positive_int(meta.get("start_page")) if isinstance(meta, dict) else None
+            end_page = _coerce_positive_int(meta.get("end_page")) if isinstance(meta, dict) else None
             display_page = str(meta.get("display_page", "")) if isinstance(meta, dict) and meta.get("display_page") else None
             header_path = str(meta.get("header_path", "")) if isinstance(meta, dict) else ""
 
@@ -1234,6 +1246,8 @@ async def get_chunk_batch(source_id: str, ids: str):
                 chunk_id=cid,
                 chunk_text=str(child.get("text", "")),
                 page_number=page_number,
+                start_page=start_page,
+                end_page=end_page,
                 display_page=display_page,
                 header_path=header_path,
                 format=fmt,
@@ -1295,7 +1309,9 @@ async def get_chunk_detail(source_id: str, chunk_id: str):
         fmt = _detect_format(sp or None)
 
         page_num_raw = meta.get("page_number") if isinstance(meta, dict) else None
-        page_number = int(page_num_raw) if page_num_raw is not None else None
+        page_number = _coerce_positive_int(page_num_raw)
+        start_page = _coerce_positive_int(meta.get("start_page")) if isinstance(meta, dict) else None
+        end_page = _coerce_positive_int(meta.get("end_page")) if isinstance(meta, dict) else None
 
         return ChunkDetailResponse(
             source_id=source_id,
@@ -1303,6 +1319,8 @@ async def get_chunk_detail(source_id: str, chunk_id: str):
             chunk_text=str(child.get("text", "")),
             parent_text=parent_text,
             page_number=page_number,
+            start_page=start_page,
+            end_page=end_page,
             display_page=str(meta.get("display_page", "")) if isinstance(meta, dict) and meta.get("display_page") else None,
             header_path=str(meta.get("header_path", "")) if isinstance(meta, dict) else "",
             format=fmt,
