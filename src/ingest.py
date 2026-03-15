@@ -22,11 +22,19 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from .models import ChildChunk, Metadata, ParentChunk
 from .generation import build_ingest_summary_messages
 from .generator import MlxGenerator
+from .phoenix_tracing import (
+    SPAN_KIND_CHAIN,
+    SPAN_KIND_EMBEDDING,
+    SPAN_KIND_LLM,
+    mark_span_error,
+    set_span_attributes,
+    start_span,
+)
 from .storage import StorageEngine
 
 logger = logging.getLogger(__name__)
@@ -571,47 +579,142 @@ def ingest_file_to_storage(
     summarize: bool = False,
     summary_generator: Optional[MlxGenerator] = None,
     page_offset: int = 1,
+    tracer: Optional[Any] = None,
 ) -> tuple[int, int]:
     path = Path(file_path)
     suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        parents, children = ingest_pdf(path, source_id=source_id, page_offset=page_offset)
-    elif suffix in {".md", ".markdown"}:
-        parents, children = ingest_markdown(
-            path,
-            source_id=source_id,
-            page_number=page_number,
-        )
-    else:
-        raise ValueError(f"Unsupported file type: {path.suffix}")
-
-    texts = [child.text for child in children]
-    try:
-        embeddings = embedding_model.encode(texts, normalize_embeddings=True)
-    except Exception as exc:  # pragma: no cover - dependency runtime
-        raise RuntimeError("Embedding model encode failed.") from exc
-
-    storage.add_parents(parents)
-    try:
-        storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
-    except Exception:
-        # Roll back the parents we just wrote so storage stays consistent.
-        logger.error("Child chunk write failed for source '%s'; rolling back parents", source_id)
+    with start_span(
+        tracer,
+        "rag.ingest.file",
+        span_kind=SPAN_KIND_CHAIN,
+        attributes={
+            "input.value": source_id,
+            "rag.ingest.file_path": str(path),
+            "rag.ingest.file_type": suffix,
+            "rag.ingest.page_number": page_number,
+            "rag.ingest.page_offset": page_offset,
+            "rag.ingest.summarize": summarize,
+        },
+    ) as ingest_span:
         try:
-            storage.delete_source(source_id)
-        except Exception:
-            logger.exception("Rollback delete_source('%s') also failed", source_id)
-        raise
+            with start_span(
+                tracer,
+                "rag.ingest.parse_and_chunk",
+                span_kind=SPAN_KIND_CHAIN,
+                attributes={
+                    "rag.ingest.file_type": suffix,
+                },
+            ) as parse_span:
+                if suffix == ".pdf":
+                    parents, children = ingest_pdf(path, source_id=source_id, page_offset=page_offset)
+                elif suffix in {".md", ".markdown"}:
+                    parents, children = ingest_markdown(
+                        path,
+                        source_id=source_id,
+                        page_number=page_number,
+                    )
+                else:
+                    raise ValueError(f"Unsupported file type: {path.suffix}")
+                set_span_attributes(
+                    parse_span,
+                    {
+                        "rag.ingest.parents_count": len(parents),
+                        "rag.ingest.children_count": len(children),
+                    },
+                )
 
-    if summarize:
-        generator = summary_generator
-        if generator is None:
-            raise ValueError("summary_generator is required when summarize=True")
-        context = "\n\n".join(parent.text for parent in parents)
-        context = _sample_context(context, _SUMMARY_CONTEXT_CHAR_LIMIT)
-        messages = build_ingest_summary_messages(context)
-        summary = generator.generate_chat(messages)
-        storage.upsert_source_summary(source_id=source_id, summary=summary, page_offset=page_offset)
+            texts = [child.text for child in children]
+            with start_span(
+                tracer,
+                "rag.ingest.embed_children",
+                span_kind=SPAN_KIND_EMBEDDING,
+                attributes={
+                    "rag.ingest.children_count": len(children),
+                },
+            ) as embed_span:
+                try:
+                    embeddings = embedding_model.encode(texts, normalize_embeddings=True)
+                except Exception as exc:  # pragma: no cover - dependency runtime
+                    mark_span_error(embed_span, f"{type(exc).__name__}: {exc}")
+                    raise RuntimeError("Embedding model encode failed.") from exc
+                set_span_attributes(
+                    embed_span,
+                    {
+                        "rag.ingest.embedding_batches": len(texts),
+                    },
+                )
 
-    storage.persist_source_page_offset(source_id, page_offset)
-    return len(parents), len(children)
+            with start_span(
+                tracer,
+                "rag.ingest.storage.write_parents",
+                span_kind=SPAN_KIND_CHAIN,
+                attributes={"rag.ingest.parents_count": len(parents)},
+            ):
+                storage.add_parents(parents)
+
+            with start_span(
+                tracer,
+                "rag.ingest.storage.write_children",
+                span_kind=SPAN_KIND_CHAIN,
+                attributes={"rag.ingest.children_count": len(children)},
+            ) as children_span:
+                try:
+                    storage.add_children(children, embeddings=_coerce_embeddings(embeddings))
+                except Exception as exc:
+                    mark_span_error(children_span, f"{type(exc).__name__}: {exc}")
+                    # Roll back the parents we just wrote so storage stays consistent.
+                    logger.error("Child chunk write failed for source '%s'; rolling back parents", source_id)
+                    try:
+                        storage.delete_source(source_id)
+                    except Exception:
+                        logger.exception("Rollback delete_source('%s') also failed", source_id)
+                    raise
+
+            if summarize:
+                generator = summary_generator
+                if generator is None:
+                    raise ValueError("summary_generator is required when summarize=True")
+                with start_span(
+                    tracer,
+                    "rag.ingest.summary.generate",
+                    span_kind=SPAN_KIND_LLM,
+                    attributes={
+                        "rag.ingest.parents_count": len(parents),
+                        "rag.ingest.summary_context_limit": _SUMMARY_CONTEXT_CHAR_LIMIT,
+                    },
+                ) as summary_span:
+                    context = "\n\n".join(parent.text for parent in parents)
+                    context = _sample_context(context, _SUMMARY_CONTEXT_CHAR_LIMIT)
+                    messages = build_ingest_summary_messages(context)
+                    summary = generator.generate_chat(messages)
+                    storage.upsert_source_summary(source_id=source_id, summary=summary, page_offset=page_offset)
+                    set_span_attributes(
+                        summary_span,
+                        {
+                            "rag.prompt.message_count": len(messages),
+                            "rag.context_chars": len(context),
+                            "rag.output_chars": len(summary),
+                            "output.value": summary,
+                        },
+                    )
+
+            with start_span(
+                tracer,
+                "rag.ingest.persist_metadata",
+                span_kind=SPAN_KIND_CHAIN,
+                attributes={"rag.ingest.page_offset": page_offset},
+            ):
+                storage.persist_source_page_offset(source_id, page_offset)
+
+            set_span_attributes(
+                ingest_span,
+                {
+                    "rag.ingest.parents_count": len(parents),
+                    "rag.ingest.children_count": len(children),
+                    "output.value": f"{source_id}: {len(parents)} parents, {len(children)} children",
+                },
+            )
+            return len(parents), len(children)
+        except Exception as exc:
+            mark_span_error(ingest_span, f"{type(exc).__name__}: {exc}")
+            raise

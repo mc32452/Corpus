@@ -699,6 +699,9 @@ class RetrievalEngine:
                 "input.value": query,
                 "rag.intent": intent,
                 "rag.source_id": source_id,
+                "rag.query_chars": len(query),
+                "rag.embedding_query_chars": len(_embedding_q),
+                "rag.bm25_query_chars": len(_bm25_q),
                 "rag.top_k_fused": k_fused,
                 "rag.top_k_rerank": k_rerank,
                 "rag.top_k_final": k_final,
@@ -743,6 +746,9 @@ class RetrievalEngine:
                     reranker_enabled,
                     timing,
                 )
+                rerank_min = min(raw_scores) if raw_scores else 0.0
+                rerank_max = max(raw_scores) if raw_scores else 0.0
+                rerank_mean = (sum(raw_scores) / len(raw_scores)) if raw_scores else 0.0
                 set_span_attributes(
                     stage_span,
                     {
@@ -750,6 +756,9 @@ class RetrievalEngine:
                         "rag.rerank_ms": timing.rerank_ms,
                         "rag.items_in": len(fused),
                         "rag.items_out": len(reranked),
+                        "rag.rerank.score_min": rerank_min,
+                        "rag.rerank.score_max": rerank_max,
+                        "rag.rerank.score_mean": rerank_mean,
                     },
                 )
             all_reranked = list(reranked)
@@ -842,6 +851,7 @@ class RetrievalEngine:
                     {
                         "rag.stage": "budget_expand",
                         "rag.retrieval_budget": budget,
+                        "rag.threshold": threshold,
                         "rag.items_before": before_expand_count,
                         "rag.items_after": len(reranked),
                         "rag.k_final_before": before_k_final,
@@ -892,11 +902,17 @@ class RetrievalEngine:
                 span_kind=SPAN_KIND_RETRIEVER,
             ) as stage_span:
                 results = self._stage_context_expand(final, context_expansion_enabled)
+                unique_sources = {
+                    result.metadata.get("source_id")
+                    for result in results
+                    if isinstance(result.metadata, dict) and result.metadata.get("source_id")
+                }
                 set_span_attributes(
                     stage_span,
                     {
                         "rag.stage": "context_expand",
                         "rag.results_count": len(results),
+                        "rag.sources_count": len(unique_sources),
                         "output.value": f"{len(results)} retrieved passages",
                     },
                 )
@@ -921,12 +937,41 @@ class RetrievalEngine:
                     metrics=metrics,
                 )
 
+            top_results_preview = []
+            top_source_ids: list[str] = []
+            for rank, result in enumerate(results[:5], start=1):
+                metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                source_value = metadata.get("source_id")
+                if isinstance(source_value, str) and source_value:
+                    top_source_ids.append(source_value)
+                top_results_preview.append(
+                    {
+                        "rank": rank,
+                        "source_id": source_value,
+                        "display_page": metadata.get("display_page"),
+                        "page_number": metadata.get("page_number"),
+                        "chunk_id": result.child_id,
+                        "score": round(float(result.score), 6),
+                    }
+                )
+
             set_span_attributes(
                 search_span,
                 {
                     "rag.total_ms": timing.total_ms,
+                    "rag.query_embedding_ms": timing.query_embedding_ms,
+                    "rag.hybrid_search_ms": timing.hybrid_search_ms,
+                    "rag.rerank_ms": timing.rerank_ms,
+                    "rag.dedup_ms": timing.dedup_ms,
                     "rag.results_count": len(results),
                     "rag.threshold": threshold,
+                    "rag.reranker.items_reranked": reranker_metrics.items_reranked,
+                    "rag.reranker.score_min": reranker_metrics.score_min,
+                    "rag.reranker.score_max": reranker_metrics.score_max,
+                    "rag.threshold.items_after": threshold_metrics.items_after_threshold,
+                    "rag.threshold.safety_net": threshold_metrics.safety_net_triggered,
+                    "rag.top_source_ids": sorted(set(top_source_ids))[:10],
+                    "rag.top_results": top_results_preview,
                     "output.value": f"{len(results)} retrieval results",
                 },
             )

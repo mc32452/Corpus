@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
@@ -763,32 +764,59 @@ class RagEngine:
     ) -> IngestResult:
         """Ingest a document (PDF or Markdown) into the RAG store."""
         self._on_status(f"Ingesting {Path(file_path).name}...")
-        embedding_model = self._ensure_embedding_model()
+        ingest_request_id = f"ing-{uuid.uuid4().hex[:12]}"
+        with start_span(
+            self._tracer,
+            "rag.ingest",
+            span_kind=SPAN_KIND_CHAIN,
+            attributes={
+                "rag.request_id": ingest_request_id,
+                "input.value": source_id,
+                "rag.ingest.file_path": str(file_path),
+                "rag.ingest.page_number": page_number,
+                "rag.ingest.page_offset": page_offset,
+                "rag.ingest.summarize": summarize,
+            },
+        ) as ingest_span:
+            try:
+                embedding_model = self._ensure_embedding_model()
 
-        generator: Optional[MlxGenerator] = None
-        if summarize:
-            generator = self.ensure_generator()
+                generator: Optional[MlxGenerator] = None
+                if summarize:
+                    generator = self.ensure_generator()
 
-        parents_count, children_count = ingest_file_to_storage(
-            file_path,
-            source_id=source_id,
-            page_number=page_number,
-            storage=self._storage,
-            embedding_model=embedding_model,
-            summarize=summarize,
-            summary_generator=generator,
-            page_offset=page_offset,
-        )
+                parents_count, children_count = ingest_file_to_storage(
+                    file_path,
+                    source_id=source_id,
+                    page_number=page_number,
+                    storage=self._storage,
+                    embedding_model=embedding_model,
+                    summarize=summarize,
+                    summary_generator=generator,
+                    page_offset=page_offset,
+                    tracer=self._tracer,
+                )
 
-        self._on_status(
-            f"Ingested {parents_count} parents, {children_count} children."
-        )
-        return IngestResult(
-            parents_count=parents_count,
-            children_count=children_count,
-            source_id=source_id,
-            summarized=summarize,
-        )
+                self._on_status(
+                    f"Ingested {parents_count} parents, {children_count} children."
+                )
+                set_span_attributes(
+                    ingest_span,
+                    {
+                        "output.value": f"{source_id}: {parents_count} parents, {children_count} children",
+                        "rag.ingest.parents_count": parents_count,
+                        "rag.ingest.children_count": children_count,
+                    },
+                )
+                return IngestResult(
+                    parents_count=parents_count,
+                    children_count=children_count,
+                    source_id=source_id,
+                    summarized=summarize,
+                )
+            except Exception as exc:
+                mark_span_error(ingest_span, f"{type(exc).__name__}: {exc}")
+                raise
 
     def query(
         self,
@@ -828,212 +856,304 @@ class RagEngine:
         config = self._model_config
         profiler = LatencyProfiler(enabled=self._cfg.latency)
         profiler.start_wall()
-
-        # -- resolve citation mode -----------------------------------------
-        if citations_enabled is not None:
-            cite = citations_enabled
-        elif self._cfg.citations_enabled is not None:
-            cite = self._cfg.citations_enabled
-        else:
-            cite = CITATIONS_ENABLED_DEFAULT
-        logger.info(
-            "Citations mode: %s",
-            "ENABLED (Academic Mode)" if cite else "DISABLED (Casual Mode)",
-        )
-
-        if self._memory_constrained and self._generator is not None:
-            self._release_generator_model()
-
-        # -- load retrieval models -----------------------------------------
-        self._on_status("Preparing retrieval models...")
-        embedding_model = self._ensure_embedding_model()
-        reranker = self._ensure_reranker()
-
-        retrieval_engine = RetrievalEngine(
-            storage=self._storage,
-            embedding_model=embedding_model,
-            reranker=reranker,
-            config=config,
-            tracer=self._tracer,
-        )
-
-        # -- intent classification + parameter resolution ------------------
-        self._on_status("Classifying intent...")
-        # For dump_prompt we want full intent classification (inc. LLM fallback),
-        # so suppress no_generate so it doesn't disable the intent LLM fallback.
-        classify_no_generate = no_generate and not dump_prompt
-        classified = self._step_classify(
-            query_text, source_id, intent_override, classify_no_generate, profiler=profiler
-        )
-        intent_result = classified.intent_result
-
-        # -- retrieval (bypass / collection / hybrid) ----------------------
-        if classified.bypass_retrieval:
-            self._on_status("Query is unclear — skipping retrieval...")
-        elif classified.intent_result.intent == Intent.COLLECTION:
-            self._on_status("Fetching collection summaries...")
-        else:
-            self._on_status("Searching knowledge base...")
-
-        retrieved = self._step_retrieve(
-            query_text, source_id, classified, retrieval_engine, cite,
-            no_generate=(no_generate or dump_prompt), profiler=profiler,
-        )
-        cite = retrieved.cite
-
-        if retrieved.context is None:
-            # COLLECTION with no documents → early exit
-            return QueryResult(
-                answer="No documents found in the database.",
-                intent=intent_result,
-                citations_enabled=False,
-                config=config,
-            )
-
-        # -- release retrieval models for LLM headroom ---------------------
-        with profiler.span("Memory cleanup (gc)"):
-            retrieval_engine = None
-            self._release_retrieval_models()
-
-        # -- no-generate path (context only, no token budgeting) -----------
-        if no_generate:
-            packed = self._step_pack_budget(retrieved, config, generator=None)
-            profiler.end_wall()
-            return QueryResult(
-                answer="",
-                intent=intent_result,
-                citations_enabled=packed.cite,
-                source_ids=retrieved.source_ids,
-                retrieval_metrics=retrieved.retrieval_metrics,
-                budget_metrics=None,
-                latency_report=profiler.format_report(),
-                context=packed.context,
-                config=config,
-            )
-
-        # -- token budget packing ------------------------------------------
-        generator = (
-            None if dump_prompt
-            else self._consume_preloaded_generator(retrieved.generator_preload_future)
-        )
-        self._on_status("Packing token budget...")
-        with profiler.span("Budget packing"):
-            packed = self._step_pack_budget(retrieved, config, generator)
-        cite = packed.cite
-
-        # -- build prompt ---------------------------------------------------
-        self._on_status("Building prompt...")
-        with profiler.span("Build prompt / messages"):
-            with start_span(
-                self._tracer,
-                "rag.prompt.build",
-                span_kind=SPAN_KIND_CHAIN,
-                attributes={
-                    "rag.intent": intent_result.intent.value,
-                    "rag.citations_enabled": cite,
-                    "rag.context_chars": len(packed.context),
-                },
-            ) as prompt_span:
-                messages = build_messages(
-                    packed.context,
-                    query_text,
-                    intent=intent_result.intent,
-                    extra_instructions=retrieved.extra_instructions,
-                    citations_enabled=cite,
-                    source_legend=packed.source_legend,
-                    mode=config.mode,
-                    retrieval_budget=config.retrieval_budget,
-                    citation_output_mode=citation_output_mode,
-                )
-                set_span_attribute(prompt_span, "rag.prompt.message_count", len(messages))
-
-        # -- dump-prompt path (no LLM generation) --------------------------
-        if dump_prompt:
-            profiler.end_wall()
-            return QueryResult(
-                answer="",
-                intent=intent_result,
-                citations_enabled=cite,
-                source_ids=retrieved.source_ids,
-                retrieval_metrics=retrieved.retrieval_metrics,
-                budget_metrics=None,
-                latency_report=profiler.format_report(),
-                context=packed.context,
-                config=config,
-                prompt_messages=messages,
-            )
-
-        # -- generate -------------------------------------------------------
-        gen_config = GenerationConfig(
-            max_tokens=self._generation_max_tokens,
-            context_window=config.context_window,
-            temperature=classified.generation_params.temperature,
-            top_p=classified.generation_params.top_p,
-            top_k=classified.generation_params.top_k,
-            min_p=classified.generation_params.min_p,
-            presence_penalty=classified.generation_params.presence_penalty,
-            repetition_penalty=classified.generation_params.repetition_penalty if classified.generation_params.repetition_penalty != 1.0 else None,
-        )
-
-        self._on_status("Generating answer...")
+        query_request_id = f"qry-{uuid.uuid4().hex[:12]}"
         with start_span(
             self._tracer,
-            "rag.llm.generate",
-            span_kind=SPAN_KIND_LLM,
+            "rag.query",
+            span_kind=SPAN_KIND_CHAIN,
             attributes={
-                "rag.intent": intent_result.intent.value,
-                "llm.temperature": gen_config.temperature,
-                "llm.top_p": gen_config.top_p,
-                "llm.top_k": gen_config.top_k,
-                "llm.max_tokens": gen_config.max_tokens,
+                "rag.request_id": query_request_id,
+                "input.value": query_text,
+                "rag.source_id": source_id,
+                "rag.intent_override": intent_override,
+                "rag.no_generate": no_generate,
+                "rag.dump_prompt": dump_prompt,
+                "rag.mode": config.mode,
+                "rag.collection": self._cfg.collection,
+                "rag.retrieval_budget": config.retrieval_budget,
+                "rag.context_window": config.context_window,
+                "rag.model.llm": (self._cfg.model or config.llm_model),
+                "rag.model.embedding": config.embedding_model,
+                "rag.model.reranker": config.reranker_model,
+                "rag.model.reranker_enabled": config.reranker_enabled,
+                "rag.memory_constrained": self._memory_constrained,
+                "rag.system_ram_gb": self._system_ram_gb,
             },
-        ) as generation_span:
+        ) as query_span:
             try:
-                with profiler.span("LLM generation"):
-                    raw_answer = generator.generate_chat(
-                        messages,
-                        config=gen_config,
-                    )
-                _gen_tokens = count_tokens(raw_answer, generator.tokenizer)
+                # -- resolve citation mode ---------------------------------
+                if citations_enabled is not None:
+                    cite = citations_enabled
+                elif self._cfg.citations_enabled is not None:
+                    cite = self._cfg.citations_enabled
+                else:
+                    cite = CITATIONS_ENABLED_DEFAULT
+                logger.info(
+                    "Citations mode: %s",
+                    "ENABLED (Academic Mode)" if cite else "DISABLED (Casual Mode)",
+                )
+                set_span_attribute(query_span, "rag.citations_requested", cite)
+
+                if self._memory_constrained and self._generator is not None:
+                    self._release_generator_model()
+
+                # -- load retrieval models ---------------------------------
+                self._on_status("Preparing retrieval models...")
+                embedding_model = self._ensure_embedding_model()
+                reranker = self._ensure_reranker()
+
+                retrieval_engine = RetrievalEngine(
+                    storage=self._storage,
+                    embedding_model=embedding_model,
+                    reranker=reranker,
+                    config=config,
+                    tracer=self._tracer,
+                )
+
+                # -- intent classification + parameter resolution ----------
+                self._on_status("Classifying intent...")
+                # For dump_prompt we want full intent classification (inc. LLM fallback),
+                # so suppress no_generate so it doesn't disable the intent LLM fallback.
+                classify_no_generate = no_generate and not dump_prompt
+                classified = self._step_classify(
+                    query_text, source_id, intent_override, classify_no_generate, profiler=profiler
+                )
+                intent_result = classified.intent_result
+
+                # -- retrieval (bypass / collection / hybrid) --------------
+                if classified.bypass_retrieval:
+                    self._on_status("Query is unclear — skipping retrieval...")
+                elif classified.intent_result.intent == Intent.COLLECTION:
+                    self._on_status("Fetching collection summaries...")
+                else:
+                    self._on_status("Searching knowledge base...")
+
+                retrieved = self._step_retrieve(
+                    query_text, source_id, classified, retrieval_engine, cite,
+                    no_generate=(no_generate or dump_prompt), profiler=profiler,
+                )
+                cite = retrieved.cite
                 set_span_attributes(
-                    generation_span,
+                    query_span,
                     {
-                        "output.value": raw_answer,
-                        "llm.token_count.total": _gen_tokens,
-                        "rag.output_chars": len(raw_answer),
+                        "rag.intent": intent_result.intent.value,
+                        "rag.citations_enabled": cite,
+                        "rag.retrieval_results_count": len(retrieved.results),
+                        "rag.sources_count": len(retrieved.source_ids),
                     },
                 )
+
+                if retrieved.context is None:
+                    # COLLECTION with no documents → early exit
+                    profiler.end_wall()
+                    set_span_attributes(
+                        query_span,
+                        {
+                            "rag.finish_reason": "collection_empty",
+                            "rag.latency_wall_ms": profiler.wall_ms,
+                            "output.value": "No documents found in the database.",
+                        },
+                    )
+                    return QueryResult(
+                        answer="No documents found in the database.",
+                        intent=intent_result,
+                        citations_enabled=False,
+                        config=config,
+                    )
+
+                # -- release retrieval models for LLM headroom -------------
+                with profiler.span("Memory cleanup (gc)"):
+                    retrieval_engine = None
+                    self._release_retrieval_models()
+
+                # -- no-generate path (context only, no token budgeting) ---
+                if no_generate:
+                    packed = self._step_pack_budget(retrieved, config, generator=None)
+                    profiler.end_wall()
+                    set_span_attributes(
+                        query_span,
+                        {
+                            "rag.finish_reason": "no_generate",
+                            "rag.context_chars": len(packed.context),
+                            "rag.latency_wall_ms": profiler.wall_ms,
+                            "output.value": f"Context-only response ({len(packed.context)} chars)",
+                        },
+                    )
+                    return QueryResult(
+                        answer="",
+                        intent=intent_result,
+                        citations_enabled=packed.cite,
+                        source_ids=retrieved.source_ids,
+                        retrieval_metrics=retrieved.retrieval_metrics,
+                        budget_metrics=None,
+                        latency_report=profiler.format_report(),
+                        context=packed.context,
+                        config=config,
+                    )
+
+                # -- token budget packing ----------------------------------
+                generator = (
+                    None if dump_prompt
+                    else self._consume_preloaded_generator(retrieved.generator_preload_future)
+                )
+                self._on_status("Packing token budget...")
+                with profiler.span("Budget packing"):
+                    packed = self._step_pack_budget(retrieved, config, generator)
+                cite = packed.cite
+
+                # -- build prompt -------------------------------------------
+                self._on_status("Building prompt...")
+                with profiler.span("Build prompt / messages"):
+                    with start_span(
+                        self._tracer,
+                        "rag.prompt.build",
+                        span_kind=SPAN_KIND_CHAIN,
+                        attributes={
+                            "rag.intent": intent_result.intent.value,
+                            "rag.citations_enabled": cite,
+                            "rag.context_chars": len(packed.context),
+                            "rag.prompt.query_chars": len(query_text),
+                        },
+                    ) as prompt_span:
+                        messages = build_messages(
+                            packed.context,
+                            query_text,
+                            intent=intent_result.intent,
+                            extra_instructions=retrieved.extra_instructions,
+                            citations_enabled=cite,
+                            source_legend=packed.source_legend,
+                            mode=config.mode,
+                            retrieval_budget=config.retrieval_budget,
+                            citation_output_mode=citation_output_mode,
+                        )
+                        prompt_chars = sum(
+                            len(str(msg.get("content", "")))
+                            for msg in messages
+                            if isinstance(msg, dict)
+                        )
+                        set_span_attributes(
+                            prompt_span,
+                            {
+                                "rag.prompt.message_count": len(messages),
+                                "rag.prompt.messages_chars": prompt_chars,
+                                "rag.prompt.has_source_legend": bool(packed.source_legend),
+                            },
+                        )
+
+                # -- dump-prompt path (no LLM generation) ------------------
+                if dump_prompt:
+                    profiler.end_wall()
+                    set_span_attributes(
+                        query_span,
+                        {
+                            "rag.finish_reason": "dump_prompt",
+                            "rag.context_chars": len(packed.context),
+                            "rag.prompt.message_count": len(messages),
+                            "rag.latency_wall_ms": profiler.wall_ms,
+                            "output.value": f"Prompt dump with {len(messages)} messages",
+                        },
+                    )
+                    return QueryResult(
+                        answer="",
+                        intent=intent_result,
+                        citations_enabled=cite,
+                        source_ids=retrieved.source_ids,
+                        retrieval_metrics=retrieved.retrieval_metrics,
+                        budget_metrics=None,
+                        latency_report=profiler.format_report(),
+                        context=packed.context,
+                        config=config,
+                        prompt_messages=messages,
+                    )
+
+                # -- generate -----------------------------------------------
+                gen_config = GenerationConfig(
+                    max_tokens=self._generation_max_tokens,
+                    context_window=config.context_window,
+                    temperature=classified.generation_params.temperature,
+                    top_p=classified.generation_params.top_p,
+                    top_k=classified.generation_params.top_k,
+                    min_p=classified.generation_params.min_p,
+                    presence_penalty=classified.generation_params.presence_penalty,
+                    repetition_penalty=classified.generation_params.repetition_penalty if classified.generation_params.repetition_penalty != 1.0 else None,
+                )
+
+                self._on_status("Generating answer...")
+                with start_span(
+                    self._tracer,
+                    "rag.llm.generate",
+                    span_kind=SPAN_KIND_LLM,
+                    attributes={
+                        "rag.intent": intent_result.intent.value,
+                        "llm.temperature": gen_config.temperature,
+                        "llm.top_p": gen_config.top_p,
+                        "llm.top_k": gen_config.top_k,
+                        "llm.max_tokens": gen_config.max_tokens,
+                        "llm.input_messages": len(messages),
+                        "llm.input_chars": prompt_chars,
+                    },
+                ) as generation_span:
+                    try:
+                        with profiler.span("LLM generation"):
+                            raw_answer = generator.generate_chat(
+                                messages,
+                                config=gen_config,
+                            )
+                        _gen_tokens = count_tokens(raw_answer, generator.tokenizer)
+                        set_span_attributes(
+                            generation_span,
+                            {
+                                "output.value": raw_answer,
+                                "llm.token_count.total": _gen_tokens,
+                                "rag.output_chars": len(raw_answer),
+                            },
+                        )
+                    except Exception as exc:
+                        mark_span_error(generation_span, f"{type(exc).__name__}: {exc}")
+                        raise
+
+                logger.info(
+                    "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | tokens_generated=%d",
+                    intent_result.intent.value,
+                    classified.generation_params.temperature,
+                    classified.generation_params.top_p,
+                    _gen_tokens,
+                )
+
+                with profiler.span("Output sanitisation"):
+                    answer = sanitize_output(raw_answer)
+
+                if answer and packed.context:
+                    _check_novel_proper_nouns(answer, packed.context)
+
+                profiler.end_wall()
+                set_span_attributes(
+                    query_span,
+                    {
+                        "rag.finish_reason": "stop",
+                        "rag.context_chars": len(packed.context),
+                        "rag.answer_chars": len(answer),
+                        "rag.output_chars": len(raw_answer),
+                        "llm.token_count.total": _gen_tokens,
+                        "rag.latency_wall_ms": profiler.wall_ms,
+                        "output.value": answer,
+                    },
+                )
+                return QueryResult(
+                    answer=answer,
+                    intent=intent_result,
+                    citations_enabled=cite,
+                    source_ids=retrieved.source_ids,
+                    retrieval_metrics=retrieved.retrieval_metrics,
+                    budget_metrics=packed.budget_metrics,
+                    latency_report=profiler.format_report(),
+                    context=packed.context,
+                    config=config,
+                    raw_answer=raw_answer,
+                )
             except Exception as exc:
-                mark_span_error(generation_span, f"{type(exc).__name__}: {exc}")
+                mark_span_error(query_span, f"{type(exc).__name__}: {exc}")
                 raise
-
-        logger.info(
-            "INTENT_AWARE | intent=%s | temperature=%.2f | top_p=%.2f | tokens_generated=%d",
-            intent_result.intent.value,
-            classified.generation_params.temperature,
-            classified.generation_params.top_p,
-            _gen_tokens,
-        )
-
-        with profiler.span("Output sanitisation"):
-            answer = sanitize_output(raw_answer)
-
-        if answer and packed.context:
-            _check_novel_proper_nouns(answer, packed.context)
-
-        profiler.end_wall()
-        return QueryResult(
-            answer=answer,
-            intent=intent_result,
-            citations_enabled=cite,
-            source_ids=retrieved.source_ids,
-            retrieval_metrics=retrieved.retrieval_metrics,
-            budget_metrics=packed.budget_metrics,
-            latency_report=profiler.format_report(),
-            context=packed.context,
-            config=config,
-            raw_answer=raw_answer,
-        )
 
     # -- streaming query (event generator) ----------------------------------
 
@@ -1074,28 +1194,64 @@ class RagEngine:
             ``False`` = user forced off, ``None`` = auto/intent-driven.
         """
         _stop = should_stop or (lambda: False)
+        stream_request_id = f"str-{uuid.uuid4().hex[:12]}"
+        finish_reason = "error"
+        completion_tokens = 0
 
-        try:
-            yield from self._query_events_impl(
-                query_text,
-                source_id=source_id,
-                intent_override=intent_override,
-                citations_enabled=citations_enabled,
-                citation_output_mode=citation_output_mode,
-                should_stop=_stop,
-                enable_thinking=enable_thinking,
-            )
-        except Exception as exc:
-            logger.exception("query_events error: %s", exc)
-            yield ErrorEvent(
-                code="INTERNAL",
-                message=str(exc),
-                metadata={
-                    "exception_type": type(exc).__name__,
-                    "query": query_text[:100],
-                },
-            )
-            yield FinishEvent(finish_reason="error")
+        with start_span(
+            self._tracer,
+            "rag.query.stream",
+            span_kind=SPAN_KIND_CHAIN,
+            attributes={
+                "rag.request_id": stream_request_id,
+                "input.value": query_text,
+                "rag.source_id": source_id,
+                "rag.intent_override": intent_override,
+                "rag.citations_requested": citations_enabled,
+                "rag.enable_thinking": enable_thinking,
+            },
+        ) as stream_span:
+            try:
+                for event in self._query_events_impl(
+                    query_text,
+                    source_id=source_id,
+                    intent_override=intent_override,
+                    citations_enabled=citations_enabled,
+                    citation_output_mode=citation_output_mode,
+                    should_stop=_stop,
+                    enable_thinking=enable_thinking,
+                ):
+                    if isinstance(event, FinishEvent):
+                        finish_reason = event.finish_reason
+                        completion_tokens = event.completion_tokens
+                    yield event
+
+                set_span_attributes(
+                    stream_span,
+                    {
+                        "rag.finish_reason": finish_reason,
+                        "llm.token_count.completion": completion_tokens,
+                    },
+                )
+            except Exception as exc:
+                mark_span_error(stream_span, f"{type(exc).__name__}: {exc}")
+                logger.exception("query_events error: %s", exc)
+                yield ErrorEvent(
+                    code="INTERNAL",
+                    message=str(exc),
+                    metadata={
+                        "exception_type": type(exc).__name__,
+                        "query": query_text[:100],
+                    },
+                )
+                yield FinishEvent(finish_reason="error")
+                set_span_attributes(
+                    stream_span,
+                    {
+                        "rag.finish_reason": "error",
+                        "llm.token_count.completion": completion_tokens,
+                    },
+                )
 
     def _query_events_impl(
         self,
@@ -1295,6 +1451,7 @@ class RagEngine:
                 "rag.intent": intent_result.intent.value,
                 "rag.citations_enabled": cite,
                 "rag.context_chars": len(packed.context),
+                "rag.prompt.query_chars": len(query_text),
             },
         ) as prompt_span:
             messages = build_messages(
@@ -1308,7 +1465,19 @@ class RagEngine:
                 retrieval_budget=config.retrieval_budget,
                 citation_output_mode=citation_output_mode,
             )
-            set_span_attribute(prompt_span, "rag.prompt.message_count", len(messages))
+            stream_prompt_chars = sum(
+                len(str(msg.get("content", "")))
+                for msg in messages
+                if isinstance(msg, dict)
+            )
+            set_span_attributes(
+                prompt_span,
+                {
+                    "rag.prompt.message_count": len(messages),
+                    "rag.prompt.messages_chars": stream_prompt_chars,
+                    "rag.prompt.has_source_legend": bool(packed.source_legend),
+                },
+            )
 
         # -- generate with streaming tokens --------------------------------
         gen_params = classified.generation_params
@@ -1369,6 +1538,8 @@ class RagEngine:
                 "llm.top_k": gen_config.top_k,
                 "llm.max_tokens": gen_config.max_tokens,
                 "llm.max_internal_tokens": gen_config.max_internal_tokens,
+                "llm.input_messages": len(messages),
+                "llm.input_chars": stream_prompt_chars,
             },
         ) as generation_span:
             if gen_params.enable_thinking:
@@ -1631,13 +1802,29 @@ class RagEngine:
             retrieval_metrics = results[0].metrics if results and results[0].metrics else None
 
             _scores = [r.score for r in results] if results else []
+            top_score = max(_scores) if _scores else 0.0
+            low_score = min(_scores) if _scores else 0.0
+            mean_score = (sum(_scores) / len(_scores)) if _scores else 0.0
+            top_results_preview = []
+            for rank, result in enumerate(results[:5], start=1):
+                metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                top_results_preview.append(
+                    {
+                        "rank": rank,
+                        "source_id": metadata.get("source_id"),
+                        "display_page": metadata.get("display_page"),
+                        "page_number": metadata.get("page_number"),
+                        "chunk_id": result.child_id,
+                        "score": round(float(result.score), 6),
+                    }
+                )
             logger.info(
                 "INTENT_AWARE | intent=%s | retrieval_results=%d | top_score=%.4f | low_score=%.4f | "
                 "params: top_k_dense=%d top_k_fused=%d top_k_rerank=%d top_k_final=%d threshold=%.4f",
                 classified.intent_result.intent.value,
                 len(results),
-                max(_scores) if _scores else 0.0,
-                min(_scores) if _scores else 0.0,
+                top_score,
+                low_score,
                 classified.retrieval_params.top_k_dense,
                 classified.retrieval_params.top_k_fused,
                 classified.retrieval_params.top_k_rerank,
@@ -1658,9 +1845,33 @@ class RagEngine:
                     "rag.retrieve.results_count": len(results),
                     "rag.retrieve.sources_count": len(source_ids),
                     "rag.retrieve.context_docs_count": len(context_docs),
+                    "rag.retrieve.top_score": top_score,
+                    "rag.retrieve.low_score": low_score,
+                    "rag.retrieve.mean_score": mean_score,
+                    "rag.retrieval.top_k_dense": classified.retrieval_params.top_k_dense,
+                    "rag.retrieval.top_k_fused": classified.retrieval_params.top_k_fused,
+                    "rag.retrieval.top_k_rerank": classified.retrieval_params.top_k_rerank,
+                    "rag.retrieval.top_k_final": classified.retrieval_params.top_k_final,
+                    "rag.retrieval.threshold": classified.retrieval_params.reranker_threshold,
+                    "rag.retrieve.preload_started": generator_preload_future is not None,
+                    "rag.retrieve.extra_instructions": bool(extra_instructions),
+                    "rag.retrieve.top_results": top_results_preview,
                     "rag.citations_enabled": cite,
                 },
             )
+            if retrieval_metrics is not None:
+                set_span_attributes(
+                    retrieve_span,
+                    {
+                        "rag.retrieve.timing_total_ms": retrieval_metrics.timing.total_ms,
+                        "rag.retrieve.timing_hybrid_ms": retrieval_metrics.timing.hybrid_search_ms,
+                        "rag.retrieve.timing_rerank_ms": retrieval_metrics.timing.rerank_ms,
+                        "rag.retrieve.threshold_value": retrieval_metrics.threshold.threshold_value,
+                        "rag.retrieve.threshold_items_after": retrieval_metrics.threshold.items_after_threshold,
+                        "rag.retrieve.threshold_safety_net": retrieval_metrics.threshold.safety_net_triggered,
+                        "rag.retrieve.parents_deduplicated": retrieval_metrics.deduplication.parents_deduplicated,
+                    },
+                )
 
             return _RetrieveResult(
                 context=context,
@@ -1803,6 +2014,30 @@ class RagEngine:
                 else:
                     context = _dedupe_context(retrieved.context_docs)
 
+            if packed_retrieval_results:
+                packed_results_for_preview = packed_retrieval_results
+            elif pack_result_obj is not None and retrieved.results:
+                packed_results_for_preview = [
+                    retrieved.results[idx]
+                    for idx in pack_result_obj.packed_indices
+                    if idx < len(retrieved.results)
+                ]
+            else:
+                packed_results_for_preview = list(retrieved.results)
+
+            packed_source_ids = []
+            packed_chunk_ids = []
+            for result in packed_results_for_preview:
+                if isinstance(result.child_id, str) and result.child_id:
+                    packed_chunk_ids.append(result.child_id)
+                metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                source_value = metadata.get("source_id")
+                if isinstance(source_value, str) and source_value:
+                    packed_source_ids.append(source_value)
+
+            unique_packed_source_ids = sorted(set(packed_source_ids))
+            unique_packed_chunk_ids = list(dict.fromkeys(packed_chunk_ids))
+
             set_span_attributes(
                 budget_span,
                 {
@@ -1821,6 +2056,16 @@ class RagEngine:
                     "rag.budget.used_tokens": (
                         pack_result_obj.used_tokens if pack_result_obj is not None else 0
                     ),
+                    "rag.budget.utilization_pct": (
+                        budget_metrics.utilization_pct if budget_metrics is not None else 0.0
+                    ),
+                    "rag.budget.citation_count": len(citation_list),
+                    "rag.budget.has_source_legend": bool(source_legend),
+                    "rag.budget.source_ids_count": len(retrieved.source_ids),
+                    "rag.budget.packed_results_count": len(packed_results_for_preview),
+                    "rag.budget.packed_source_ids": unique_packed_source_ids[:10],
+                    "rag.budget.packed_chunk_ids": unique_packed_chunk_ids[:10],
+                    "rag.context_chars": len(context or ""),
                 },
             )
 
