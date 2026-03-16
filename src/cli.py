@@ -418,11 +418,24 @@ def run() -> None:
         citations = False
 
     # -- build engine config -----------------------------------------------
+    command = getattr(args, "command", None)
+    query_model_override = (
+        getattr(args, "model", None)
+        if command in {"query", "benchmark"}
+        else None
+    )
+    summary_model_override = (
+        getattr(args, "model", None)
+        if command == "ingest"
+        else "mlx-community/LFM2-8B-A1B-4bit"
+    )
+
     engine_cfg = RagEngineConfig(
         lance_dir=args.lance,
         collection=args.collection,
         mode=getattr(args, "mode", None),
-        model=getattr(args, "model", None),
+        model=query_model_override,
+        summary_model=summary_model_override,
         fts_rebuild_policy=args.fts_rebuild_policy,
         fts_rebuild_batch_size=args.fts_rebuild_batch_size,
         citations_enabled=citations,
@@ -454,7 +467,7 @@ def run() -> None:
         else "auto"
     )
     print(f"\n[Hardware: {config.system_ram_gb:.0f}GB | Mode: {config.mode} ({mode_source})]")
-    print(f"[LLM: {config.llm_model} | Quant: {config.quantization}]")
+    print(f"[LLM: {config.llm_model} | Summary LLM: {engine_cfg.summary_model} | Quant: {config.quantization}]")
     print(f"[Context: {config.context_window:,} | Budget: {config.retrieval_budget:,}]\n")
 
     # ---- ingest ----------------------------------------------------------
