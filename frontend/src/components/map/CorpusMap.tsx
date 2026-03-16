@@ -171,6 +171,10 @@ export function CorpusMap({
   }, [data.mentions, selectedGroup]);
 
   useEffect(() => {
+    hasFitBounds.current = false;
+  }, [geojson.features]);
+
+  useEffect(() => {
     if (hasFitBounds.current) {
       return;
     }
@@ -284,7 +288,7 @@ export function CorpusMap({
     });
   }, []);
 
-  const handleViewChunk = useCallback(async (sourceId: string, chunkId: string) => {
+  const handleViewChunk = useCallback(async (sourceId: string, chunkId: string, matchedInput: string) => {
     const chunk = await sourceApi.getChunk(sourceId, chunkId);
     dispatch({
       type: "SET_ACTIVE_CITATION",
@@ -295,6 +299,8 @@ export function CorpusMap({
         page: chunk.page_number ?? null,
         header_path: chunk.header_path,
         chunk_text: chunk.chunk_text,
+        highlight_text: matchedInput,
+        highlight_scope_text: chunk.chunk_text,
       },
     });
   }, [dispatch]);
@@ -373,7 +379,7 @@ export function CorpusMap({
             closeOnClick={false}
             anchor="top"
             offset={10}
-            className="pointer-events-none"
+            className="pointer-events-none corpus-map-popup"
           >
             <div className="rounded-lg border border-white/15 bg-black/80 px-3 py-2 text-xs shadow-[0_10px_24px_rgba(0,0,0,0.45)] backdrop-blur-md">
               <p className="font-semibold text-white">{hoverPopup.placeName}</p>
@@ -386,52 +392,54 @@ export function CorpusMap({
       </Map>
 
       <aside
-        className={`absolute inset-y-0 right-0 z-30 w-[min(95%,26rem)] transform border-l border-gray-800 bg-gray-950/82 backdrop-blur-xl transition-transform duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+        className={`absolute inset-y-0 right-0 z-30 w-[min(95%,26rem)] transform border-l border-white/12 bg-black/62 shadow-[-18px_0_40px_rgba(0,0,0,0.48)] backdrop-blur-xl transition-transform duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] ${
           selectedGroup ? "translate-x-0" : "translate-x-full"
         }`}
       >
-        <div className="flex items-center justify-between border-b border-gray-800 px-4 py-3">
+        <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,rgba(255,255,255,0.05)_0%,rgba(255,255,255,0.00)_22%)]" />
+
+        <div className="relative z-10 flex items-center justify-between border-b border-white/10 px-4 py-3">
           <div>
-            <p className="text-sm font-semibold text-gray-100">{selectedGroup?.place_name ?? ""}</p>
-            <p className="text-xs text-gray-400">
+            <p className="text-sm font-semibold tracking-tight text-white/92">{selectedGroup?.place_name ?? ""}</p>
+            <p className="text-xs text-white/58">
               {selectedGroup?.mention_count ?? 0} mention{(selectedGroup?.mention_count ?? 0) === 1 ? "" : "s"}
             </p>
           </div>
           <button
-            className="rounded px-2 py-1 text-xs text-gray-300 hover:bg-white/10"
+            className="rounded-md border border-white/14 bg-white/5 px-2.5 py-1 text-xs text-white/74 transition-colors hover:bg-white/12 hover:text-white"
             onClick={() => setSelectedGroup(null)}
           >
             Close
           </button>
         </div>
 
-        <div className="h-[calc(100%-56px)] overflow-y-auto px-3 py-3">
+        <div className="relative z-10 h-[calc(100%-56px)] overflow-y-auto px-3 py-3">
           {(selectedGroup?.mentions ?? []).map((mention) => (
-            <div key={mention.id} className="mb-3 rounded-lg border border-gray-800 bg-gray-900/70 p-3">
+            <div key={mention.id} className="mb-3 rounded-xl border border-white/12 bg-white/[0.035] p-3.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
               <div className="mb-2 flex items-center justify-between gap-2">
-                <p className="truncate text-xs font-medium text-gray-200">{mention.source_id}</p>
-                <span className="rounded border border-blue-500/40 bg-blue-500/10 px-2 py-0.5 text-[10px] text-blue-200">
+                <p className="truncate text-xs font-medium tracking-wide text-white/86">{mention.source_id}</p>
+                <span className="rounded-md border border-white/18 bg-white/8 px-2 py-0.5 text-[10px] font-medium text-white/82">
                   {(mention.confidence * 100).toFixed(0)}%
                 </span>
               </div>
 
-              <p className="mb-3 text-xs text-gray-300">
+              <p className="mb-3 text-xs text-white/68">
                 mentioned as &apos;{mention.matched_input}&apos;
               </p>
 
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => handleViewChunk(mention.source_id, mention.chunk_id)}
-                  className="rounded border border-gray-700 px-2 py-1 text-xs text-gray-200 hover:border-gray-500 hover:bg-white/10"
+                  onClick={() => handleViewChunk(mention.source_id, mention.chunk_id, mention.matched_input)}
+                  className="rounded-md border border-white/16 bg-white/[0.03] px-2.5 py-1 text-xs text-white/82 transition-colors hover:bg-white/10"
                 >
-                  -&gt; view
+                  View source
                 </button>
                 <button
                   type="button"
                   onClick={() => handleDeleteMention(mention.id)}
                   disabled={deletingMentionId === mention.id}
-                  className="rounded border border-red-500/30 p-1 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+                  className="rounded-md border border-red-400/35 bg-red-500/[0.08] p-1 text-red-300 transition-colors hover:bg-red-500/[0.16] disabled:opacity-50"
                   title="Delete mention"
                 >
                   <Trash2 className="h-3.5 w-3.5" />

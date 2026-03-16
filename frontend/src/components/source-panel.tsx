@@ -379,7 +379,7 @@ export function SourcePanel({
                   Ingesting {uploadStatus.fileName}...
                 </p>
                 <p className="text-xs text-gray-400 mt-0.5">
-                  Chunking, embedding &amp; {uploadStatus.geotag ? "geotagging" : "summarizing"}
+                  Chunking &amp; embedding{uploadStatus.geotag ? ", geotagging" : ""}
                   {uploadStatus.queued > 0 ? ` · ${uploadStatus.queued} queued` : ""}
                 </p>
               </div>

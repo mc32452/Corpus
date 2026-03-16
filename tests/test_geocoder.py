@@ -109,6 +109,7 @@ def test_resolve_all(gc: OfflineGeocoder) -> None:
     assert any("Alex" in n for n in names)
 
 
+@pytest.mark.slow
 def test_forward_latency(gc: OfflineGeocoder) -> None:
     import time
 
@@ -119,6 +120,7 @@ def test_forward_latency(gc: OfflineGeocoder) -> None:
     assert elapsed / 50 < 0.1, f"forward() avg {elapsed / 50:.3f}s > 100ms"
 
 
+@pytest.mark.slow
 def test_reverse_latency(gc: OfflineGeocoder) -> None:
     import time
 

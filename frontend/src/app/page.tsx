@@ -525,7 +525,8 @@ export default function Page() {
               <div
                 className="pointer-events-none absolute inset-0"
                 style={{
-                  background: "radial-gradient(120% 80% at 50% 50%, rgba(0,0,0,0.30) 0%, rgba(0,0,0,0.62) 70%, rgba(0,0,0,0.78) 100%)",
+                  background:
+                    "linear-gradient(180deg, rgba(7,10,14,0.82) 0%, rgba(7,10,14,0.90) 100%), radial-gradient(120% 80% at 50% 50%, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.00) 68%)",
                   opacity: mapScrimOpacity,
                   transition: "opacity 520ms cubic-bezier(0.22,1,0.36,1)",
                 }}

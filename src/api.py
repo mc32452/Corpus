@@ -27,7 +27,7 @@ from typing import AsyncGenerator, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .rag_engine import RagEngine
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -239,15 +239,6 @@ async def lifespan(app: FastAPI):
             logger.info("RAG_EAGER_LOAD=1: loading engine at startup...")
             await asyncio.to_thread(_get_engine)
 
-        # Warm-load geocoder in background if data/dependencies are available.
-        try:
-            from .geocoder import get_geocoder
-
-            geocoder = get_geocoder()
-            geocoder.warm(background=True)
-            logger.info("Geocoder warm-load initiated in background thread")
-        except Exception as geocoder_exc:
-            logger.warning("Geocoder warm-load skipped: %s", geocoder_exc)
     except Exception:
         logger.exception("Failed to initialize backend services at startup")
         
@@ -348,11 +339,11 @@ async def geocode_forward(
     from .geocoder import get_geocoder
 
     geocoder = get_geocoder()
-    if not geocoder.is_available():
-        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
 
     context_words = tuple(word.strip() for word in context.split(",") if word.strip())
     result = geocoder.forward(q, threshold=threshold, context_words=context_words)
+    if result is None and not geocoder.is_available():
+        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
     if not result:
         raise HTTPException(404, detail=f"No match found for '{q}'")
 
@@ -382,10 +373,10 @@ async def geocode_near(
     limit = min(limit, 200)
 
     geocoder = get_geocoder()
-    if not geocoder.is_available():
-        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
 
     places = geocoder.find_near(lat, lon, radius_km=radius_km, max_results=limit)
+    if not geocoder.is_available():
+        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
     return {
         "lat": lat,
         "lon": lon,
@@ -402,11 +393,11 @@ async def geocode_reverse(lat: float, lon: float, k: int = 3) -> dict:
     from .geocoder import get_geocoder
 
     geocoder = get_geocoder()
-    if not geocoder.is_available():
-        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
 
     k = min(k, 10)
     results = geocoder.reverse(lat, lon, k=k)
+    if not geocoder.is_available():
+        raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
     return {
         "lat": lat,
         "lon": lon,
@@ -421,55 +412,70 @@ async def geocode_reverse(lat: float, lon: float, k: int = 3) -> dict:
 @app.get("/api/geo/mentions")
 async def get_geo_mentions(
     source_id: str | None = None,
-    min_confidence: float = 0.75,
+    min_confidence: float = Query(0.75, ge=0.0, le=1.0),
+    limit: int = Query(1000, ge=1, le=50_000),
+    offset: int = Query(0, ge=0),
+    detailed: bool = True,
 ) -> dict:
     """Return geocoded place mentions grouped by geonameid."""
     engine = await asyncio.to_thread(_get_engine)
     storage = engine.storage  # type: ignore[union-attr]
-    rows = await asyncio.to_thread(
-        storage.get_geo_mentions,
-        source_id,
-        min_confidence,
-    )
+    try:
+        rows = await asyncio.to_thread(
+            storage.get_geo_mentions,
+            source_id,
+            min_confidence,
+            limit,
+            offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     groups: dict[int, dict] = {}
     for row in rows:
         gid = row["geonameid"]
         if gid not in groups:
-            groups[gid] = {
+            group = {
                 "place_name": row["place_name"],
                 "geonameid": gid,
                 "lat": row["lat"],
                 "lon": row["lon"],
                 "mention_count": 0,
                 "max_confidence": 0.0,
-                "matched_inputs": [],
-                "source_ids": [],
-                "chunk_ids": [],
-                "mention_ids": [],
-                "mentions": [],
             }
+            if detailed:
+                group.update(
+                    {
+                        "matched_inputs": [],
+                        "source_ids": [],
+                        "chunk_ids": [],
+                        "mention_ids": [],
+                        "mentions": [],
+                    }
+                )
+            groups[gid] = group
 
         group = groups[gid]
         group["mention_count"] += 1
         group["max_confidence"] = max(group["max_confidence"], row["confidence"])
-        if row["matched_input"] not in group["matched_inputs"]:
-            group["matched_inputs"].append(row["matched_input"])
-        if row["source_id"] not in group["source_ids"]:
-            group["source_ids"].append(row["source_id"])
-        if row["chunk_id"] not in group["chunk_ids"]:
-            group["chunk_ids"].append(row["chunk_id"])
-        group["mention_ids"].append(row["id"])
-        group["mentions"].append(
-            {
-                "id": row["id"],
-                "source_id": row["source_id"],
-                "chunk_id": row["chunk_id"],
-                "matched_input": row["matched_input"],
-                "confidence": row["confidence"],
-                "method": row["method"],
-            }
-        )
+        if detailed:
+            if row["matched_input"] not in group["matched_inputs"]:
+                group["matched_inputs"].append(row["matched_input"])
+            if row["source_id"] not in group["source_ids"]:
+                group["source_ids"].append(row["source_id"])
+            if row["chunk_id"] not in group["chunk_ids"]:
+                group["chunk_ids"].append(row["chunk_id"])
+            group["mention_ids"].append(row["id"])
+            group["mentions"].append(
+                {
+                    "id": row["id"],
+                    "source_id": row["source_id"],
+                    "chunk_id": row["chunk_id"],
+                    "matched_input": row["matched_input"],
+                    "confidence": row["confidence"],
+                    "method": row["method"],
+                }
+            )
 
     result = sorted(groups.values(), key=lambda item: item["mention_count"], reverse=True)
     return {"count": len(result), "mentions": result}

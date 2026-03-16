@@ -18,6 +18,7 @@ Architecture
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -363,15 +364,6 @@ class StorageEngine:
         except (TypeError, ValueError):
             return None
         return page if page >= 1 else None
-
-    @staticmethod
-    def _normalize_float(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
 
     @staticmethod
     def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -837,8 +829,23 @@ class StorageEngine:
         self,
         source_id: str | None = None,
         min_confidence: float = 0.0,
+        limit: int = 1000,
+        offset: int = 0,
     ) -> list[dict]:
         """Return mentions, optionally filtered by source and confidence floor."""
+        try:
+            normalized_min_confidence = float(min_confidence)
+        except (TypeError, ValueError):
+            raise ValueError("min_confidence must be a finite float in range [0.0, 1.0].")
+
+        if not math.isfinite(normalized_min_confidence) or not (0.0 <= normalized_min_confidence <= 1.0):
+            raise ValueError("min_confidence must be a finite float in range [0.0, 1.0].")
+
+        if limit < 1:
+            raise ValueError("limit must be >= 1.")
+        if offset < 0:
+            raise ValueError("offset must be >= 0.")
+
         table = self._geo_mentions
         if table is None:
             try:
@@ -847,7 +854,7 @@ class StorageEngine:
             except ValueError:
                 return []
 
-        where_parts = [f"confidence >= {float(min_confidence)}"]
+        where_parts = [f"confidence >= {normalized_min_confidence}"]
         if source_id:
             where_parts.append(self._where_eq("source_id", source_id))
         where = " AND ".join(f"({part})" for part in where_parts)
@@ -867,7 +874,8 @@ class StorageEngine:
                 "confidence",
                 "method",
             ])
-            .limit(200_000)
+            .offset(offset)
+            .limit(limit)
             .to_list()
         )
         return [

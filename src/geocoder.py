@@ -89,8 +89,7 @@ _CAP_NP_CHAIN = re.compile(
     r"^([A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2}(?:\s+and\s+[A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2})*)"
 )
 _BETWEEN_CHAIN = re.compile(
-    r"\bbetween\s+([A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2})\s+and\s+([A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2})",
-    re.IGNORECASE,
+    r"\b[Bb]etween\s+\"?([A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2})\"?\s+[Aa]nd\s+\"?([A-Z][a-zA-Z\-]{1,}(?:\s+[A-Z][a-zA-Z\-]{1,}){0,2})\"?",
 )
 
 _COUNTRY_HINT_TO_CODE = {
@@ -105,6 +104,60 @@ _COUNTRY_HINT_TO_CODE = {
     "syrian": "SY",
     "turkey": "TR",
     "turkish": "TR",
+}
+
+_US_ADMIN1_HINT_TO_CODE = {
+    "alabama": "AL", "al": "AL",
+    "alaska": "AK", "ak": "AK",
+    "arizona": "AZ", "az": "AZ",
+    "arkansas": "AR", "ar": "AR",
+    "california": "CA", "ca": "CA",
+    "colorado": "CO", "co": "CO",
+    "connecticut": "CT", "ct": "CT",
+    "delaware": "DE", "de": "DE",
+    "florida": "FL", "fl": "FL",
+    "georgia": "GA", "ga": "GA",
+    "hawaii": "HI", "hi": "HI",
+    "idaho": "ID", "id": "ID",
+    "illinois": "IL", "il": "IL",
+    "indiana": "IN", "in": "IN",
+    "iowa": "IA", "ia": "IA",
+    "kansas": "KS", "ks": "KS",
+    "kentucky": "KY", "ky": "KY",
+    "louisiana": "LA", "la": "LA",
+    "maine": "ME", "me": "ME",
+    "maryland": "MD", "md": "MD",
+    "massachusetts": "MA", "ma": "MA",
+    "michigan": "MI", "mi": "MI",
+    "minnesota": "MN", "mn": "MN",
+    "mississippi": "MS", "ms": "MS",
+    "missouri": "MO", "mo": "MO",
+    "montana": "MT", "mt": "MT",
+    "nebraska": "NE", "ne": "NE",
+    "nevada": "NV", "nv": "NV",
+    "new hampshire": "NH", "nh": "NH",
+    "new jersey": "NJ", "nj": "NJ",
+    "new mexico": "NM", "nm": "NM",
+    "new york": "NY", "ny": "NY",
+    "north carolina": "NC", "nc": "NC",
+    "north dakota": "ND", "nd": "ND",
+    "ohio": "OH", "oh": "OH",
+    "oklahoma": "OK", "ok": "OK",
+    "oregon": "OR", "or": "OR",
+    "pennsylvania": "PA", "pa": "PA",
+    "rhode island": "RI", "ri": "RI",
+    "south carolina": "SC", "sc": "SC",
+    "south dakota": "SD", "sd": "SD",
+    "tennessee": "TN", "tn": "TN",
+    "texas": "TX", "tx": "TX",
+    "utah": "UT", "ut": "UT",
+    "vermont": "VT", "vt": "VT",
+    "virginia": "VA", "va": "VA",
+    "washington": "WA", "wa": "WA",
+    "west virginia": "WV", "wv": "WV",
+    "wisconsin": "WI", "wi": "WI",
+    "wyoming": "WY", "wy": "WY",
+    "district of columbia": "DC", "dc": "DC",
 }
 
 
@@ -287,6 +340,13 @@ class OfflineGeocoder:
             return
         self._load_safe()
 
+    def _ensure_loaded(self) -> bool:
+        """Synchronously load GeoNames on first real use."""
+        if self._ready.is_set():
+            return True
+        self._load_safe()
+        return self._ready.is_set()
+
     def is_available(self) -> bool:
         return self._ready.is_set()
 
@@ -442,13 +502,25 @@ class OfflineGeocoder:
 
     def _disambiguate(self, gids: list[int], context_words: tuple[str, ...]) -> int:
         """Pick best candidate geonameid using weighted context + population."""
-        ctx_tokens = {w.lower() for w in context_words if len(w) >= 2 and w.isalpha()}
+        ctx_tokens: set[str] = set()
+        ctx_phrases: set[str] = set()
+        for word in context_words:
+            tokens = [token.lower() for token in re.findall(r"[A-Za-z]{2,}", word)]
+            if not tokens:
+                continue
+            ctx_tokens.update(tokens)
+            ctx_phrases.add(" ".join(tokens))
+
+        hint_terms = ctx_tokens | ctx_phrases
         ctx_country_codes = {
-            _COUNTRY_HINT_TO_CODE[token]
-            for token in ctx_tokens
-            if token in _COUNTRY_HINT_TO_CODE
+            _COUNTRY_HINT_TO_CODE[token] for token in hint_terms if token in _COUNTRY_HINT_TO_CODE
         }
-        if not ctx_tokens:
+        ctx_us_admin1_codes = {
+            _US_ADMIN1_HINT_TO_CODE[token]
+            for token in hint_terms
+            if token in _US_ADMIN1_HINT_TO_CODE
+        }
+        if not hint_terms:
             return max(gids, key=lambda gid: self.places_by_id[gid].population)
 
         def _feature_score(gid: int) -> tuple[float, int]:
@@ -457,8 +529,15 @@ class OfflineGeocoder:
 
             if place.country.upper() in ctx_country_codes:
                 score += 4.0
-            elif place.country.lower() in ctx_tokens:
+            elif place.country.lower() in hint_terms:
                 score += 3.0
+
+            if (
+                ctx_us_admin1_codes
+                and place.country.upper() == "US"
+                and place.admin1.upper() in ctx_us_admin1_codes
+            ):
+                score += 4.5
 
             admin1_tokens = set(place.admin1.lower().split())
             if admin1_tokens & ctx_tokens:
@@ -488,7 +567,7 @@ class OfflineGeocoder:
         context_words: tuple[str, ...] = (),
     ) -> GeoMatch | None:
         """Forward geocode one place name with exact/region/fuzzy fallback."""
-        if not self._ready.is_set():
+        if not self._ensure_loaded():
             return None
 
         query = place_name.lower().strip()
@@ -600,7 +679,7 @@ class OfflineGeocoder:
         max_results: int = 200,
     ) -> list[GeoPlace]:
         """Return canonical places within radius_km."""
-        if not self._ready.is_set() or self.kdtree is None:
+        if not self._ensure_loaded() or self.kdtree is None:
             return []
 
         chord = _radius_to_chord(radius_km)
@@ -621,7 +700,7 @@ class OfflineGeocoder:
 
     def reverse(self, lat: float, lon: float, k: int = 1) -> list[tuple[float, GeoPlace]]:
         """Return nearest canonical places as (distance_km, GeoPlace)."""
-        if not self._ready.is_set() or self.kdtree is None:
+        if not self._ensure_loaded() or self.kdtree is None:
             return []
 
         qvec = _to_unit(lat, lon)

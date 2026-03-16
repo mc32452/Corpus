@@ -289,9 +289,15 @@ class SourceApiClient {
   async getGeoMentions(
     sourceId?: string,
     minConfidence: number = 0.75,
+    limit: number = 1000,
+    offset: number = 0,
+    detailed: boolean = true,
   ): Promise<GeoMentionsResponse> {
     const params = new URLSearchParams({
       min_confidence: String(minConfidence),
+      limit: String(limit),
+      offset: String(offset),
+      detailed: String(detailed),
     });
     if (sourceId) {
       params.set("source_id", sourceId);
