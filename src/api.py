@@ -209,19 +209,38 @@ def _get_engine(mode: str | None = None):
 # ---------------------------------------------------------------------------
 
 
+_phoenix_process = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: initialize engine on startup, cleanup on shutdown."""
-    global _engine_loaded
+    global _engine_loaded, _phoenix_process
     try:
         import os
+        import sys
+        import subprocess
+
+        # Auto-start Phoenix server if tracing is enabled and we are running locally
+        if os.environ.get("RAG_PHOENIX_ENABLED", "").strip() in ("1", "true", "yes", "on", "y"):
+            logger.info("RAG_PHOENIX_ENABLED: Auto-starting local Phoenix tracing server on port 6006...")
+            try:
+                _phoenix_process = subprocess.Popen(
+                    [sys.executable, "-m", "phoenix.server.main", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.warning("Failed to auto-start Phoenix server: %s", e)
 
         if os.environ.get("RAG_EAGER_LOAD", "").strip() == "1":
             logger.info("RAG_EAGER_LOAD=1: loading engine at startup...")
             await asyncio.to_thread(_get_engine)
     except Exception:
-        logger.exception("Failed to initialize RagEngine at startup")
+        logger.exception("Failed to initialize backend services at startup")
+        
     yield
+    
     global _engine, _engine_mode
     if _engine is not None:
         try:
@@ -231,6 +250,14 @@ async def lifespan(app: FastAPI):
         _engine = None
         _engine_mode = None
     _engine_loaded = False
+
+    if _phoenix_process is not None:
+        logger.info("Shutting down local Phoenix tracing server...")
+        try:
+            _phoenix_process.terminate()
+            _phoenix_process.wait(timeout=5)
+        except Exception as e:
+            logger.warning("Error during Phoenix server shutdown: %s", e)
 
 
 # ---------------------------------------------------------------------------
