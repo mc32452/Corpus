@@ -357,12 +357,12 @@ export function PeopleDictionary({
 
   return (
     <>
-      <div className="relative h-full w-full overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(120%_120%_at_0%_0%,rgba(245,158,11,0.10)_0%,rgba(245,158,11,0.00)_48%),linear-gradient(180deg,rgba(0,0,0,0.70)_0%,rgba(0,0,0,0.78)_100%)]" />
+      <div className="relative h-full w-full overflow-hidden bg-black/62 backdrop-blur-xl">
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,rgba(255,255,255,0.05)_0%,rgba(255,255,255,0.00)_22%)]" />
 
       <div className="relative z-10 flex h-full flex-col">
         <div className="border-b border-white/10 px-4 py-3">
-          <div className="flex items-center justify-between gap-3">
+          <div>
             <div>
               <p className="text-sm font-semibold tracking-tight text-white/92">People Dictionary</p>
               <div className="flex items-center gap-2 text-xs text-white/58">
@@ -377,36 +377,16 @@ export function PeopleDictionary({
                 )}
               </div>
             </div>
-            <div className="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-[10px] text-white/70">
-              {(threshold * 100).toFixed(0)}% min confidence
-            </div>
           </div>
 
-          <div className="mt-2 rounded-md border border-white/15 bg-white/[0.04] px-2.5 py-2">
-            <div className="mb-1.5 flex items-center justify-between text-[10px] uppercase tracking-[0.08em] text-white/65">
-              <span>People confidence</span>
-              <span>{Math.round(threshold * 100)}% minimum</span>
-            </div>
-            <input
-              type="range"
-              min={0.3}
-              max={0.99}
-              step={0.01}
-              value={threshold}
-              onChange={(event) => onThresholdChange?.(Number(event.target.value))}
-              className="w-full accent-amber-400"
-              aria-label="People confidence threshold"
-            />
-          </div>
-
-          <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
-            <label className="relative">
-              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/45" />
+          <div className="mt-2 grid grid-cols-[1fr_auto] gap-2">
+            <label className="flex h-9 items-center rounded-md border border-white/15 bg-white/5 px-2.5 focus-within:border-white/30">
+              <Search className="h-4 w-4 shrink-0 text-white/45" />
               <input
                 value={searchInput}
                 onChange={(event) => setSearchInput(event.target.value)}
                 placeholder="Search people or variants"
-                className="w-full rounded-md border border-white/15 bg-white/5 py-1.5 pl-7 pr-2 text-xs text-white/90 outline-none placeholder:text-white/45 focus:border-white/30"
+                className="h-full w-full bg-transparent px-2 text-xs text-white/90 outline-none placeholder:text-white/45"
               />
             </label>
 
@@ -435,6 +415,26 @@ export function PeopleDictionary({
               </button>
             </div>
           </div>
+
+          <div className="mt-2 w-full max-w-[18rem] rounded-xl border border-white/20 bg-black/72 px-3 py-2.5 text-white shadow-lg backdrop-blur-md">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white/75">People confidence</p>
+            <input
+              type="range"
+              min={0.3}
+              max={0.99}
+              step={0.01}
+              value={threshold}
+              onChange={(event) => onThresholdChange?.(Number(event.target.value))}
+              className="mt-2 w-full accent-amber-400"
+              aria-label="People confidence threshold"
+            />
+            <div className="mt-1.5 flex items-center justify-between text-[11px] text-white/70">
+              <span>{Math.round(threshold * 100)}% minimum</span>
+              <span>
+                {normalizedSourceIds.length} source{normalizedSourceIds.length === 1 ? "" : "s"}
+              </span>
+            </div>
+          </div>
         </div>
 
         {people.length === 0 ? (
@@ -461,7 +461,7 @@ export function PeopleDictionary({
                       event.preventDefault();
                       setExpandedCanonical((prev) => (prev === person.canonical_name ? null : person.canonical_name));
                     }}
-                    className="w-full px-3.5 py-3 text-left hover:bg-white/[0.03] transition-colors focus:outline-none focus:ring-1 focus:ring-white/20"
+                    className="w-full cursor-pointer px-3.5 py-3 text-left focus:outline-none"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <p className="truncate text-sm font-semibold text-white/92">{person.canonical_name}</p>
@@ -591,13 +591,15 @@ export function PeopleDictionary({
               Target canonical name
             </label>
             <label className="relative block">
-              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/45" />
+              <span className="pointer-events-none absolute inset-y-0 left-2.5 flex items-center text-white/45">
+                <Search className="h-3.5 w-3.5" />
+              </span>
               <input
                 value={mergeSearchInput}
                 onChange={(event) => setMergeSearchInput(event.target.value)}
                 placeholder="Search canonical names"
                 autoFocus
-                className="w-full rounded-md border border-white/15 bg-white/5 py-1.5 pl-7 pr-2 text-xs text-white/90 outline-none placeholder:text-white/45 focus:border-white/30"
+                className="w-full rounded-md border border-white/15 bg-white/5 py-1.5 pl-8 pr-2 text-xs text-white/90 outline-none placeholder:text-white/45 focus:border-white/30"
               />
             </label>
 
@@ -621,6 +623,10 @@ export function PeopleDictionary({
                       }`}
                     >
                       <span className="truncate">{candidate.canonical_name}</span>
+                      {/* Show page number if available, and hide snippet preview if cut off */}
+                      {candidate.page_number != null && (
+                        <span className="ml-2 shrink-0 text-[10px] text-amber-300">Page {candidate.page_number}</span>
+                      )}
                       <span className="ml-2 shrink-0 text-[10px] text-white/55">
                         {candidate.mention_count} mentions
                       </span>

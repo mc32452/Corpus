@@ -691,7 +691,7 @@ export default function Page() {
                 className="pointer-events-none absolute inset-0"
                 style={{
                   background:
-                    "linear-gradient(180deg, rgba(12,9,4,0.84) 0%, rgba(12,9,4,0.92) 100%), radial-gradient(120% 80% at 50% 50%, rgba(251,191,36,0.05) 0%, rgba(251,191,36,0.00) 68%)",
+                    "linear-gradient(180deg, rgba(7,10,14,0.82) 0%, rgba(7,10,14,0.90) 100%), radial-gradient(120% 80% at 50% 50%, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.00) 68%)",
                   opacity: peopleScrimOpacity,
                   transition: "opacity 520ms cubic-bezier(0.22,1,0.36,1)",
                 }}
