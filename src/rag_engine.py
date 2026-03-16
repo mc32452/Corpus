@@ -833,6 +833,7 @@ class RagEngine:
         source_id: str,
         page_number: Optional[int] = None,
         summarize: bool = True,
+        geotag: bool = False,
         page_offset: int = 1,
     ) -> IngestResult:
         """Ingest a document (PDF or Markdown) into the RAG store."""
@@ -849,6 +850,7 @@ class RagEngine:
                 "rag.ingest.page_number": page_number,
                 "rag.ingest.page_offset": page_offset,
                 "rag.ingest.summarize": summarize,
+                "rag.ingest.geotag": geotag,
             },
         ) as ingest_span:
             try:
@@ -866,6 +868,7 @@ class RagEngine:
                     embedding_model=embedding_model,
                     summarize=summarize,
                     summary_generator=generator,
+                    geotag=geotag,
                     page_offset=page_offset,
                     tracer=self._tracer,
                 )

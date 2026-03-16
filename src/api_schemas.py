@@ -180,6 +180,10 @@ class IngestRequest(BaseModel):
         default=True,
         description="Whether to generate a summary during ingest.",
     )
+    geotag: bool = Field(
+        default=False,
+        description="Whether to run ingest-time place NER/geocoding and persist geo mentions.",
+    )
     page_offset: int = Field(
         default=1,
         ge=1,

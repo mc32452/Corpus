@@ -159,6 +159,12 @@ def run() -> None:
         dest="summarize",
         help="Disable summary generation",
     )
+    ingest_parser.add_argument(
+        "--geotag",
+        action="store_true",
+        default=False,
+        help="Enable ingest-time NER geotagging and geo mention persistence",
+    )
     _add_phoenix_args(ingest_parser)
 
     # ---- query subcommand ------------------------------------------------
@@ -458,6 +464,7 @@ def run() -> None:
             source_id=args.source_id,
             page_number=args.page_number,
             summarize=args.summarize,
+            geotag=args.geotag,
             page_offset=args.page_offset,
         )
         print(f"Ingested {result.parents_count} parents and {result.children_count} children.")

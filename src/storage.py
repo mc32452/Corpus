@@ -2,9 +2,9 @@
 
 Architecture
 ~~~~~~~~~~~~
-- Three LanceDB tables: ``child_chunks`` (dense vectors + FTS text index),
+- Four LanceDB tables: ``child_chunks`` (dense vectors + FTS text index),
   ``parent_chunks`` (text only, no vectors), ``source_summaries`` (source
-  metadata and file paths).
+  metadata and file paths), and ``geo_mentions`` (ingest-time geocoded mentions).
 - FTS index rebuild is controlled by a policy (``immediate``, ``deferred``,
   ``batch``) to trade ingest throughput against query-time freshness.  The
   ``_fts_dirty`` flag tracks whether a rebuild is pending so hybrid_search
@@ -43,7 +43,20 @@ class StorageEngine:
 
     _PARENTS_TABLE = "parent_chunks"
     _SUMMARIES_TABLE = "source_summaries"
+    _GEO_MENTIONS_TABLE = "geo_mentions"
     _MAX_IN_CLAUSE_VALUES = 256
+    _GEO_MENTIONS_SCHEMA = pa.schema([
+        pa.field("id", pa.string()),
+        pa.field("source_id", pa.string()),
+        pa.field("chunk_id", pa.string()),
+        pa.field("place_name", pa.string()),
+        pa.field("matched_input", pa.string()),
+        pa.field("geonameid", pa.int64()),
+        pa.field("lat", pa.float64()),
+        pa.field("lon", pa.float64()),
+        pa.field("confidence", pa.float64()),
+        pa.field("method", pa.string()),
+    ])
 
     def __init__(self, config: StorageConfig) -> None:
         self._config = config
@@ -83,6 +96,13 @@ class StorageEngine:
         try:
             self._summaries = self._db.open_table(self._SUMMARIES_TABLE)
             self._migrate_summaries_schema()
+        except ValueError:
+            pass  # Table does not exist yet
+
+        # --- geo mentions (no vectors) ---
+        self._geo_mentions: Optional[lancedb.table.Table] = None
+        try:
+            self._geo_mentions = self._db.open_table(self._GEO_MENTIONS_TABLE)
         except ValueError:
             pass  # Table does not exist yet
 
@@ -248,7 +268,12 @@ class StorageEngine:
 
     def reset_all_tables(self) -> None:
         """Drop all managed tables and clear in-memory handles."""
-        for table_name in (self._table_name, self._PARENTS_TABLE, self._SUMMARIES_TABLE):
+        for table_name in (
+            self._table_name,
+            self._PARENTS_TABLE,
+            self._SUMMARIES_TABLE,
+            self._GEO_MENTIONS_TABLE,
+        ):
             try:
                 self._db.drop_table(table_name)
                 logger.warning("Dropped LanceDB table '%s'", table_name)
@@ -258,6 +283,7 @@ class StorageEngine:
         self._table = None
         self._parents = None
         self._summaries = None
+        self._geo_mentions = None
         self._fts_dirty = False
         self._pending_fts_rows = 0
 
@@ -339,6 +365,15 @@ class StorageEngine:
         return page if page >= 1 else None
 
     @staticmethod
+    def _normalize_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         return {
             key: value
@@ -394,6 +429,7 @@ class StorageEngine:
 
         if self._table is None:
             self._table = self._db.create_table(self._table_name, records)
+            self._migrate_children_schema()
             # Create FTS index on the text column for hybrid search
             self._ensure_fts_index(force_rebuild=True)
             logger.info(
@@ -730,8 +766,157 @@ class StorageEngine:
             "page_offset": int(r.get("page_offset") or 1),
         }
 
+    def _ensure_geo_mentions_table(self) -> Optional[lancedb.table.Table]:
+        if self._geo_mentions is not None:
+            return self._geo_mentions
+        try:
+            self._geo_mentions = self._db.create_table(
+                self._GEO_MENTIONS_TABLE,
+                schema=self._GEO_MENTIONS_SCHEMA,
+                exist_ok=True,
+            )
+        except Exception as exc:
+            logger.error("Failed to create/open '%s': %s", self._GEO_MENTIONS_TABLE, exc)
+            return None
+        return self._geo_mentions
+
+    def upsert_geo_mentions(self, mentions: list[dict]) -> None:
+        """Batch write geo mentions. Creates table if not present."""
+        if not mentions:
+            return
+        table = self._ensure_geo_mentions_table()
+        if table is None:
+            return
+
+        records: list[dict[str, Any]] = []
+        for row in mentions:
+            mention_id = str(row.get("id", "")).strip()
+            source_id = str(row.get("source_id", "")).strip()
+            chunk_id = str(row.get("chunk_id", "")).strip()
+            place_name = str(row.get("place_name", "")).strip()
+            matched_input = str(row.get("matched_input", "")).strip()
+            method = str(row.get("method", "")).strip()
+            if not mention_id or not source_id or not chunk_id or not place_name:
+                continue
+            try:
+                geonameid = int(row.get("geonameid"))
+                lat = float(row.get("lat"))
+                lon = float(row.get("lon"))
+                confidence = float(row.get("confidence"))
+            except (TypeError, ValueError):
+                continue
+
+            records.append(
+                {
+                    "id": mention_id,
+                    "source_id": source_id,
+                    "chunk_id": chunk_id,
+                    "place_name": place_name,
+                    "matched_input": matched_input,
+                    "geonameid": geonameid,
+                    "lat": lat,
+                    "lon": lon,
+                    "confidence": confidence,
+                    "method": method,
+                }
+            )
+
+        if not records:
+            return
+
+        unique_ids = list(dict.fromkeys(record["id"] for record in records))
+        try:
+            for id_batch in self._chunk(unique_ids, self._MAX_IN_CLAUSE_VALUES):
+                table.delete(self._where_in("id", id_batch))
+            table.add(records)
+        except Exception as exc:
+            logger.error("Failed to upsert geo mentions: %s", exc)
+            raise
+
+    def get_geo_mentions(
+        self,
+        source_id: str | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[dict]:
+        """Return mentions, optionally filtered by source and confidence floor."""
+        table = self._geo_mentions
+        if table is None:
+            try:
+                table = self._db.open_table(self._GEO_MENTIONS_TABLE)
+                self._geo_mentions = table
+            except ValueError:
+                return []
+
+        where_parts = [f"confidence >= {float(min_confidence)}"]
+        if source_id:
+            where_parts.append(self._where_eq("source_id", source_id))
+        where = " AND ".join(f"({part})" for part in where_parts)
+
+        rows = (
+            table.search()
+            .where(where, prefilter=True)
+            .select([
+                "id",
+                "source_id",
+                "chunk_id",
+                "place_name",
+                "matched_input",
+                "geonameid",
+                "lat",
+                "lon",
+                "confidence",
+                "method",
+            ])
+            .limit(200_000)
+            .to_list()
+        )
+        return [
+            {
+                "id": str(row.get("id", "")),
+                "source_id": str(row.get("source_id", "")),
+                "chunk_id": str(row.get("chunk_id", "")),
+                "place_name": str(row.get("place_name", "")),
+                "matched_input": str(row.get("matched_input", "")),
+                "geonameid": int(row.get("geonameid")),
+                "lat": float(row.get("lat")),
+                "lon": float(row.get("lon")),
+                "confidence": float(row.get("confidence")),
+                "method": str(row.get("method", "")),
+            }
+            for row in rows
+            if row.get("id") is not None
+            and row.get("source_id") is not None
+            and row.get("chunk_id") is not None
+            and row.get("geonameid") is not None
+            and row.get("lat") is not None
+            and row.get("lon") is not None
+            and row.get("confidence") is not None
+        ]
+
+    def delete_geo_mentions_by_source(self, source_id: str) -> None:
+        """Called from delete_source() — cascading delete."""
+        table = self._geo_mentions
+        if table is None:
+            try:
+                table = self._db.open_table(self._GEO_MENTIONS_TABLE)
+                self._geo_mentions = table
+            except ValueError:
+                return
+        table.delete(self._where_eq("source_id", source_id))
+
+    def delete_geo_mention(self, mention_id: str) -> None:
+        """Single row delete by UUID for manual correction."""
+        table = self._geo_mentions
+        if table is None:
+            try:
+                table = self._db.open_table(self._GEO_MENTIONS_TABLE)
+                self._geo_mentions = table
+            except ValueError:
+                return
+        table.delete(self._where_eq("id", mention_id))
+
     def delete_source(self, source_id: str) -> bool:
-        """Delete all data for a source: children, parents, and summary.
+        """Delete all data for a source: children, parents, summary, geo mentions.
 
         Returns True if the source existed (had any data), False otherwise.
         Raises ``RuntimeError`` if any individual delete step fails so
@@ -774,6 +959,14 @@ class StorageEngine:
             except Exception as exc:
                 logger.error("Failed to delete summary for source '%s': %s", sid, exc)
                 errors.append(f"summary: {exc}")
+
+        # Delete geo mentions
+        try:
+            self.delete_geo_mentions_by_source(sid)
+            logger.info("Deleted geo mentions for source '%s'", sid)
+        except Exception as exc:
+            logger.error("Failed to delete geo mentions for source '%s': %s", sid, exc)
+            errors.append(f"geo_mentions: {exc}")
 
         if errors:
             raise RuntimeError(

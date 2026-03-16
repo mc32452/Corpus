@@ -569,6 +569,66 @@ def _coerce_embeddings(raw_embeddings: object) -> list[list[float]]:
     raise TypeError("Unsupported embeddings type.")
 
 
+def _geotag_chunks(
+    source_id: str,
+    child_chunks: list[ChildChunk],
+    storage: StorageEngine,
+) -> None:
+    """Extract place mentions with NER, geocode, and store grouped mention rows."""
+    try:
+        import uuid
+
+        from .geocoder import get_geocoder
+        from .ner import extract_places_ner
+
+        geocoder = get_geocoder()
+        if not geocoder.is_available():
+            logger.info("Geocoder cold during ingest geotagging; warming now for %s", source_id)
+            geocoder.warm(background=False)
+        if not geocoder.is_available():
+            logger.warning("Geocoder unavailable after warm attempt — skipping geotagging for %s", source_id)
+            return
+
+        texts = [chunk.text for chunk in child_chunks]
+        ner_lists = extract_places_ner(texts)
+
+        mentions: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+
+        for chunk, place_candidates in zip(child_chunks, ner_lists):
+            for candidate in place_candidates:
+                normalized = candidate.strip()
+                if not normalized:
+                    continue
+                match = geocoder.forward(normalized, threshold=75)
+                if match is None:
+                    continue
+                key = (match.place.geonameid, chunk.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mentions.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "source_id": source_id,
+                        "chunk_id": chunk.id,
+                        "place_name": match.place.name,
+                        "matched_input": normalized,
+                        "geonameid": match.place.geonameid,
+                        "lat": match.place.lat,
+                        "lon": match.place.lon,
+                        "confidence": round(match.confidence, 4),
+                        "method": match.method.value,
+                    }
+                )
+
+        if mentions:
+            storage.upsert_geo_mentions(mentions)
+            logger.info("Geotagged %d mentions for source %s.", len(mentions), source_id)
+    except Exception as exc:
+        logger.warning("Geotagging failed for %s (ingest unaffected): %s", source_id, exc)
+
+
 def ingest_file_to_storage(
     file_path: str | Path,
     *,
@@ -578,6 +638,7 @@ def ingest_file_to_storage(
     embedding_model: object,
     summarize: bool = False,
     summary_generator: Optional[MlxGenerator] = None,
+    geotag: bool = False,
     page_offset: int = 1,
     tracer: Optional[Any] = None,
 ) -> tuple[int, int]:
@@ -594,6 +655,7 @@ def ingest_file_to_storage(
             "rag.ingest.page_number": page_number,
             "rag.ingest.page_offset": page_offset,
             "rag.ingest.summarize": summarize,
+            "rag.ingest.geotag": geotag,
         },
     ) as ingest_span:
         try:
@@ -669,6 +731,9 @@ def ingest_file_to_storage(
                     except Exception:
                         logger.exception("Rollback delete_source('%s') also failed", source_id)
                     raise
+
+            if geotag:
+                _geotag_chunks(source_id, children, storage)
 
             if summarize:
                 generator = summary_generator
