@@ -58,6 +58,20 @@ from .query_events import (
     StatusEvent,
     TextTokenEvent,
     ThinkingTokenEvent,
+    TraceEvent,
+)
+from .phoenix_tracing import (
+    SPAN_KIND_CHAIN,
+    SPAN_KIND_LLM,
+    annotate_span_feedback,
+    get_phoenix_runtime_status,
+    mark_span_error,
+    set_llm_input_messages,
+    set_llm_output_message,
+    set_llm_token_counts,
+    set_span_attributes,
+    start_span,
+    to_json,
 )
 from .stream_protocol import (
     annotation_error,
@@ -66,6 +80,7 @@ from .stream_protocol import (
     annotation_intent,
     annotation_sources,
     annotation_status,
+    encode_annotation,
     encode_done,
     encode_error,
     encode_finish_message,
@@ -196,19 +211,38 @@ def _get_engine(mode: str | None = None):
 # ---------------------------------------------------------------------------
 
 
+_phoenix_process = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: initialize engine on startup, cleanup on shutdown."""
-    global _engine_loaded
+    global _engine_loaded, _phoenix_process
     try:
         import os
+        import sys
+        import subprocess
+
+        # Auto-start Phoenix server if tracing is enabled and we are running locally
+        if os.environ.get("RAG_PHOENIX_ENABLED", "").strip() in ("1", "true", "yes", "on", "y"):
+            logger.info("RAG_PHOENIX_ENABLED: Auto-starting local Phoenix tracing server on port 6006...")
+            try:
+                _phoenix_process = subprocess.Popen(
+                    [sys.executable, "-m", "phoenix.server.main", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.warning("Failed to auto-start Phoenix server: %s", e)
 
         if os.environ.get("RAG_EAGER_LOAD", "").strip() == "1":
             logger.info("RAG_EAGER_LOAD=1: loading engine at startup...")
             await asyncio.to_thread(_get_engine)
     except Exception:
-        logger.exception("Failed to initialize RagEngine at startup")
+        logger.exception("Failed to initialize backend services at startup")
+        
     yield
+    
     global _engine, _engine_mode
     if _engine is not None:
         try:
@@ -218,6 +252,14 @@ async def lifespan(app: FastAPI):
         _engine = None
         _engine_mode = None
     _engine_loaded = False
+
+    if _phoenix_process is not None:
+        logger.info("Shutting down local Phoenix tracing server...")
+        try:
+            _phoenix_process.terminate()
+            _phoenix_process.wait(timeout=5)
+        except Exception as e:
+            logger.warning("Error during Phoenix server shutdown: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +305,17 @@ async def validation_exception_handler(request: Request, exc: Exception):
 async def health():
     from .config import get_system_ram_gb
 
+    phoenix_status = get_phoenix_runtime_status()
+
     return HealthResponse(
         status="ok",
         engine_loaded=_engine_loaded,
         system_ram_gb=round(get_system_ram_gb(), 1),
+        phoenix_configured=phoenix_status.configured,
+        phoenix_active=phoenix_status.active,
+        phoenix_project_name=phoenix_status.project_name,
+        phoenix_endpoint=phoenix_status.endpoint,
+        phoenix_error=phoenix_status.error,
     )
 
 
@@ -352,6 +401,12 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
             encode_finish_step(event.finish_reason)
             + encode_finish_message(event.finish_reason)
         )
+    elif isinstance(event, TraceEvent):
+        return encode_annotation([{
+            "type": "trace-id",
+            "trace_id": event.trace_id,
+            "span_id": event.span_id,
+        }])
     logger.warning("Unknown event type: %s", type(event).__name__)
     return None
 
@@ -604,6 +659,7 @@ class FreeformChatRequest(BaseModel):
     messages: list[FreeformMessage]
     model: str = "regular"  # "regular" | "deep-research"
     enable_thinking: Optional[bool] = None  # tri-state: None=auto, True=on, False=off
+    session_id: Optional[str] = None  # frontend session ID for Phoenix session tracking
 
 
 _FREEFORM_SYSTEM = (
@@ -635,6 +691,14 @@ async def _freeform_stream_generator(
     freeform_mode = _FRONTEND_MODE_MAP.get(freeform_request.model, "regular")
     pinned_engine = await asyncio.to_thread(_get_engine, freeform_mode)
 
+    # Resolve Phoenix tracer
+    _tracer = getattr(pinned_engine, '_tracer', None) if pinned_engine else None
+
+    freeform_request_id = f"ff-{uuid.uuid4().hex[:12]}"
+    user_query = freeform_request.messages[-1].content if freeform_request.messages else ""
+    model_name = getattr(pinned_engine, '_cfg', None)
+    model_name = (model_name.model if model_name and hasattr(model_name, 'model') and model_name.model else freeform_request.model)
+
     def _producer() -> None:
         try:
             engine = pinned_engine
@@ -661,34 +725,142 @@ async def _freeform_stream_generator(
 
     producer_task = loop.run_in_executor(None, _producer)
 
-    try:
-        while True:
-            if await request.is_disconnected():
-                stop_event.set()
-                return
+    # Track token output for tracing
+    chunk_event_count = 0
+    all_answer_tokens: list[str] = []
+    all_thinking_tokens: list[str] = []
+
+    with start_span(
+        _tracer,
+        "freeform.chat",
+        span_kind=SPAN_KIND_CHAIN,
+        attributes={
+            "input.value": user_query,
+            "input.mime_type": "text/plain",
+            "freeform.request_id": freeform_request_id,
+            "session.id": freeform_request.session_id or freeform_request_id,
+            "freeform.model": freeform_request.model,
+            "freeform.message_count": len(messages),
+            "freeform.enable_thinking": freeform_request.enable_thinking,
+        },
+    ) as chain_span:
+        # Emit trace_id so the frontend can use it for feedback
+        trace_id = ""
+        span_id = ""
+        if chain_span is not None:
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL_S)
-            except asyncio.TimeoutError:
-                yield ": ping\n\n"
-                continue
-            if item is _SENTINEL:
-                break
-            if isinstance(item, Exception):
-                err_json = json.dumps({"error": str(item)})
-                yield f"event: error\ndata: {err_json}\n\n"
-                return
-            # item is a dict {"type": "thinking"|"answer", "text": str}
-            sse_event = "thinking_token" if item.get("type") == "thinking" else "token"
-            token_json = json.dumps({"text": item.get("text", "")})
-            yield f"event: {sse_event}\ndata: {token_json}\n\n"
-    except asyncio.CancelledError:
-        stop_event.set()
-    finally:
-        stop_event.set()
-        try:
-            await asyncio.wait_for(producer_task, timeout=_PRODUCER_CLEANUP_TIMEOUT_S)
-        except (asyncio.TimeoutError, Exception):
-            pass
+                ctx = chain_span.get_span_context()
+                trace_id = format(ctx.trace_id, '032x')
+                span_id = format(ctx.span_id, '016x')
+            except Exception:
+                pass
+
+        if trace_id:
+            trace_json = json.dumps({"trace_id": trace_id, "span_id": span_id})
+            yield f"event: trace_id\ndata: {trace_json}\n\n"
+
+        with start_span(
+            _tracer,
+            "freeform.llm.generate",
+            span_kind=SPAN_KIND_LLM,
+            attributes={
+                "input.value": user_query,
+                "input.mime_type": "text/plain",
+                "llm.model_name": model_name,
+                "llm.input_messages": len(messages),
+                "freeform.enable_thinking": freeform_request.enable_thinking,
+            },
+        ) as llm_span:
+            set_llm_input_messages(llm_span, messages)
+
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        stop_event.set()
+                        mark_span_error(llm_span, "CLIENT_DISCONNECTED")
+                        return
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL_S)
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"
+                        continue
+                    if item is _SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        err_json = json.dumps({"error": str(item)})
+                        yield f"event: error\ndata: {err_json}\n\n"
+                        mark_span_error(llm_span, f"{type(item).__name__}: {item}")
+                        return
+                    # item is a dict {"type": "thinking"|"answer", "text": str}
+                    chunk_event_count += 1
+                    token_text = item.get("text", "")
+                    if item.get("type") == "thinking":
+                        all_thinking_tokens.append(token_text)
+                    else:
+                        all_answer_tokens.append(token_text)
+
+                    if chunk_event_count == 1 and llm_span is not None:
+                        try:
+                            llm_span.add_event("first_token")
+                        except Exception:
+                            pass
+
+                    sse_event = "thinking_token" if item.get("type") == "thinking" else "token"
+                    token_json = json.dumps({"text": token_text})
+                    yield f"event: {sse_event}\ndata: {token_json}\n\n"
+            except asyncio.CancelledError:
+                stop_event.set()
+                mark_span_error(llm_span, "STREAM_CANCELLED")
+            finally:
+                stop_event.set()
+                try:
+                    await asyncio.wait_for(producer_task, timeout=_PRODUCER_CLEANUP_TIMEOUT_S)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+            # Finalize LLM span
+            answer_text = "".join(all_answer_tokens)
+            # Estimate token counts (rough char/4 heuristic)
+            prompt_chars = sum(len(m.get("content", "")) for m in messages)
+            prompt_token_est = max(1, prompt_chars // 4)
+            completion_token_est = max(1, len(answer_text) // 4)
+
+            if llm_span is not None:
+                try:
+                    llm_span.add_event("stream_complete")
+                except Exception:
+                    pass
+
+            set_llm_output_message(llm_span, answer_text)
+            set_llm_token_counts(
+                llm_span,
+                prompt_tokens=prompt_token_est,
+                completion_tokens=completion_token_est,
+                total_tokens=prompt_token_est + completion_token_est,
+            )
+            set_span_attributes(
+                llm_span,
+                {
+                    "output.value": answer_text[:4096],
+                    "output.mime_type": "text/plain",
+                    "freeform.output_chars": len(answer_text),
+                    "freeform.stream.chunk_events": chunk_event_count,
+                    "freeform.thinking_chars": len("".join(all_thinking_tokens)),
+                },
+            )
+
+        # Finalize chain span
+        set_span_attributes(
+            chain_span,
+            {
+                "output.value": f"stream finished: {chunk_event_count} chunks",
+                "output.mime_type": "text/plain",
+                "freeform.finish_reason": "stop" if chunk_event_count > 0 else "empty",
+                "llm.token_count.prompt": prompt_token_est,
+                "llm.token_count.completion": completion_token_est,
+                "llm.token_count.total": prompt_token_est + completion_token_est,
+            },
+        )
 
     yield "event: complete\ndata: {}\n\n"
 
@@ -1333,3 +1505,34 @@ async def get_chunk_detail(source_id: str, chunk_id: str):
             status_code=500,
             content=http_error_body("INTERNAL", f"Chunk detail failed: {exc}"),
         )
+
+
+# ---------------------------------------------------------------------------
+# User Feedback Annotations (Phoenix)
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    span_id: str
+    trace_id: str
+    label: str  # e.g. "👍", "👎"
+    score: Optional[float] = None  # 1.0 = positive, 0.0 = negative
+    comment: Optional[str] = None
+
+
+@app.post("/api/feedback")
+async def post_feedback(feedback: FeedbackRequest):
+    """Log user feedback as a Phoenix annotation on a specific span."""
+    ok = annotate_span_feedback(
+        span_id=feedback.span_id,
+        trace_id=feedback.trace_id,
+        label=feedback.label,
+        score=feedback.score,
+        comment=feedback.comment,
+    )
+    if ok:
+        return {"status": "ok", "message": "Feedback recorded"}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "unavailable", "message": "Phoenix annotation unavailable (arize-phoenix not installed or Phoenix unreachable)"},
+    )

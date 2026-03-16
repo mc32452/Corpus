@@ -10,6 +10,8 @@ import {
   Loader2Icon,
   MicIcon,
   SquareIcon,
+  ThumbsUpIcon,
+  ThumbsDownIcon,
 } from "lucide-react";
 import {
   PickerRoot,
@@ -103,11 +105,13 @@ async function* freeformStreaming(
   model: string,
   signal: AbortSignal,
   enableThinking: boolean = false,
+  sessionId?: string,
 ): AsyncGenerator<{ event: string; data: string }, void, unknown> {
   const body = JSON.stringify({
     messages: messages.map((m) => ({ role: m.role, content: m.content })),
     model,
     enable_thinking: enableThinking,
+    session_id: sessionId,
   });
 
   const res = await fetch(`${BACKEND_BASE}/api/freeform/chat`, {
@@ -207,6 +211,7 @@ export function FreeformChatPanel({
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [feedbackState, setFeedbackState] = useState<Record<string, "up" | "down" | null>>({});
   const [selectedModel, setSelectedModel] = useState("regular");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [thinkingEnabled, setThinkingEnabled] = useState(false);
@@ -419,8 +424,22 @@ export function FreeformChatPanel({
           selectedModel,
           controller.signal,
           thinkingEnabled,
+          sessionIdRef.current,
         )) {
-          if (event === "thinking_token") {
+          if (event === "trace_id") {
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.trace_id) {
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantId
+                      ? { ...m, traceId: parsed.trace_id, spanId: parsed.span_id || "" }
+                      : m
+                  ),
+                );
+              }
+            } catch { /* skip */ }
+          } else if (event === "thinking_token") {
             try {
               const parsed = JSON.parse(data);
               const token = typeof parsed.text === "string" ? parsed.text : "";
@@ -447,18 +466,20 @@ export function FreeformChatPanel({
               updateTimerRef.current = null;
             }
             const finalText = streamingTextRef.current;
-            const finalMessages = nextMessages.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    content: finalText,
-                    thinkingContent: thinkingTextRef.current || undefined,
-                    timestamp: Date.now(),
-                  }
-                : m,
-            );
-            setMessages(finalMessages);
-            saveCurrentSession(finalMessages);
+            setMessages((prev) => {
+              const final = prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      content: finalText,
+                      thinkingContent: thinkingTextRef.current || undefined,
+                      timestamp: Date.now(),
+                    }
+                  : m,
+              );
+              saveCurrentSession(final);
+              return final;
+            });
           }
         }
       } catch (err) {
@@ -598,7 +619,7 @@ export function FreeformChatPanel({
               )}
 
               {!isPlaceholder && message.content && (
-                <div className="mt-1 ml-2 flex">
+                <div className="mt-1 ml-2 flex gap-0.5">
                   <button
                     type="button"
                     onClick={() => copyToClipboard(message.id, message.content)}
@@ -610,6 +631,62 @@ export function FreeformChatPanel({
                     ) : (
                       <CopyIcon className="size-3.5" />
                     )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const newState = feedbackState[message.id] === "up" ? null : "up";
+                      setFeedbackState((prev) => ({ ...prev, [message.id]: newState }));
+                      if (newState && message.traceId) {
+                        fetch(`${BACKEND_BASE}/api/feedback`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            span_id: message.spanId,
+                            trace_id: message.traceId,
+                            label: "👍",
+                            score: 1.0,
+                          }),
+                        }).catch(() => {});
+                      }
+                    }}
+                    className={cn(
+                      "inline-flex items-center rounded-md px-2 py-1 text-xs transition-colors",
+                      feedbackState[message.id] === "up"
+                        ? "text-green-400 bg-green-400/10"
+                        : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    )}
+                    title="Good response"
+                  >
+                    <ThumbsUpIcon className="size-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const newState = feedbackState[message.id] === "down" ? null : "down";
+                      setFeedbackState((prev) => ({ ...prev, [message.id]: newState }));
+                      if (newState && message.traceId) {
+                        fetch(`${BACKEND_BASE}/api/feedback`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            span_id: message.spanId,
+                            trace_id: message.traceId,
+                            label: "👎",
+                            score: 0.0,
+                          }),
+                        }).catch(() => {});
+                      }
+                    }}
+                    className={cn(
+                      "inline-flex items-center rounded-md px-2 py-1 text-xs transition-colors",
+                      feedbackState[message.id] === "down"
+                        ? "text-red-400 bg-red-400/10"
+                        : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    )}
+                    title="Poor response"
+                  >
+                    <ThumbsDownIcon className="size-3.5" />
                   </button>
                 </div>
               )}
