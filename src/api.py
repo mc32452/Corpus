@@ -362,15 +362,14 @@ async def geocode_forward(
 
 @app.get("/api/geocode/near")
 async def geocode_near(
-    lat: float,
-    lon: float,
-    radius_km: float = 50.0,
+    lat: float = Query(..., ge=-90.0, le=90.0),
+    lon: float = Query(..., ge=-180.0, le=180.0),
+    radius_km: float = Query(50.0, ge=0.0, le=1_000.0),
     limit: int = 50,
 ) -> dict:
     """Find canonical places near a coordinate using offline geocoder KDTree."""
     from .geocoder import get_geocoder
 
-    radius_km = min(radius_km, 1_000.0)
     limit = min(limit, 200)
 
     geocoder = get_geocoder()
