@@ -35,7 +35,9 @@ from .metrics import (
     compute_reranker_stats,
 )
 from .phoenix_tracing import (
+    SPAN_KIND_RERANKER,
     SPAN_KIND_RETRIEVER,
+    set_reranker_documents,
     set_retrieval_documents,
     set_span_attributes,
     start_span,
@@ -799,14 +801,22 @@ class RetrievalEngine:
             with start_span(
                 self._tracer,
                 "retrieval.stage.rerank",
-                span_kind=SPAN_KIND_RETRIEVER,
+                span_kind=SPAN_KIND_RERANKER,
             ) as stage_span:
+                # Build input documents for RERANKER span before reranking
+                input_docs_for_span = self._build_retrieval_documents_from_items(
+                    fused[:k_rerank], limit=k_rerank, max_content_chars=220,
+                )
                 reranked, raw_scores = self._stage_rerank(
                     query,
                     fused,
                     k_rerank,
                     reranker_enabled,
                     timing,
+                )
+                # Build output documents for RERANKER span after reranking
+                output_docs_for_span = self._build_retrieval_documents_from_items(
+                    reranked, limit=k_rerank, max_content_chars=220,
                 )
                 rerank_min = min(raw_scores) if raw_scores else 0.0
                 rerank_max = max(raw_scores) if raw_scores else 0.0
@@ -822,6 +832,13 @@ class RetrievalEngine:
                         "rag.rerank.score_max": rerank_max,
                         "rag.rerank.score_mean": rerank_mean,
                     },
+                )
+                set_reranker_documents(
+                    stage_span,
+                    input_documents=input_docs_for_span,
+                    output_documents=output_docs_for_span,
+                    query=query,
+                    top_k=k_rerank,
                 )
             all_reranked = list(reranked)
 

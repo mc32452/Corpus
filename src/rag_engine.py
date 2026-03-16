@@ -1704,6 +1704,11 @@ class RagEngine:
                         yield FinishEvent(finish_reason="error")
                         return
                     chunk_event_count += 1
+                    if chunk_event_count == 1 and generation_span is not None:
+                        try:
+                            generation_span.add_event("first_token")
+                        except Exception:
+                            pass
                     if event["type"] == "answer":
                         answer_tokens.append(event["text"])
                         yield TextTokenEvent(token=event["text"])
@@ -1732,8 +1737,19 @@ class RagEngine:
                         yield FinishEvent(finish_reason="error")
                         return
                     chunk_event_count += 1
+                    if chunk_event_count == 1 and generation_span is not None:
+                        try:
+                            generation_span.add_event("first_token")
+                        except Exception:
+                            pass
                     answer_tokens.append(token)
                     yield TextTokenEvent(token=token)
+
+            if generation_span is not None:
+                try:
+                    generation_span.add_event("stream_complete")
+                except Exception:
+                    pass
 
             answer_text = "".join(answer_tokens)
             completion_token_count = count_tokens(answer_text, generator.tokenizer)

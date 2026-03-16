@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 OPENINFERENCE_SPAN_KIND = "openinference.span.kind"
 SPAN_KIND_CHAIN = "CHAIN"
 SPAN_KIND_RETRIEVER = "RETRIEVER"
+SPAN_KIND_RERANKER = "RERANKER"
 SPAN_KIND_LLM = "LLM"
 SPAN_KIND_EMBEDDING = "EMBEDDING"
 SPAN_KIND_TOOL = "TOOL"
@@ -385,6 +386,52 @@ def set_retrieval_documents(
             set_span_attribute(span, f"{prefix}.{key}", value, max_text_chars=max_text_chars)
 
 
+def set_reranker_documents(
+    span: Any,
+    *,
+    input_documents: list[dict[str, Any]],
+    output_documents: list[dict[str, Any]],
+    query: Optional[str] = None,
+    top_k: Optional[int] = None,
+    max_text_chars: int = 4096,
+) -> None:
+    """Emit OpenInference RERANKER attributes: input/output documents, query, top_k."""
+
+    if span is None:
+        return
+
+    if query is not None:
+        set_span_attribute(span, "reranker.query", query, max_text_chars=max_text_chars)
+    if top_k is not None:
+        set_span_attribute(span, "reranker.top_k", int(top_k))
+
+    # Emit root array for UI parsing
+    if input_documents:
+        docs_json = [to_json(doc) if isinstance(doc, dict) else str(doc) for doc in input_documents]
+        set_span_attribute(span, "reranker.input_documents", docs_json, max_text_chars=max_text_chars)
+
+    # Emit flattened reranker.input_documents.{i}.document.* keys
+    for index, doc in enumerate(input_documents):
+        if not isinstance(doc, dict):
+            continue
+        prefix = f"reranker.input_documents.{index}"
+        for key, value in doc.items():
+            set_span_attribute(span, f"{prefix}.{key}", value, max_text_chars=max_text_chars)
+
+    # Emit root array for UI parsing
+    if output_documents:
+        docs_json = [to_json(doc) if isinstance(doc, dict) else str(doc) for doc in output_documents]
+        set_span_attribute(span, "reranker.output_documents", docs_json, max_text_chars=max_text_chars)
+
+    # Emit flattened reranker.output_documents.{i}.document.* keys
+    for index, doc in enumerate(output_documents):
+        if not isinstance(doc, dict):
+            continue
+        prefix = f"reranker.output_documents.{index}"
+        for key, value in doc.items():
+            set_span_attribute(span, f"{prefix}.{key}", value, max_text_chars=max_text_chars)
+
+
 def set_llm_input_messages(
     span: Any,
     messages: list[dict[str, Any]],
@@ -492,3 +539,61 @@ def to_json(value: Any) -> str:
     """JSON helper for span attributes and structured diagnostics."""
 
     return json.dumps(value, ensure_ascii=True)
+
+
+def annotate_span_feedback(
+    *,
+    span_id: str,
+    trace_id: str,
+    label: str,
+    score: Optional[float] = None,
+    comment: Optional[str] = None,
+    annotator: str = "user",
+) -> bool:
+    """Attach a user feedback annotation to a span in Phoenix.
+
+    Requires ``arize-phoenix`` (not just ``arize-phoenix-otel``).
+    Returns True on success, False if the package is unavailable or the call fails.
+    """
+    try:
+        import phoenix as px  # type: ignore[import-untyped]
+        from phoenix.trace.span_evaluations import SpanEvaluations  # type: ignore[import-untyped]
+    except ImportError:
+        logger.debug("arize-phoenix not installed — cannot annotate spans")
+        return False
+
+    try:
+        from urllib.parse import urlparse
+
+        settings = resolve_phoenix_tracing_settings()
+        base_endpoint = "http://127.0.0.1:6006"
+        ep = settings.endpoint
+        if isinstance(ep, str):
+            try:
+                parsed = urlparse(ep)
+                if parsed.scheme and parsed.netloc:
+                    base_endpoint = f"{parsed.scheme}://{parsed.netloc}"
+            except Exception:
+                pass
+
+        client = px.Client(endpoint=base_endpoint)
+        import pandas as pd  # type: ignore[import-untyped]
+
+        df = pd.DataFrame(
+            [
+                {
+                    "span_id": span_id,
+                    "label": label,
+                    "score": score,
+                    "explanation": comment or "",
+                }
+            ]
+        ).set_index("span_id")
+        
+        evals = SpanEvaluations(eval_name="user-feedback", dataframe=df)
+        client.log_evaluations(evals)
+        logger.info("Phoenix annotation logged: span_id=%s label=%s", span_id, label)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to annotate span in Phoenix: %s", exc)
+        return False

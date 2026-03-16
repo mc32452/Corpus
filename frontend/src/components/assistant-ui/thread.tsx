@@ -42,6 +42,8 @@ import {
   PencilIcon,
   RefreshCwIcon,
   SquareIcon,
+  ThumbsUpIcon,
+  ThumbsDownIcon,
 } from "lucide-react";
 import { type FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -498,6 +500,7 @@ const AssistantActionBar: FC = () => {
     }, ""),
   );
   const [isCleanlyCopied, setIsCleanlyCopied] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<"up" | "down" | null>(null);
 
   const handleCleanCopy = useCallback(() => {
     // Strip [N] citation markers and collapse any resulting double spaces
@@ -528,6 +531,26 @@ const AssistantActionBar: FC = () => {
             <RefreshCwIcon />
           </TooltipIconButton>
         </ActionBarPrimitive.Reload>
+      )}
+      {!isRunning && (
+        <TooltipIconButton
+          tooltip="Good response"
+          side="top"
+          onClick={() => setFeedbackState((prev) => (prev === "up" ? null : "up"))}
+          className={feedbackState === "up" ? "text-green-400" : undefined}
+        >
+          <ThumbsUpIcon />
+        </TooltipIconButton>
+      )}
+      {!isRunning && (
+        <TooltipIconButton
+          tooltip="Poor response"
+          side="top"
+          onClick={() => setFeedbackState((prev) => (prev === "down" ? null : "down"))}
+          className={feedbackState === "down" ? "text-red-400" : undefined}
+        >
+          <ThumbsDownIcon />
+        </TooltipIconButton>
       )}
       <MessageTimingBadge />
       {!isRunning && (

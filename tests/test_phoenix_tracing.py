@@ -8,6 +8,7 @@ from src.phoenix_tracing import (
     set_llm_input_messages,
     set_llm_output_message,
     set_llm_token_counts,
+    set_reranker_documents,
     set_retrieval_documents,
     set_span_attributes,
     start_span,
@@ -116,3 +117,32 @@ def test_set_llm_messages_and_token_counts_emit_flattened_fields() -> None:
     assert span.attrs["llm.token_count.prompt"] == 123
     assert span.attrs["llm.token_count.completion"] == 45
     assert span.attrs["llm.token_count.total"] == 168
+
+
+def test_set_reranker_documents_emits_array_and_flattened_keys() -> None:
+    span = _DummySpan()
+    input_docs = [{"document.id": "in-1", "document.score": 0.5}]
+    output_docs = [{"document.id": "out-1", "document.score": 0.9}]
+
+    set_reranker_documents(
+        span,
+        input_documents=input_docs,
+        output_documents=output_docs,
+        query="test query",
+        top_k=5,
+    )
+
+    assert span.attrs["reranker.query"] == "test query"
+    assert span.attrs["reranker.top_k"] == 5
+
+    # Check root arrays
+    in_arr = span.attrs.get("reranker.input_documents")
+    assert isinstance(in_arr, list)
+    assert '"document.id": "in-1"' in in_arr[0]
+    out_arr = span.attrs.get("reranker.output_documents")
+    assert isinstance(out_arr, list)
+    assert '"document.id": "out-1"' in out_arr[0]
+
+    # Check flattened keys
+    assert span.attrs["reranker.input_documents.0.document.id"] == "in-1"
+    assert span.attrs["reranker.output_documents.0.document.id"] == "out-1"
