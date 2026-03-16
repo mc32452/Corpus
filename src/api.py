@@ -388,13 +388,16 @@ async def geocode_near(
 
 
 @app.get("/api/geocode/reverse")
-async def geocode_reverse(lat: float, lon: float, k: int = 3) -> dict:
+async def geocode_reverse(
+    lat: float,
+    lon: float,
+    k: int = Query(3, ge=1, le=10),
+) -> dict:
     """Reverse geocode coordinates to nearest canonical places."""
     from .geocoder import get_geocoder
 
     geocoder = get_geocoder()
 
-    k = min(k, 10)
     results = geocoder.reverse(lat, lon, k=k)
     if not geocoder.is_available():
         raise HTTPException(503, detail="Geocoder not ready. Check /api/geo/status.")
