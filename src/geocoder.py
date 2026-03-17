@@ -777,16 +777,27 @@ class OfflineGeocoder:
                 gids, key=lambda g: self.places_by_id[g].population
             )
 
-        # Nothing to cross-reference with a single mention
         if len(candidates) <= 1:
             return pop_best
 
         # ── Pass 2: re-score ambiguous names with coherence ───────
         result: dict[str, int] = {}
         for name, gids in candidates.items():
-            # Unambiguous — keep as-is
             if len(gids) == 1:
                 result[name] = gids[0]
+                continue
+
+            # If one candidate dominates by population, trust it outright.
+            # Coherence should only break genuine ties, not override a clear winner.
+            pop_sorted = sorted(
+                gids, key=lambda g: self.places_by_id[g].population, reverse=True
+            )
+            top_pop = self.places_by_id[pop_sorted[0]].population
+            second_pop = self.places_by_id[pop_sorted[1]].population if len(pop_sorted) > 1 else 0
+
+            # >5x gap = clear winner; skip coherence entirely
+            if top_pop > max(second_pop, 1) * 5:
+                result[name] = pop_sorted[0]
                 continue
 
             # Anchor set = pass-1 picks for every OTHER mention
@@ -798,20 +809,13 @@ class OfflineGeocoder:
 
             def _score(gid: int) -> float:
                 p = self.places_by_id[gid]
-
-                # Population remains the dominant signal (sqrt-scaled)
                 s = math.sqrt(max(p.population, 1))
-
-                # Coherence: multiply by a bonus based on mean distance
-                # to anchors.  Close to the cluster → up to +50%.
-                # Far from the cluster → no bonus, but no penalty either.
                 if anchors:
                     mean_dist = sum(
                         haversine_km(p.lat, p.lon, alat, alon)
                         for alat, alon in anchors
                     ) / len(anchors)
                     s *= 1.0 + 0.5 * math.exp(-mean_dist / 500.0)
-
                 return s
 
             result[name] = max(gids, key=_score)
@@ -1129,18 +1133,94 @@ class OfflineGeocoder:
         threshold: int = _DEFAULT_THRESHOLD,
         entity_types: list[str | None] | None = None,
     ) -> list[GeoMatch | None]:
-        """Batch forward-geocode with shared context and deduplication."""
+        """Batch forward-geocode with coherence-aware disambiguation across all names."""
         if not self._ensure_loaded():
             return [None] * len(place_names)
 
         if entity_types is None:
             entity_types = [None] * len(place_names)
 
-        all_ctx = tuple(re.findall(r"[A-Z][a-zA-Z]{2,}", query))
+        # Step 1: raw core lookup for every name (cached, context-free)
+        normalized = [_normalize_query(n) for n in place_names]
+        raws = [
+            self._forward_cached(q, threshold) if q else None
+            for q in normalized
+        ]
+
+        # Step 2: collect all ambiguous names into a single batch
+        # so _disambiguate_batch can use coherence across all of them at once
+        batch_candidates: dict[str, list[int]] = {}
+        for q, raw in zip(normalized, raws):
+            if raw is None or not raw.ambiguous:
+                continue
+            if raw.method == GeoMethod.EXACT:
+                gids = self.alias_to_ids.get(q, [])[:10]
+            else:
+                gids = [raw.place.geonameid] + [c.geonameid for c in raw.candidates]
+            if len(gids) > 1:
+                batch_candidates[q] = gids
+
+        # Step 3: single coherence pass across ALL ambiguous names together
+        batch_resolved: dict[str, int] = (
+            self._disambiguate_batch(batch_candidates) if batch_candidates else {}
+        )
+
+        # Step 4: build final results with confidence
         results: list[GeoMatch | None] = []
-        for name, etype in zip(place_names, entity_types):
-            ctx = tuple(w for w in all_ctx if w.lower() not in name.lower())
-            results.append(self.forward(name, threshold, ctx, etype))
+        for q, raw, etype in zip(normalized, raws, entity_types):
+            if raw is None:
+                results.append(
+                    self._resolve_country(q, (), etype) if q else None
+                )
+                continue
+
+            # Use batch-resolved place if available, otherwise raw winner
+            place = (
+                self.places_by_id[batch_resolved[q]]
+                if q in batch_resolved
+                else raw.place
+            )
+
+            # Hardened filters (fuzzy path only)
+            if USE_HARDENED_GEOCODER and raw.method == GeoMethod.TRIGRAM_FUZZY:
+                floor = max(float(_DEFAULT_THRESHOLD), float(GEOTAG_FUZZY_SCORE_FLOOR))
+                if raw.score < floor:
+                    results.append(None)
+                    continue
+                if (
+                    raw.candidate_count >= 2
+                    and raw.margin_score is not None
+                    and raw.margin_score < GEOTAG_FUZZY_MARGIN_THRESHOLD
+                ):
+                    results.append(None)
+                    continue
+                if self._is_generic_place_like(q) and raw.score < 90.0:
+                    results.append(None)
+                    continue
+
+            conf = self._compute_confidence(
+                score=raw.score,
+                method=raw.method,
+                ambiguous=raw.ambiguous,
+                query=q,
+                entity_type=etype,
+                candidate_count=raw.candidate_count,
+                margin_score=raw.margin_score,
+            )
+
+            results.append(GeoMatch(
+                place=place,
+                score=raw.score,
+                matched_on=raw.matched_on,
+                method=raw.method,
+                ambiguous=raw.ambiguous,
+                candidates=raw.candidates,
+                confidence_value=conf,
+                candidate_count=raw.candidate_count,
+                margin_score=raw.margin_score,
+                entity_type=etype,
+            ))
+
         return results
 
     def resolve_all(

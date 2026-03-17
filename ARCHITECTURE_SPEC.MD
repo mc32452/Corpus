@@ -94,8 +94,8 @@ Unified LanceDB-backed storage managing four table types:
 |-----------|-------|
 | Parent target tokens | 1,200 (min 1,000, max 1,500) |
 | Parent overlap tokens | 150 |
-| Child target tokens | 250 (min 200, max 300) |
-| Child overlap tokens | 50 |
+| Child target tokens | 200 (min 120, max 250) |
+| Child overlap tokens | 40 |
 | Child overlap sentences | 2 |
 | Summary context char limit | 12,000 |
 

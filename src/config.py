@@ -86,7 +86,7 @@ def _env_int(name: str, default: int, *, low: int | None = None, high: int | Non
 
 
 # Geotag and geocoder hardening knobs
-GEOTAG_MIN_CONFIDENCE: float = _env_float("GEOTAG_MIN_CONFIDENCE", 0.75, low=0.0, high=1.0)
+GEOTAG_MIN_CONFIDENCE: float = _env_float("GEOTAG_MIN_CONFIDENCE", 0.5, low=0.0, high=1.0)
 GEOTAG_FUZZY_THRESHOLD: int = _env_int("GEOTAG_FUZZY_THRESHOLD", 75, low=0, high=100)
 GEOTAG_FUZZY_SCORE_FLOOR: int = _env_int("GEOTAG_FUZZY_SCORE_FLOOR", 78, low=0, high=100)
 GEOTAG_FUZZY_MARGIN_THRESHOLD: float = _env_float("GEOTAG_FUZZY_MARGIN_THRESHOLD", 4.0, low=0.0)

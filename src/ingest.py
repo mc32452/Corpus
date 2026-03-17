@@ -65,10 +65,10 @@ PARENT_MAX_TOKENS = 1500
 PARENT_TARGET_TOKENS = 1200
 PARENT_OVERLAP_TOKENS = 150
 
-CHILD_MIN_TOKENS = 200
-CHILD_MAX_TOKENS = 300
-CHILD_TARGET_TOKENS = 250
-CHILD_OVERLAP_TOKENS = 50
+CHILD_MIN_TOKENS = 120
+CHILD_MAX_TOKENS = 250
+CHILD_TARGET_TOKENS = 200
+CHILD_OVERLAP_TOKENS = 40
 CHILD_OVERLAP_SENTENCES = 2
 
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -160,23 +160,40 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _split_long_sentence_on_clause(sentence: str, target_tokens: int) -> list[str]:
-    if _token_count(sentence) <= max(1, int(target_tokens * 0.4)):
+    """Recursively split a single long sentence into smaller units.
+    
+    Tries to split at midpoint clause boundaries (comma, semicolon, conjunctions).
+    If no clause boundary is found and the sentence is still too long, falls
+    back to a forced split by word count to ensure GLiNER token limits are met.
+    """
+    total_tokens = _token_count(sentence)
+    if total_tokens <= target_tokens:
         return [sentence]
 
     boundary_matches = list(CLAUSE_BOUNDARY_RE.finditer(sentence))
-    if not boundary_matches:
-        return [sentence]
+    split_index: int | None = None
 
-    midpoint = len(sentence) / 2
-    best = min(boundary_matches, key=lambda match: abs(match.start() - midpoint))
-    split_index = best.start() + 1 if sentence[best.start()] in {",", ";"} else best.start()
+    if boundary_matches:
+        midpoint = len(sentence) / 2
+        best = min(boundary_matches, key=lambda match: abs(match.start() - midpoint))
+        split_index = best.start() + 1 if sentence[best.start()] in {",", ";"} else best.start()
+    elif total_tokens > int(target_tokens * 1.2):
+        # Fallback: force split at word midpoint if no elegant boundary exists
+        words = _tokenize(sentence)
+        mid_word = len(words) // 2
+        left_text = _detokenize(words[:mid_word])
+        split_index = len(left_text)
+
+    if split_index is None:
+        return [sentence]
 
     left = sentence[:split_index].strip()
     right = sentence[split_index:].strip()
     if not left or not right:
         return [sentence]
 
-    return [left, right]
+    # Recursively split both halves if they remain too long
+    return _split_long_sentence_on_clause(left, target_tokens) + _split_long_sentence_on_clause(right, target_tokens)
 
 
 def _parse_markdown_sections(text: str) -> list[_Section]:
@@ -623,64 +640,72 @@ def _geotag_chunks(
         mentions: list[dict] = []
         seen: set[tuple[int, str]] = set()
 
+        # Flatten all candidates across all chunks so the geocoder can use
+        # coherence across the whole document in one batch call
+        flat_candidates: list[tuple[ChildChunk, dict]] = []
         for chunk, place_candidates in zip(child_chunks, ner_lists):
             for candidate in place_candidates:
                 normalized = str(candidate.get("text", "")).strip()
-                if not normalized:
-                    continue
+                if normalized:
+                    flat_candidates.append((chunk, candidate))
 
-                context_words = tuple(
-                    word.strip()
-                    for word in candidate.get("context_words", [])
-                    if isinstance(word, str) and word.strip()
-                )
-                entity_type_raw = candidate.get("entity_type")
-                entity_type = str(entity_type_raw).upper().strip() if entity_type_raw else None
+        place_names = [str(c.get("text", "")).strip() for _, c in flat_candidates]
+        entity_types = [
+            str(c.get("entity_type", "")).upper().strip() or None
+            for _, c in flat_candidates
+        ]
 
-                match = geocoder.forward(
-                    normalized,
-                    threshold=GEOTAG_FUZZY_THRESHOLD,
-                    context_words=context_words,
-                    entity_type=entity_type,
-                )
-                if match is None:
-                    continue
-                if match.confidence < GEOTAG_MIN_CONFIDENCE:
-                    continue
-                key = (match.place.geonameid, chunk.id)
-                if key in seen:
-                    continue
-                seen.add(key)
+        # TEMP DEBUG
+        logger.warning("DEBUG geo place_names: %s", place_names)
 
-                ner_score_raw = candidate.get("score", 0.0)
-                try:
-                    ner_score = float(ner_score_raw)
-                except (TypeError, ValueError):
-                    ner_score = 0.0
+        batch_results = geocoder.forward_batch(
+            place_names,
+            threshold=GEOTAG_FUZZY_THRESHOLD,
+            entity_types=entity_types,
+        )
 
-                mentions.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "source_id": source_id,
-                        "chunk_id": chunk.id,
-                        "place_name": match.place.name,
-                        "matched_input": normalized,
-                        "geonameid": match.place.geonameid,
-                        "lat": match.place.lat,
-                        "lon": match.place.lon,
-                        "confidence": round(match.confidence, 4),
-                        "method": match.method.value,
-                        "matched_on": match.matched_on,
-                        "raw_score": round(float(match.score), 4),
-                        "is_ambiguous": bool(match.ambiguous),
-                        "candidate_count": int(match.candidate_count),
-                        "margin_score": None if match.margin_score is None else round(float(match.margin_score), 4),
-                        "entity_type": entity_type,
-                        "ner_score": round(ner_score, 4),
-                        "geocoder_version": geocoder_version,
-                        "geocoded_at": geocoded_at,
-                    }
-                )
+        for (chunk, candidate), match in zip(flat_candidates, batch_results):
+            if match is None:
+                continue
+            if match.confidence < GEOTAG_MIN_CONFIDENCE:
+                continue
+            key = (match.place.geonameid, chunk.id)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            normalized = str(candidate.get("text", "")).strip()
+            entity_type = str(candidate.get("entity_type", "")).upper().strip() or None
+
+            ner_score_raw = candidate.get("score", 0.0)
+            try:
+                ner_score = float(ner_score_raw)
+            except (TypeError, ValueError):
+                ner_score = 0.0
+
+            mentions.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "source_id": source_id,
+                    "chunk_id": chunk.id,
+                    "place_name": match.place.name,
+                    "matched_input": normalized,
+                    "geonameid": match.place.geonameid,
+                    "lat": match.place.lat,
+                    "lon": match.place.lon,
+                    "confidence": round(match.confidence, 4),
+                    "method": match.method.value,
+                    "matched_on": match.matched_on,
+                    "raw_score": round(float(match.score), 4),
+                    "is_ambiguous": bool(match.ambiguous),
+                    "candidate_count": int(match.candidate_count),
+                    "margin_score": None if match.margin_score is None else round(float(match.margin_score), 4),
+                    "entity_type": entity_type,
+                    "ner_score": round(ner_score, 4),
+                    "geocoder_version": geocoder_version,
+                    "geocoded_at": geocoded_at,
+                }
+            )
 
         if mentions:
             storage.upsert_geo_mentions(mentions)
@@ -749,17 +774,17 @@ def _peopletag_chunks(
                 start = max(0, start)
                 end = max(start, min(len(chunk.text), end))
 
-                key = (chunk.id, raw_name.lower(), start, end)
-                if key in seen:
-                    continue
-                seen.add(key)
-
                 context_words = [
                     word.strip()
                     for word in candidate.get("context_words", [])
                     if isinstance(word, str) and word.strip()
                 ]
                 snippet = _context_snippet(chunk.text, start, end)
+
+                key = (source_id, raw_name.lower(), snippet)
+                if key in seen:
+                    continue
+                seen.add(key)
 
                 resolved = resolver.resolve(
                     raw_name=raw_name,

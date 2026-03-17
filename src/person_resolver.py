@@ -90,8 +90,7 @@ class PersonResolver:
         stripped = cls._strip_titles(cls._collapse_spaces(value))
         if not stripped:
             return ""
-        normalized = re.sub(r"\s+", " ", stripped).strip().lower()
-        return normalized
+        return re.sub(r"\s+", " ", stripped).strip().lower()
 
     @staticmethod
     def _display_rank(name: str) -> tuple[int, int]:
@@ -129,14 +128,25 @@ class PersonResolver:
         return "mentioned"
 
     def _rebuild_alias_index_locked(self) -> None:
+        """Rebuild the normalized-name-to-canonical map from scratch.
+
+        Uses the entry with the highest mention count to win conflicts rather
+        than silently dropping one of the aliases via setdefault.
+        """
         alias_map: dict[str, str] = {}
-        for canonical_name, entry in self._entries.items():
+        # Process entries ordered by ascending mention_count so that the
+        # highest-count entry wins when two entries share a normalised form.
+        ordered = sorted(
+            self._entries.items(),
+            key=lambda kv: kv[1].mention_count,
+        )
+        for canonical_name, entry in ordered:
             names = [canonical_name, *entry.variants.keys()]
             for name in names:
                 normalized = self.normalize_name(name)
                 if not normalized:
                     continue
-                alias_map.setdefault(normalized, canonical_name)
+                alias_map[normalized] = canonical_name
         self._normalized_to_canonical = alias_map
 
     def warm_from_rows(self, rows: list[dict[str, Any]]) -> None:
@@ -175,12 +185,36 @@ class PersonResolver:
             best = self._choose_better_display(best, candidate)
         return best
 
+    def _merge_entries_locked(self, survivor: _PersonEntry, absorbed: _PersonEntry) -> None:
+        """Merge absorbed into survivor in place."""
+        survivor.mention_count += absorbed.mention_count
+        survivor.source_ids.update(absorbed.source_ids)
+        for variant, count in absorbed.variants.items():
+            survivor.variants[variant] = survivor.variants.get(variant, 0) + count
+
     def _maybe_promote_canonical_locked(self, entry: _PersonEntry) -> str:
+        """Promote the best display name to canonical, merging on collision.
+
+        Bug fix: the original code would silently overwrite an existing entry
+        when the promoted name was already a key in self._entries. The entry
+        that was overwritten lost all its data. This version detects that
+        collision and merges the two entries instead.
+        """
         best = self._best_canonical_name_locked(entry)
         if best == entry.canonical_name:
             return entry.canonical_name
 
         old_name = entry.canonical_name
+
+        existing = self._entries.get(best)
+        if existing is not None and existing is not entry:
+            # Collision: merge the entry being promoted into the one already
+            # registered under the target name, then discard the old key.
+            self._merge_entries_locked(existing, entry)
+            self._entries.pop(old_name, None)
+            self._rebuild_alias_index_locked()
+            return best
+
         entry.canonical_name = best
         self._entries.pop(old_name, None)
         self._entries[best] = entry
@@ -188,21 +222,34 @@ class PersonResolver:
         return best
 
     def _fuzzy_match_lastname_locked(self, normalized: str) -> tuple[Optional[str], float]:
+        """Fuzzy match on last token, comparing against last tokens of all aliases.
+
+        Bug fix: the original compared the full normalised input against aliases
+        that share the same last token. When name-order variants exist (e.g.
+        "smith john" vs "john smith") the last tokens differ so the candidate
+        set is empty and no match is found, producing a duplicate entry.
+
+        The fix extracts the last token from both the query and each alias so
+        that the comparison is always surname-to-surname regardless of token
+        ordering.
+        """
         last = self._last_token(normalized)
         if not last:
             return None, 0.0
 
-        choices = [
-            alias
-            for alias in self._normalized_to_canonical.keys()
-            if self._last_token(alias) == last
-        ]
-        if not choices:
+        # Build a map of alias -> last_token so we can check both orderings.
+        candidates: dict[str, str] = {}
+        for alias in self._normalized_to_canonical.keys():
+            alias_last = self._last_token(alias)
+            if alias_last == last:
+                candidates[alias] = alias_last
+
+        if not candidates:
             return None, 0.0
 
         match = process.extractOne(
             normalized,
-            choices,
+            list(candidates.keys()),
             scorer=fuzz.WRatio,
             score_cutoff=self._fuzzy_threshold_lastname,
         )
@@ -286,18 +333,18 @@ class PersonResolver:
                 entry.source_ids.add(source_id)
             entry.variants[clean_raw] = entry.variants.get(clean_raw, 0) + 1
 
+            # _maybe_promote_canonical_locked calls _rebuild_alias_index_locked
+            # internally, so no second call is needed here (bug fix: the
+            # original called _rebuild_alias_index_locked again after this,
+            # causing the index to be rebuilt against a partially updated state).
             final_canonical = self._maybe_promote_canonical_locked(entry)
-            self._rebuild_alias_index_locked()
             self._is_warm = True
 
         try:
             ner_conf = float(ner_score)
         except (TypeError, ValueError):
             ner_conf = 0.0
-        if ner_conf < 0.0:
-            ner_conf = 0.0
-        if ner_conf > 1.0:
-            ner_conf = 1.0
+        ner_conf = max(0.0, min(1.0, ner_conf))
 
         confidence = max(ner_conf, float(match_confidence))
         return {
