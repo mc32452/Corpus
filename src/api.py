@@ -475,6 +475,7 @@ async def get_geo_mentions(
             storage.get_geo_mentions,
             source_id=normalized_source_id or None,
             source_ids=effective_source_ids,
+            q=q,
             min_confidence=min_confidence,
             limit=limit,
             offset=offset,
@@ -1624,6 +1625,26 @@ async def _post_ingest_snapshot(
         logger.warning("Failed to update source paths for %s: %s", source_id, path_exc)
 
 
+def _to_ner_diagnostics_response(diag: object | None) -> Optional[NERDiagnosticsResponse]:
+    """Best-effort conversion from ingest diagnostics objects to API schema."""
+    if diag is None:
+        return None
+
+    method = getattr(diag, "method", None)
+    if method is None:
+        return None
+
+    ner_available_raw = getattr(diag, "ner_available", False)
+    warning_raw = getattr(diag, "warning", None)
+    warning_value = str(warning_raw) if warning_raw is not None else None
+
+    return NERDiagnosticsResponse(
+        ner_available=bool(ner_available_raw),
+        method=str(method),
+        warning=warning_value,
+    )
+
+
 @app.post("/api/sources/ingest", response_model=IngestResponse)
 async def ingest_source(request: IngestRequest):
     """Ingest a document (PDF or Markdown) into the RAG store.
@@ -1679,6 +1700,8 @@ async def ingest_source(request: IngestRequest):
             parents_count=result.parents_count,
             children_count=result.children_count,
             summarized=result.summarized,
+            geotag_ner=_to_ner_diagnostics_response(getattr(result, "geotag_ner", None)),
+            peopletag_ner=_to_ner_diagnostics_response(getattr(result, "peopletag_ner", None)),
         )
 
     except Exception as exc:
@@ -1825,6 +1848,8 @@ async def upload_source(
             parents_count=result.parents_count,
             children_count=result.children_count,
             summarized=result.summarized,
+            geotag_ner=_to_ner_diagnostics_response(getattr(result, "geotag_ner", None)),
+            peopletag_ner=_to_ner_diagnostics_response(getattr(result, "peopletag_ner", None)),
         )
 
     except Exception as exc:
