@@ -82,10 +82,10 @@ def test_canonical_promotion_prefers_more_informative_variant() -> None:
     assert "Chomsky" not in snapshot
 
 
-def test_role_inference_taxonomy() -> None:
-    assert PersonResolver.infer_role_hint(context_words=["written", "by"], context_snippet="written by John Doe") == "author"
-    assert PersonResolver.infer_role_hint(context_words=["according", "to"], context_snippet="according to John Doe") == "cited"
-    assert PersonResolver.infer_role_hint(context_words=["focuses", "on"], context_snippet="focuses on John Doe") == "subject"
+def test_role_inference_defaults_to_mentioned() -> None:
+    assert PersonResolver.infer_role_hint(context_words=["written", "by"], context_snippet="written by John Doe") == "mentioned"
+    assert PersonResolver.infer_role_hint(context_words=["according", "to"], context_snippet="according to John Doe") == "mentioned"
+    assert PersonResolver.infer_role_hint(context_words=["focuses", "on"], context_snippet="focuses on John Doe") == "mentioned"
     assert PersonResolver.infer_role_hint(context_words=[], context_snippet="") == "mentioned"
 
 

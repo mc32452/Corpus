@@ -31,10 +31,6 @@ _TITLE_TOKENS = {
     "gen",
 }
 
-_AUTHOR_RE = re.compile(r"\b(author|written\s+by|by\s+[A-Z][a-z])\b", re.IGNORECASE)
-_CITED_RE = re.compile(r"\b(cited|citation|according\s+to|references?)\b", re.IGNORECASE)
-_SUBJECT_RE = re.compile(r"\b(about|on\s+the\s+work\s+of|focuses\s+on|discusses)\b", re.IGNORECASE)
-
 
 @dataclass
 class _PersonEntry:
@@ -115,16 +111,7 @@ class PersonResolver:
 
     @staticmethod
     def infer_role_hint(*, context_words: list[str], context_snippet: str) -> str:
-        joined = " ".join(word for word in context_words if word).strip()
-        text = f"{joined} {context_snippet}".strip()
-        if not text:
-            return "mentioned"
-        if _AUTHOR_RE.search(text):
-            return "author"
-        if _CITED_RE.search(text):
-            return "cited"
-        if _SUBJECT_RE.search(text):
-            return "subject"
+        _ = context_words, context_snippet
         return "mentioned"
 
     def _rebuild_alias_index_locked(self) -> None:

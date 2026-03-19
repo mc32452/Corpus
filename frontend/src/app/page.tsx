@@ -35,9 +35,7 @@ export default function Page() {
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
 
   const clampMap = useCallback((v: number) => clamp(v, 0.5, 0.99, 0.75), []);
-  const clampPeople = useCallback((v: number) => clamp(v, 0.3, 0.99, 0.7), []);
   const [mapThreshold, setMapThreshold] = usePersistedState("dh-map-threshold-v1", 0.75, clampMap);
-  const [peopleThreshold, setPeopleThreshold] = usePersistedState("dh-people-threshold-v1", 0.7, clampPeople);
 
   // Debounced Map Threshold
   const [localMapThreshold, setLocalMapThreshold] = useState(mapThreshold);
@@ -273,9 +271,7 @@ export default function Page() {
             <PeopleDictionary
               active={isPeopleOpen}
               refreshNonce={peopleRefreshNonce}
-              threshold={peopleThreshold}
               sourceIds={selectedSourceIds}
-              onThresholdChange={(value) => setPeopleThreshold(value)}
             />
           </OverlayPanel>
         </main>
