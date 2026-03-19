@@ -43,6 +43,7 @@ Corpus runs entirely on your machine. Documents are ingested into a local vector
 | **Citation export** | Responses exportable as formatted footnotes or Harvard bibliography entries |
 | **Geospatial mapping** | Optional ingest-time place NER + offline geocoding, with clustered map markers filtered by source selection |
 | **People dictionary** | Optional ingest-time person NER + canonical name matching, with searchable mentions, merge tools, and document jump-to-context |
+| **Ingest NER diagnostics** | Ingest responses report whether GLiNER ran or a fallback path was used (`gliner`, `regex_fallback`, `empty`) so degraded indexing is visible |
 | **Phoenix tracing** | Optional OpenTelemetry tracing with trace/span ID propagation and in-UI feedback annotations |
 
 ---
@@ -503,12 +504,28 @@ curl -F "file=@paper.pdf" -F "source_id=my_paper" -F "summarize=true" -F "people
 # List grouped geo mentions for selected source(s)
 curl "http://127.0.0.1:8000/api/geo/mentions?min_confidence=0.75&source_ids=my_paper"
 
+# Filter geo mentions by search text (server-side, with safe fallback)
+curl "http://127.0.0.1:8000/api/geo/mentions?min_confidence=0.75&source_ids=my_paper&q=pari"
+
 # List canonical people for selected source(s)
 curl "http://127.0.0.1:8000/api/people?source_ids=my_paper"
+
+# Filter people list by canonical/raw name text
+curl "http://127.0.0.1:8000/api/people?source_ids=my_paper&q=foucault"
 
 # List mention rows for a canonical person
 curl "http://127.0.0.1:8000/api/people/mentions?canonical_name=Noam%20Chomsky&source_ids=my_paper"
 ```
+
+### Retrieval and ingest diagnostics notes
+
+- Retrieval now exposes two core knobs in runtime config (`src/config.py`):
+    - `bm25_weight` (default `0.5`): balances lexical BM25 vs vector scoring in LanceDB hybrid search.
+    - `use_hybrid` (default `true`): toggles hybrid retrieval on/off (`false` runs dense vector-only retrieval).
+- Ingest endpoints now return optional NER diagnostics fields:
+    - `geotag_ner`: diagnostics for place extraction.
+    - `peopletag_ner`: diagnostics for person extraction.
+- Diagnostics include `ner_available`, `method`, and optional `warning`, allowing the UI to flag degraded indexing without failing ingest.
 
 ### Phoenix Observability (Arize)
 

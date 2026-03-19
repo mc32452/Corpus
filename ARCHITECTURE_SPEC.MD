@@ -135,8 +135,13 @@ Text cleaning: `clean_ocr_artifacts()` merges hyphenated line breaks.
 - Persists canonicalized rows into `person_mentions` with method (`new`, `exact`, `fuzzy_last`, `fuzzy_full`) and context snippet
 - On re-ingest, deletes prior source rows first (`delete_person_mentions_by_source`) to prevent duplication
 
+**NER diagnostics propagation:**
+- Ingest now emits structured diagnostics for geotag and peopletag paths (`ner_available`, `method`, optional `warning`)
+- Method values identify execution path: `gliner`, `regex_fallback` (places), or `empty` (people fallback)
+- Diagnostics are returned from ingest, attached to `IngestResult`, and exposed through ingest API responses for frontend warning states
+
 **Shared NER optimization:**
-- When `geotag=True` and `peopletag=True`, ingest runs a single GLiNER pass via `extract_place_and_person_candidates_ner()` and fans out to `_geotag_chunks()` + `_peopletag_chunks()`
+- When `geotag=True` and `peopletag=True`, ingest runs a single GLiNER pass via `extract_place_and_person_candidates_ner_with_diagnostics()` and fans out to `_geotag_chunks()` + `_peopletag_chunks()`
 
 **Supported formats:** `.pdf`, `.md`, `.markdown`
 
@@ -191,6 +196,11 @@ query_text
 **Constants:**
 - `_WORD_TO_TOKEN_RATIO = 1.35` (BPE subword expansion correction)
 - `_ADAPTIVE_THRESHOLD_FACTOR = 0.15`
+
+**Runtime retrieval knobs:**
+- `bm25_weight` (default `0.5`): controls lexical-vs-vector weighting in LanceDB hybrid fusion
+- `use_hybrid` (default `True`): toggles hybrid retrieval; when `False`, retrieval runs dense vector-only search
+- LanceDB FTS tokenization remains backend-native; Hugging Face tokenizers are not injected into LanceDB FTS
 
 **Sub-threshold policies** (intent-driven backfill when starved for context):
 
@@ -347,7 +357,7 @@ Central orchestrator consumed by both CLI and API:
 Additional optional runtime overrides include `mode`, `model`, `summary_model`, `citations_enabled`, `verbose`, `latency`, and Phoenix tracing fields (`phoenix_enabled`, `phoenix_project_name`, `phoenix_endpoint`, `phoenix_api_key`, `phoenix_auto_instrument`, `phoenix_batch`).
 
 **Result types:**
-- `IngestResult` (frozen): `parents_count`, `children_count`, `source_id`, `summarized`
+- `IngestResult` (frozen): `parents_count`, `children_count`, `source_id`, `summarized`, `geotag_ner?`, `peopletag_ner?`
 - `QueryResult` (frozen): `answer`, `intent`, `citations_enabled`, `source_ids`, `retrieval_metrics`, `budget_metrics`, `latency_report`, `context`, `config`, `raw_answer`, `prompt_messages`
 
 **Key features:**
@@ -365,7 +375,7 @@ Additional optional runtime overrides include `mode`, `model`, `summary_model`, 
 - **Low-information query bypass:** Skips retrieval for gibberish/vague queries (via `is_low_information_query()`)
 - **Output sanitization:** `sanitize_output()` strips instruction leakage ("Important:", "Task:", "Format:", "Tone:"), chatter/filler phrases, deduplicates repeated halves (≥85% similarity via `SequenceMatcher`), truncates at incomplete sentences
 - **Citation normalization:** `_dedupe_citations_by_source_page()` collapses duplicate `(source_id, page_number)` citations and renumbers passage blocks to keep markers sequential
-- **Ingest enrichment propagation:** `ingest(..., geotag, peopletag)` supports place and person indexing, including single-pass shared NER when both are enabled
+- **Ingest enrichment propagation:** `ingest(..., geotag, peopletag)` supports place and person indexing, including single-pass shared NER when both are enabled and diagnostics propagation into ingest/API responses
 - **Hallucination detection:** `_check_novel_proper_nouns()` logs warning when >3 capitalized words in output are absent from retrieved context
 - **Offline mode:** `_enable_offline_if_cached()` sets `HF_HUB_OFFLINE=1` when all models are cached locally
 - **Metal cache management:** Explicit `mx.clear_cache()` to release GPU memory between phases
@@ -418,7 +428,7 @@ FastAPI application with SSE streaming support:
 | `/api/geocode` | GET | Forward geocode a place query against offline GeoNames index |
 | `/api/geocode/near` | GET | Nearby canonical places for `lat/lon` within `radius_km` |
 | `/api/geocode/reverse` | GET | Reverse geocode `lat/lon` to nearest canonical places |
-| `/api/geo/mentions` | GET | Grouped geocoded mentions with confidence/source filters |
+| `/api/geo/mentions` | GET | Grouped geocoded mentions with confidence/source filters and optional text query (`q`) |
 | `/api/geo/mentions/{mention_id}` | DELETE | Delete one persisted geo mention |
 | `/api/people` | GET | Canonical people list grouped from mention rows |
 | `/api/people/mentions` | GET | Mention-level rows for a canonical person |
@@ -438,6 +448,8 @@ FastAPI application with SSE streaming support:
 - `ChatRequest` -- supports AI SDK v3 (`content` string) and v6 (`parts` array) message formats
 - `QueryRequest` -- `query`, `mode`, `source_ids`, `citations_enabled`, `stream`, `intent_override`
 - `IngestRequest` -- `file_path`, `source_id`, `summarize`, `geotag`, `peopletag`, `page_offset`, `citation_reference`
+- `IngestResponse` -- `source_id`, `parents_count`, `children_count`, `summarized`, optional `geotag_ner`, optional `peopletag_ner`
+- `NERDiagnosticsResponse` -- `ner_available`, `method`, `warning?`
 - `SourceInfo` -- `source_id`, `summary`, `source_path`, `snapshot_path`, `source_size_bytes`, `content_size_bytes`, `page_offset`, `citation_reference`
 - `SourceContentResponse` -- `source_id`, `content`, `content_source` ("original"/"snapshot"/"summary"), `format` ("pdf"/"markdown"/"text")
 - `ChunkDetailResponse` & `ChunkBatchResponse` -- chunk text, parent text, page metadata, header path, format, source path
@@ -515,13 +527,13 @@ Offline entity indexing subsystem for ingest-time enrichment and overlay explora
 - **Persistence:** ingest geotag pipeline writes canonicalized rows into `geo_mentions` (confidence, method, ambiguity, candidate-count diagnostics)
 
 **People path:**
-- **NER candidates:** `extract_person_candidates_ner()` returns typed person candidates with confidence, offsets, and context windows
+- **NER candidates:** `extract_person_candidates_ner_with_diagnostics()` returns typed person candidates plus fallback diagnostics
 - **Canonicalization:** `PersonResolver` (thread-safe singleton) normalizes titles and resolves mentions through exact, surname-fuzzy, and full-name-fuzzy matching
 - **Persistence:** ingest peopletag pipeline writes canonicalized rows into `person_mentions` (`raw_name`, `canonical_name`, `method`, `role_hint`, `context_snippet`)
 - **Manual curation:** API supports mention delete (`DELETE /api/people/mentions/{id}`) and canonical merge (`POST /api/people/merge`)
 
 **Shared optimization:**
-- When both `geotag=True` and `peopletag=True`, ingest performs one GLiNER pass via `extract_place_and_person_candidates_ner()` and fans out to both pipelines
+- When both `geotag=True` and `peopletag=True`, ingest performs one GLiNER pass via `extract_place_and_person_candidates_ner_with_diagnostics()` and fans out to both pipelines
 
 ```mermaid
 flowchart LR
@@ -664,7 +676,7 @@ Page (app/page.tsx)
 | `getChunk(sourceId, chunkId)` | `GET /api/sources/:id/chunk/:cid` | |
 | `getChunks(sourceId, chunkIds)` | `GET /api/sources/:id/chunks?ids=...` | Batch fetch |
 | `ingest(filePath, sourceId, summarize, geotag, peopletag)` | `POST /api/sources/ingest` | JSON body |
-| `getGeoMentions(sourceId?, minConfidence, limit, offset, detailed, sourceIds?)` | `GET /api/geo/mentions` | Source-aware grouped map payload |
+| `getGeoMentions(sourceId?, minConfidence, limit, offset, detailed, sourceIds?, q?)` | `GET /api/geo/mentions` | Source-aware grouped map payload with optional text filter |
 | `deleteGeoMention(mentionId)` | `DELETE /api/geo/mentions/:mentionId` | Manual map mention cleanup |
 | `getPeople(sourceId?, minConfidence, q?, limit, offset, sourceIds?)` | `GET /api/people` | Canonical person list for selected sources |
 | `getPeopleMentions(canonicalName, sourceId?, minConfidence, limit, offset, sourceIds?)` | `GET /api/people/mentions` | Mention-level rows for one canonical person |
@@ -1243,7 +1255,7 @@ cd frontend && npm run dev
 | **Observability** | `arize-phoenix-otel` |
 | **Speech** | `mlx-whisper`, `soundfile`, `scipy`, `av` (PyAV) |
 | **Geospatial** | `rapidfuzz`, `pycountry` |
-| **NER (Geo + People ingest)** | `gliner`, `gliner-spacy` |
+| **NER (Geo + People ingest)** | `gliner` |
 | **System** | `psutil` (optional, RAM detection) |
 
 ### Frontend (Node.js)
