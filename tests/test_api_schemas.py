@@ -20,6 +20,7 @@ from src.api_schemas import (
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    NERDiagnosticsResponse,
     PeopleListResponse,
     PeopleMergeRequest,
     PeopleMergeResponse,
@@ -242,6 +243,28 @@ class TestIngestResponse:
         data = resp.model_dump()
         assert data["parents_count"] == 10
         assert data["children_count"] == 20
+        assert data["geotag_ner"] is None
+        assert data["peopletag_ner"] is None
+
+    def test_response_with_ner_diagnostics(self) -> None:
+        resp = IngestResponse(
+            source_id="doc",
+            parents_count=2,
+            children_count=4,
+            summarized=False,
+            geotag_ner=NERDiagnosticsResponse(
+                ner_available=False,
+                method="regex_fallback",
+                warning="GLiNER unavailable",
+            ),
+            peopletag_ner=NERDiagnosticsResponse(
+                ner_available=False,
+                method="empty",
+            ),
+        )
+        data = resp.model_dump()
+        assert data["geotag_ner"]["method"] == "regex_fallback"
+        assert data["peopletag_ner"]["method"] == "empty"
 
 
 # ---------------------------------------------------------------------------

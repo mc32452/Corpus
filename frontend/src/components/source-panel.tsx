@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { sourceApi, type SourceInfo } from "@/lib/api-client";
+import {
+  sourceApi,
+  type IngestResponse,
+  type NERDiagnostics,
+  type SourceInfo,
+} from "@/lib/api-client";
 import { IngestModal, type UploadRequest } from "@/components/ingest-modal";
 import { CitationPanelReader } from "@/components/citation-viewer-modal";
 import { File } from "@/components/assistant-ui/file";
@@ -49,6 +54,15 @@ export function SourcePanel({
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [uploadQueue, setUploadQueue] = useState<UploadRequest[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [ingestDiagnosticsBySourceId, setIngestDiagnosticsBySourceId] = useState<
+    Record<
+      string,
+      {
+        geotagNer: NERDiagnostics | null;
+        peopletagNer: NERDiagnostics | null;
+      }
+    >
+  >({});
   const [uploadStatus, setUploadStatus] = useState<
     | null
     | { stage: "uploading"; fileName: string; sourceId: string; queued: number; geotag: boolean; peopletag: boolean }
@@ -176,7 +190,7 @@ export function SourcePanel({
 
     (async () => {
       try {
-        await sourceApi.uploadDocument(
+        const ingestResponse: IngestResponse = await sourceApi.uploadDocument(
           current.file,
           current.sourceId,
           current.summarize,
@@ -185,6 +199,13 @@ export function SourcePanel({
           current.peopletag,
           current.citationRef,
         );
+        setIngestDiagnosticsBySourceId((prev) => ({
+          ...prev,
+          [current.sourceId]: {
+            geotagNer: ingestResponse.geotag_ner ?? null,
+            peopletagNer: ingestResponse.peopletag_ner ?? null,
+          },
+        }));
         // Refresh the source list after each successful ingest
         const data = await sourceApi.listSources();
         const nextIds = data.map((item) => item.source_id);
@@ -290,6 +311,12 @@ export function SourcePanel({
     try {
       await sourceApi.deleteSource(sourceId);
       setSources((prev) => prev.filter((s) => s.source_id !== sourceId));
+      setIngestDiagnosticsBySourceId((prev) => {
+        if (!(sourceId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sourceId];
+        return next;
+      });
       onSourcesChanged?.();
       if (activeSourceId === sourceId) {
         setActiveSourceId(null);
@@ -307,6 +334,35 @@ export function SourcePanel({
   function handleViewFullText(sourceId: string, e: React.MouseEvent) {
     e.stopPropagation();
     dispatch({ type: "SET_ACTIVE_CITATION", citation: { source_id: sourceId, chunk_id: "", number: 0 } });
+  }
+
+  function isNerDegraded(diag: NERDiagnostics | null | undefined): boolean {
+    if (!diag) return false;
+    return !diag.ner_available || diag.method !== "gliner";
+  }
+
+  function summarizeNerDegradation(
+    sourceId: string,
+  ): { visible: boolean; label: string; detail: string } {
+    const diag = ingestDiagnosticsBySourceId[sourceId];
+    if (!diag) return { visible: false, label: "", detail: "" };
+
+    const parts: string[] = [];
+    if (isNerDegraded(diag.geotagNer)) {
+      const method = diag.geotagNer?.method ?? "unknown";
+      parts.push(`Places: ${method}`);
+    }
+    if (isNerDegraded(diag.peopletagNer)) {
+      const method = diag.peopletagNer?.method ?? "unknown";
+      parts.push(`People: ${method}`);
+    }
+
+    const detail = parts.join(" · ");
+    return {
+      visible: parts.length > 0,
+      label: "NER degraded",
+      detail,
+    };
   }
 
   /* ── Citation reader mode — slides in over the file list ── */
@@ -497,6 +553,7 @@ export function SourcePanel({
             const isActive = activeSourceId === source.source_id;
             const isPending = source.ingestState === "ingesting" || source.ingestState === "queued";
             const sizeLabel = formatBytes(source.content_size_bytes ?? source.source_size_bytes);
+            const nerDegradation = summarizeNerDegradation(source.source_id);
             return (
               <div
                 key={source.source_id}
@@ -542,6 +599,19 @@ export function SourcePanel({
                           : "Ingesting..."
                         : sizeLabel ?? "Size unavailable"}
                     </p>
+                    {nerDegradation.visible && !isPending && (
+                      <span
+                        className="mt-1 inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium tracking-wide"
+                        style={{
+                          borderColor: "rgba(245, 158, 11, 0.5)",
+                          color: "rgba(253, 224, 71, 0.95)",
+                          background: "rgba(120, 53, 15, 0.35)",
+                        }}
+                        title={nerDegradation.detail}
+                      >
+                        {nerDegradation.label}
+                      </span>
+                    )}
                   </div>
 
                   {/* Delete (hover) */}

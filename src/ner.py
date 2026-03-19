@@ -12,6 +12,7 @@ import logging
 import re
 import threading
 import warnings
+from dataclasses import dataclass
 from typing import TypedDict
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ _GLINER_SAFE_SEQUENCE_TOKENS = 300
 _GLINER_WINDOW_TOKENS = 250
 _GLINER_WINDOW_OVERLAP_TOKENS = 50
 _TOKEN_ESTIMATE_MULTIPLIER = 1.6
+_NER_METHOD_GLINER = "gliner"
+_NER_METHOD_REGEX_FALLBACK = "regex_fallback"
+_NER_METHOD_EMPTY = "empty"
 _PLACE_LABELS = {"CITY", "LOCATION", "LOC", "GPE"}
 _PERSON_LABELS = {"PERSON", "PER"}
 _PERSON_BLOCKLIST = {
@@ -75,6 +79,20 @@ class _EntityCandidate(TypedDict):
     score: float
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class NERDiagnostics:
+    """Runtime diagnostics describing which NER path was used.
+
+    ``ner_available`` reports whether GLiNER was available for inference,
+    ``method`` records the extraction strategy used by the caller, and
+    ``warning`` provides a human-readable degradation reason when applicable.
+    """
+
+    ner_available: bool
+    method: str
+    warning: str | None = None
 
 
 def _get_model():
@@ -630,32 +648,11 @@ def _to_person_candidates(
     return candidates
 
 
-def extract_place_candidates_ner(
+def _build_regex_place_fallback(
     texts: list[str],
     *,
-    threshold: float = _NER_THRESHOLD,
-    context_window_words: int = 8,
+    context_window_words: int,
 ) -> list[list[PlaceCandidate]]:
-    """Extract place candidates with metadata for downstream geocoding decisions."""
-    try:
-        predicted = _predict_entity_candidates(
-            texts,
-            labels=_NER_LABELS,
-            threshold=threshold,
-        )
-        return [
-            _to_place_candidates(
-                text,
-                rows,
-                min_score=threshold,
-                context_window_words=context_window_words,
-            )
-            for text, rows in zip(texts, predicted)
-        ]
-    except RuntimeError as exc:
-        # Expected when the GLiNER model is unavailable; fall back to regex.
-        log.warning("GLiNER inference unavailable, falling back to regex: %s", exc)
-
     from .geocoder import extract_places_from_query
 
     fallback: list[list[PlaceCandidate]] = []
@@ -680,6 +677,100 @@ def extract_place_candidates_ner(
     return fallback
 
 
+def extract_place_candidates_ner_with_diagnostics(
+    texts: list[str],
+    *,
+    threshold: float = _NER_THRESHOLD,
+    context_window_words: int = 8,
+) -> tuple[list[list[PlaceCandidate]], NERDiagnostics]:
+    """Extract place candidates and report whether GLiNER was used."""
+    try:
+        predicted = _predict_entity_candidates(
+            texts,
+            labels=_NER_LABELS,
+            threshold=threshold,
+        )
+        return (
+            [
+                _to_place_candidates(
+                    text,
+                    rows,
+                    min_score=threshold,
+                    context_window_words=context_window_words,
+                )
+                for text, rows in zip(texts, predicted)
+            ],
+            NERDiagnostics(ner_available=True, method=_NER_METHOD_GLINER),
+        )
+    except Exception as exc:
+        warning = f"GLiNER place inference unavailable; fell back to regex ({type(exc).__name__}: {exc})"
+        log.warning(warning)
+        return (
+            _build_regex_place_fallback(texts, context_window_words=context_window_words),
+            NERDiagnostics(
+                ner_available=False,
+                method=_NER_METHOD_REGEX_FALLBACK,
+                warning=warning,
+            ),
+        )
+
+
+def extract_place_candidates_ner(
+    texts: list[str],
+    *,
+    threshold: float = _NER_THRESHOLD,
+    context_window_words: int = 8,
+) -> list[list[PlaceCandidate]]:
+    """Extract place candidates with metadata for downstream geocoding decisions."""
+    rows, _diagnostics = extract_place_candidates_ner_with_diagnostics(
+        texts,
+        threshold=threshold,
+        context_window_words=context_window_words,
+    )
+    return rows
+
+
+def extract_person_candidates_ner_with_diagnostics(
+    texts: list[str],
+    *,
+    threshold: float = _NER_THRESHOLD,
+    context_window_words: int = 8,
+) -> tuple[list[list[PersonCandidate]], NERDiagnostics]:
+    """Extract person candidates and report whether GLiNER was used."""
+    try:
+        predicted = _predict_entity_candidates(
+            texts,
+            labels=["person"],
+            threshold=threshold,
+        )
+        return (
+            [
+                _to_person_candidates(
+                    text,
+                    rows,
+                    min_score=threshold,
+                    context_window_words=context_window_words,
+                )
+                for text, rows in zip(texts, predicted)
+            ],
+            NERDiagnostics(ner_available=True, method=_NER_METHOD_GLINER),
+        )
+    except Exception as exc:
+        warning = (
+            "GLiNER person inference unavailable; returning empty person candidates "
+            f"({type(exc).__name__}: {exc})"
+        )
+        log.warning(warning)
+        return (
+            [[] for _ in texts],
+            NERDiagnostics(
+                ner_available=False,
+                method=_NER_METHOD_EMPTY,
+                warning=warning,
+            ),
+        )
+
+
 def extract_person_candidates_ner(
     texts: list[str],
     *,
@@ -687,37 +778,23 @@ def extract_person_candidates_ner(
     context_window_words: int = 8,
 ) -> list[list[PersonCandidate]]:
     """Extract person candidates for resolver canonicalization."""
-    try:
-        predicted = _predict_entity_candidates(
-            texts,
-            labels=["person"],
-            threshold=threshold,
-        )
-        return [
-            _to_person_candidates(
-                text,
-                rows,
-                min_score=threshold,
-                context_window_words=context_window_words,
-            )
-            for text, rows in zip(texts, predicted)
-        ]
-    except RuntimeError as exc:
-        # Expected when the GLiNER model is unavailable; we currently do not
-        # have a robust regex-based person extractor to fall back to.
-        log.warning("GLiNER person inference unavailable; returning no person candidates: %s", exc)
-        return [[] for _ in texts]
+    rows, _diagnostics = extract_person_candidates_ner_with_diagnostics(
+        texts,
+        threshold=threshold,
+        context_window_words=context_window_words,
+    )
+    return rows
 
 
-def extract_place_and_person_candidates_ner(
+def extract_place_and_person_candidates_ner_with_diagnostics(
     texts: list[str],
     *,
     geo_threshold: float,
     people_threshold: float,
     geo_context_window_words: int = 8,
     people_context_window_words: int = 8,
-) -> tuple[list[list[PlaceCandidate]], list[list[PersonCandidate]]]:
-    """Run a single GLiNER pass for city+person labels and post-filter by per-type thresholds."""
+) -> tuple[list[list[PlaceCandidate]], list[list[PersonCandidate]], NERDiagnostics, NERDiagnostics]:
+    """Run joint geo/person extraction and return diagnostics for each output."""
     shared_threshold = min(float(geo_threshold), float(people_threshold))
     try:
         predicted = _predict_entity_candidates(
@@ -743,10 +820,49 @@ def extract_place_and_person_candidates_ner(
             )
             for text, rows in zip(texts, predicted)
         ]
-        return place_rows, person_rows
+        gliner_diag = NERDiagnostics(ner_available=True, method=_NER_METHOD_GLINER)
+        return place_rows, person_rows, gliner_diag, gliner_diag
     except Exception as exc:
-        log.warning("GLiNER shared geo/person inference failed; falling back for places only: %s", exc)
-        return extract_place_candidates_ner(texts, context_window_words=geo_context_window_words), [[] for _ in texts]
+        warning = (
+            "GLiNER shared geo/person inference failed; using regex fallback for places "
+            f"and empty people output ({type(exc).__name__}: {exc})"
+        )
+        log.warning(warning)
+        return (
+            _build_regex_place_fallback(texts, context_window_words=geo_context_window_words),
+            [[] for _ in texts],
+            NERDiagnostics(
+                ner_available=False,
+                method=_NER_METHOD_REGEX_FALLBACK,
+                warning=warning,
+            ),
+            NERDiagnostics(
+                ner_available=False,
+                method=_NER_METHOD_EMPTY,
+                warning=warning,
+            ),
+        )
+
+
+def extract_place_and_person_candidates_ner(
+    texts: list[str],
+    *,
+    geo_threshold: float,
+    people_threshold: float,
+    geo_context_window_words: int = 8,
+    people_context_window_words: int = 8,
+) -> tuple[list[list[PlaceCandidate]], list[list[PersonCandidate]]]:
+    """Run a single GLiNER pass for city+person labels and post-filter by per-type thresholds."""
+    place_rows, person_rows, _place_diag, _person_diag = (
+        extract_place_and_person_candidates_ner_with_diagnostics(
+            texts,
+            geo_threshold=geo_threshold,
+            people_threshold=people_threshold,
+            geo_context_window_words=geo_context_window_words,
+            people_context_window_words=people_context_window_words,
+        )
+    )
+    return place_rows, person_rows
 
 
 def extract_places_ner(texts: list[str]) -> list[list[str]]:

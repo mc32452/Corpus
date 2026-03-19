@@ -22,7 +22,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, TYPE_CHECKING
 
 from .models import ChildChunk, Metadata, ParentChunk
 from .generation import build_ingest_summary_messages
@@ -36,6 +36,9 @@ from .phoenix_tracing import (
     start_span,
 )
 from .storage import StorageEngine
+
+if TYPE_CHECKING:
+    from .ner import NERDiagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +420,14 @@ class _PageData:
     display_page: Optional[str]
 
 
+@dataclass(frozen=True)
+class IngestNERDiagnostics:
+    """NER diagnostics returned by ingest-time entity extraction helpers."""
+
+    geotag_ner: Optional["NERDiagnostics"] = None
+    peopletag_ner: Optional["NERDiagnostics"] = None
+
+
 def _chunk_pages(
     pages: list[_PageData],
     source_id: str,
@@ -594,8 +605,13 @@ def _geotag_chunks(
     storage: StorageEngine,
     *,
     ner_lists: Optional[list[list[dict[str, Any]]]] = None,
-) -> None:
+    ner_diagnostics: Optional["NERDiagnostics"] = None,
+) -> "NERDiagnostics":
     """Extract place mentions with NER, geocode, and store grouped mention rows."""
+    from .ner import NERDiagnostics
+
+    diagnostics = ner_diagnostics
+
     try:
         import time
         import uuid
@@ -607,7 +623,17 @@ def _geotag_chunks(
             GEOTAG_NER_CONTEXT_WINDOW,
         )
         from .geocoder import get_geocoder
-        from .ner import extract_place_candidates_ner
+        from .ner import extract_place_candidates_ner_with_diagnostics
+
+        if ner_lists is None:
+            texts = [chunk.text for chunk in child_chunks]
+            ner_lists, diagnostics = extract_place_candidates_ner_with_diagnostics(
+                texts,
+                threshold=GEOTAG_NER_THRESHOLD,
+                context_window_words=GEOTAG_NER_CONTEXT_WINDOW,
+            )
+        elif diagnostics is None:
+            diagnostics = NERDiagnostics(ner_available=True, method="gliner")
 
         geocoder = get_geocoder()
         if not geocoder.is_available():
@@ -615,7 +641,7 @@ def _geotag_chunks(
             geocoder.warm(background=False)
         if not geocoder.is_available():
             logger.warning("Geocoder unavailable after warm attempt — skipping geotagging for %s", source_id)
-            return
+            return diagnostics or NERDiagnostics(ner_available=True, method="gliner")
 
         status = geocoder.status()
         version_info = status.get("version_info") if isinstance(status, dict) else None
@@ -623,13 +649,6 @@ def _geotag_chunks(
         if isinstance(version_info, dict):
             geocoder_version = str(version_info.get("checksum") or version_info.get("build_timestamp") or "unknown")
 
-        if ner_lists is None:
-            texts = [chunk.text for chunk in child_chunks]
-            ner_lists = extract_place_candidates_ner(
-                texts,
-                threshold=GEOTAG_NER_THRESHOLD,
-                context_window_words=GEOTAG_NER_CONTEXT_WINDOW,
-            )
         geocoded_at = time.time()
 
         mentions: list[dict] = []
@@ -702,8 +721,19 @@ def _geotag_chunks(
         if mentions:
             storage.upsert_geo_mentions(mentions)
             logger.info("Geotagged %d mentions for source %s.", len(mentions), source_id)
+        return diagnostics or NERDiagnostics(ner_available=True, method="gliner")
     except Exception as exc:
         logger.warning("Geotagging failed for %s (ingest unaffected): %s", source_id, exc)
+        warning = f"Geotagging failed (ingest unaffected): {type(exc).__name__}: {exc}"
+        if diagnostics is not None:
+            prior = diagnostics.warning
+            merged_warning = f"{prior}; {warning}" if prior else warning
+            return NERDiagnostics(
+                ner_available=diagnostics.ner_available,
+                method=diagnostics.method,
+                warning=merged_warning,
+            )
+        return NERDiagnostics(ner_available=False, method="empty", warning=warning)
 
 
 def _peopletag_chunks(
@@ -712,8 +742,13 @@ def _peopletag_chunks(
     storage: StorageEngine,
     *,
     ner_lists: Optional[list[list[dict[str, Any]]]] = None,
-) -> None:
+    ner_diagnostics: Optional["NERDiagnostics"] = None,
+) -> "NERDiagnostics":
     """Extract person mentions, resolve canonical names, and persist mention rows."""
+    from .ner import NERDiagnostics
+
+    diagnostics = ner_diagnostics
+
     try:
         import uuid
 
@@ -722,7 +757,7 @@ def _peopletag_chunks(
             PEOPLETAG_NER_CONTEXT_WINDOW,
             PEOPLETAG_NER_THRESHOLD,
         )
-        from .ner import extract_person_candidates_ner
+        from .ner import extract_person_candidates_ner_with_diagnostics
         from .person_resolver import get_person_resolver
 
         # Re-ingest guard: clear prior mentions for this source before reprocessing.
@@ -733,11 +768,13 @@ def _peopletag_chunks(
 
         if ner_lists is None:
             texts = [chunk.text for chunk in child_chunks]
-            ner_lists = extract_person_candidates_ner(
+            ner_lists, diagnostics = extract_person_candidates_ner_with_diagnostics(
                 texts,
                 threshold=PEOPLETAG_NER_THRESHOLD,
                 context_window_words=PEOPLETAG_NER_CONTEXT_WINDOW,
             )
+        elif diagnostics is None:
+            diagnostics = NERDiagnostics(ner_available=True, method="gliner")
 
         mentions: list[dict[str, Any]] = []
         seen: set[tuple[str, str, int, int]] = set()
@@ -809,8 +846,19 @@ def _peopletag_chunks(
         if mentions:
             storage.upsert_person_mentions(mentions)
             logger.info("Peopletagged %d mentions for source %s.", len(mentions), source_id)
+        return diagnostics or NERDiagnostics(ner_available=True, method="gliner")
     except Exception as exc:
         logger.warning("Peopletagging failed for %s (ingest unaffected): %s", source_id, exc)
+        warning = f"Peopletagging failed (ingest unaffected): {type(exc).__name__}: {exc}"
+        if diagnostics is not None:
+            prior = diagnostics.warning
+            merged_warning = f"{prior}; {warning}" if prior else warning
+            return NERDiagnostics(
+                ner_available=diagnostics.ner_available,
+                method=diagnostics.method,
+                warning=merged_warning,
+            )
+        return NERDiagnostics(ner_available=False, method="empty", warning=warning)
 
 
 def ingest_file_to_storage(
@@ -827,7 +875,7 @@ def ingest_file_to_storage(
     citation_reference: Optional[str] = None,
     page_offset: int = 1,
     tracer: Optional[Any] = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, IngestNERDiagnostics]:
     path = Path(file_path)
     suffix = path.suffix.lower()
     with start_span(
@@ -927,33 +975,66 @@ def ingest_file_to_storage(
                     PEOPLETAG_NER_CONTEXT_WINDOW,
                     PEOPLETAG_NER_THRESHOLD,
                 )
-                from .ner import extract_place_and_person_candidates_ner
+                from .ner import extract_place_and_person_candidates_ner_with_diagnostics
 
                 texts = [child.text for child in children]
-                place_candidates, person_candidates = extract_place_and_person_candidates_ner(
+                (
+                    place_candidates,
+                    person_candidates,
+                    geotag_diag,
+                    peopletag_diag,
+                ) = extract_place_and_person_candidates_ner_with_diagnostics(
                     texts,
                     geo_threshold=GEOTAG_NER_THRESHOLD,
                     people_threshold=PEOPLETAG_NER_THRESHOLD,
                     geo_context_window_words=GEOTAG_NER_CONTEXT_WINDOW,
                     people_context_window_words=PEOPLETAG_NER_CONTEXT_WINDOW,
                 )
-                _geotag_chunks(
+                geotag_diag = _geotag_chunks(
                     source_id,
                     children,
                     storage,
                     ner_lists=place_candidates,
+                    ner_diagnostics=geotag_diag,
                 )
-                _peopletag_chunks(
+                peopletag_diag = _peopletag_chunks(
                     source_id,
                     children,
                     storage,
                     ner_lists=person_candidates,
+                    ner_diagnostics=peopletag_diag,
+                )
+                ingest_ner_diagnostics = IngestNERDiagnostics(
+                    geotag_ner=geotag_diag,
+                    peopletag_ner=peopletag_diag,
                 )
             else:
+                geotag_diag = None
+                peopletag_diag = None
                 if geotag:
-                    _geotag_chunks(source_id, children, storage)
+                    geotag_diag = _geotag_chunks(source_id, children, storage)
                 if peopletag:
-                    _peopletag_chunks(source_id, children, storage)
+                    peopletag_diag = _peopletag_chunks(source_id, children, storage)
+                ingest_ner_diagnostics = IngestNERDiagnostics(
+                    geotag_ner=geotag_diag,
+                    peopletag_ner=peopletag_diag,
+                )
+
+            set_span_attributes(
+                ingest_span,
+                {
+                    "rag.ingest.ner.geotag_method": (
+                        ingest_ner_diagnostics.geotag_ner.method
+                        if ingest_ner_diagnostics.geotag_ner is not None
+                        else "disabled"
+                    ),
+                    "rag.ingest.ner.peopletag_method": (
+                        ingest_ner_diagnostics.peopletag_ner.method
+                        if ingest_ner_diagnostics.peopletag_ner is not None
+                        else "disabled"
+                    ),
+                },
+            )
 
             if summarize:
                 generator = summary_generator
@@ -1008,7 +1089,7 @@ def ingest_file_to_storage(
                     "output.value": f"{source_id}: {len(parents)} parents, {len(children)} children",
                 },
             )
-            return len(parents), len(children)
+            return len(parents), len(children), ingest_ner_diagnostics
         except Exception as exc:
             mark_span_error(ingest_span, f"{type(exc).__name__}: {exc}")
             raise

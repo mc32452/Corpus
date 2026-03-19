@@ -199,6 +199,16 @@ class IngestRequest(BaseModel):
     )
 
 
+class NERDiagnosticsResponse(BaseModel):
+    """Structured diagnostics for ingest-time NER extraction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ner_available: bool
+    method: str
+    warning: Optional[str] = None
+
+
 class IngestResponse(BaseModel):
     """Response body after successful ingestion."""
 
@@ -208,6 +218,14 @@ class IngestResponse(BaseModel):
     parents_count: int
     children_count: int
     summarized: bool
+    geotag_ner: Optional[NERDiagnosticsResponse] = Field(
+        default=None,
+        description="NER diagnostics for ingest-time geotagging when geotag=true.",
+    )
+    peopletag_ner: Optional[NERDiagnosticsResponse] = Field(
+        default=None,
+        description="NER diagnostics for ingest-time person tagging when peopletag=true.",
+    )
 
 
 class SourceInfo(BaseModel):

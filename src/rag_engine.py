@@ -18,7 +18,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, TYPE_CHECKING
 
 from .config import (
     CITATIONS_ENABLED_DEFAULT,
@@ -88,6 +88,9 @@ from .query_events import (
 )
 from .storage import StorageConfig, StorageEngine
 
+if TYPE_CHECKING:
+    from .ner import NERDiagnostics
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,8 @@ class IngestResult:
     children_count: int
     source_id: str
     summarized: bool
+    geotag_ner: Optional["NERDiagnostics"] = None
+    peopletag_ner: Optional["NERDiagnostics"] = None
 
 
 @dataclass(frozen=True)
@@ -283,14 +288,37 @@ def sanitize_output(text: str) -> str:
     return result.strip()
 
 
-def _dedupe_context(texts: Iterable[str]) -> str:
-    seen: set[str] = set()
+def _dedupe_context(
+    texts: Iterable[str],
+    *,
+    source_ids: Optional[Iterable[Optional[str]]] = None,
+) -> str:
+    text_list = list(texts)
+    source_list = list(source_ids) if source_ids is not None else []
+
+    if not source_list:
+        seen: set[str] = set()
+        unique_texts: list[str] = []
+        for text in text_list:
+            cleaned = text.strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                unique_texts.append(cleaned)
+        return "\n\n".join(unique_texts)
+
+    seen_with_source: set[tuple[str, str]] = set()
     unique_texts = []
-    for text in texts:
+    for idx, text in enumerate(text_list):
         cleaned = text.strip()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            unique_texts.append(cleaned)
+        if not cleaned:
+            continue
+        source_id_raw = source_list[idx] if idx < len(source_list) else None
+        source_id = str(source_id_raw).strip() if source_id_raw else ""
+        key = (source_id, cleaned)
+        if key in seen_with_source:
+            continue
+        seen_with_source.add(key)
+        unique_texts.append(cleaned)
     return "\n\n".join(unique_texts)
 
 
@@ -999,7 +1027,7 @@ class RagEngine:
                 if summarize:
                     generator = self.ensure_summary_generator()
 
-                parents_count, children_count = ingest_file_to_storage(
+                parents_count, children_count, ner_diagnostics = ingest_file_to_storage(
                     file_path,
                     source_id=source_id,
                     page_number=page_number,
@@ -1023,6 +1051,16 @@ class RagEngine:
                         "output.value": f"{source_id}: {parents_count} parents, {children_count} children",
                         "rag.ingest.parents_count": parents_count,
                         "rag.ingest.children_count": children_count,
+                        "rag.ingest.ner.geotag_method": (
+                            ner_diagnostics.geotag_ner.method
+                            if ner_diagnostics.geotag_ner is not None
+                            else "disabled"
+                        ),
+                        "rag.ingest.ner.peopletag_method": (
+                            ner_diagnostics.peopletag_ner.method
+                            if ner_diagnostics.peopletag_ner is not None
+                            else "disabled"
+                        ),
                     },
                 )
                 return IngestResult(
@@ -1030,6 +1068,8 @@ class RagEngine:
                     children_count=children_count,
                     source_id=source_id,
                     summarized=summarize,
+                    geotag_ner=ner_diagnostics.geotag_ner,
+                    peopletag_ner=ner_diagnostics.peopletag_ner,
                 )
             except Exception as exc:
                 mark_span_error(ingest_span, f"{type(exc).__name__}: {exc}")
@@ -2368,7 +2408,14 @@ class RagEngine:
                 elif cite:
                     cite = False
                 else:
-                    context = _dedupe_context(retrieved.context_docs)
+                    context_source_ids = [
+                        (result.metadata.get("source_id") if isinstance(result.metadata, dict) else None)
+                        for result in retrieved.results
+                    ]
+                    context = _dedupe_context(
+                        retrieved.context_docs,
+                        source_ids=context_source_ids,
+                    )
 
             if packed_retrieval_results:
                 packed_results_for_preview = packed_retrieval_results
