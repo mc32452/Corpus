@@ -7,12 +7,13 @@ The application is a **full-stack offline RAG system** designed for local-first 
 **Components:**
 
 - **FastAPI backend** (`src/api.py`) -- REST + SSE streaming for ingest, source management, query, freeform chat, and transcription
-- **Next.js frontend** (`frontend/`) -- dual-mode UI (RAG + Freeform) with source management, streaming responses, citation viewer, session history, and speech-to-text
+- **Next.js frontend** (`frontend/`) -- dual-mode UI (RAG + Freeform) with modular layout components, source management, map/people overlays, citation viewer, session history, and speech-to-text
 - **Decoupled RAG engine** (`src/rag_engine.py`) -- shared by CLI and API, orchestrates the full query/ingest pipeline
 - **Hybrid retrieval pipeline** (`src/retrieval.py`) -- LanceDB ANN + BM25 FTS with RRF fusion, Jina v3 reranking, intent-scaled parameters
 - **MLX inference stack** -- generator (`src/generator.py`), embeddings (`src/embeddings.py`), reranker (`src/reranker.py`)
 - **Mode-aware configuration** (`src/config.py`) -- RAM-based auto-scaling across operating modes with per-intent retrieval and generation overrides
-- **Geospatial mapping pipeline** (`src/geocoder.py`, `src/ner.py`, `frontend/src/components/map/CorpusMap.tsx`) -- ingest-time place NER + offline geocoding + interactive map filtering
+- **Entity indexing pipelines** (`src/geocoder.py`, `src/ner.py`, `src/person_resolver.py`) -- ingest-time place and person NER with offline geocoding and canonical person matching
+- **People dictionary UX** (`frontend/src/components/people/PeopleDictionary.tsx`) -- canonical person browsing, mention inspection/deletion, and merge operations
 - **Phoenix/Arize observability** (`src/phoenix_tracing.py`) -- OpenTelemetry tracing across ingest/query/freeform with trace ID propagation and feedback annotations
 - **Inline academic citations** -- source-grounded responses with chunk-level references and post-hoc citation verification
 
@@ -23,13 +24,13 @@ The application is a **full-stack offline RAG system** designed for local-first 
 | Layer | Technology | Notes |
 |-------|-----------|-------|
 | LLM Inference | `mlx-lm` (Metal-native) | KVCache support, streaming, thinking-block filtering |
-| Embeddings | `mlx-lm` via `MlxEmbeddingModel` wrapper | Mean-pooled hidden states with L2 normalization |
+| Embeddings | `mlx-lm` via `MlxEmbeddingModel` wrapper | Last-token pooling (decoder architecture), left-padding, instruction-prefixed query encoding |
 | Re-ranking | `jinaai/jina-reranker-v3-mlx` | Listwise MLX-native reranker (Qwen3-0.6B backbone) |
 | Intent Classification | Heuristic-first + `mlx-lm` LLM fallback | 12 intents, regex + structural signals, LFM2 fallback |
 | Storage | `lancedb` + `pyarrow` | Vector ANN + FTS hybrid search with native RRF |
 | Backend API | `fastapi`, `uvicorn`, `python-multipart` | SSE streaming (AI SDK v6 UI Message Stream) + multipart upload |
 | Frontend | `next.js 16` (App Router), React 19, TypeScript 5 | Tailwind CSS 4, `@assistant-ui/react`, `@ai-sdk/react`, MapLibre map overlay |
-| Geospatial | `GeoNames` + `rapidfuzz` + `gliner` | Offline place NER + geocoding at ingest and map render time |
+| Geospatial + People | `GeoNames` + `rapidfuzz` + `gliner` + in-process person resolver | Offline place geocoding + canonical person indexing for map and people dictionary overlays |
 | Observability | `arize-phoenix-otel` | OpenTelemetry tracing + Phoenix export/runtime status |
 | Speech-to-Text | `mlx-whisper` | Offline transcription with VAD |
 | PDF Extraction | `pypdf`, `pdfminer.six`, `PyMuPDF`, `pytesseract` | Four-strategy fallback chain |
@@ -43,7 +44,7 @@ All modes share the same three-model stack. No model varies by mode -- different
 | Role | Model ID | Details |
 |------|----------|---------|
 | **LLM** | `NexVeridian/Qwen3.5-35B-A3B-4bit` | Qwen3.5 35B MoE (3B active), 4-bit quantized. Supports `enable_thinking` template parameter for chain-of-thought. |
-| **Embedding** | `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` | Qwen3 0.6B backbone, 4-bit DWQ. Loaded via `mlx_lm.load()`, not SentenceTransformers. Mean-pooled last hidden states + L2 norm. |
+| **Embedding** | `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` | Qwen3 0.6B decoder backbone, 4-bit DWQ. Loaded via `mlx_lm.load()`. Uses last-token pooling, left-padding, and instruction-prefixed query encoding. |
 | **Reranker** | `jinaai/jina-reranker-v3-mlx` | Qwen3-0.6B backbone (28 layers, 1024 hidden) + MLP projector (1024→512→512). Listwise cosine similarity scoring. |
 | **Intent LLM** | `mlx-community/LFM2-8B-A1B-4bit` | LFM2 8B MoE (1B active), 4-bit. Used when heuristic intent confidence < 0.70. |
 | **Whisper** | `mlx-community/whisper-large-v3-4bit` | Via `mlx-whisper`. Lazy-loaded on first transcription request. |
@@ -64,27 +65,30 @@ All dataclasses are frozen (immutable) with UUID generation at creation.
 
 ### 4.2 Storage Engine (`src/storage.py`)
 
-Unified LanceDB-backed storage managing four table types:
+Unified LanceDB-backed storage managing five table types:
 
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
 | `child_chunks` | Vectors + FTS, hybrid-searched | `id`, `text`, `vector`, `source_id`, `parent_id`, `page_number`, `header_path` |
 | `parent_chunks` | Parent text for context expansion | `parent_id`, `source_id`, `text`, page metadata |
-| `source_summaries` | Per-source metadata (schema v2) | `source_id`, `summary`, `source_path`, `snapshot_path` |
+| `source_summaries` | Per-source metadata (schema v3) | `source_id`, `summary`, `source_path`, `snapshot_path`, `page_offset` |
 | `geo_mentions` | Ingest-time geocoded mentions for map UX | `id`, `source_id`, `chunk_id`, `place_name`, `geonameid`, `lat`, `lon`, `confidence`, `method` |
+| `person_mentions` | Ingest-time canonical person mentions for People Dictionary UX | `id`, `source_id`, `chunk_id`, `raw_name`, `canonical_name`, `confidence`, `method`, `role_hint` |
 
 **`StorageConfig`:** `lance_dir` (default `data/lance`), `lance_table` (default `child_chunks`), `fts_rebuild_policy` (default `deferred`), `fts_rebuild_batch_size` (default 0)
 
 **Key capabilities:**
 - Native hybrid search (vector ANN + BM25 + RRF) via single LanceDB call with auto-retry on FTS rebuild
 - FTS index management with configurable rebuild policies (`immediate`, `deferred`, `batch`)
-- Automatic schema migration for v2 summary columns (`source_path`, `snapshot_path`)
+- Automatic schema migration for summary columns (`source_path`, `snapshot_path`, `page_offset`)
 - Geo-mentions schema migration and best-effort scalar indexes (`source_id`, `confidence`, `geonameid`)
+- Person-mentions table creation + best-effort scalar indexes (`source_id`, `canonical_name`, `confidence`)
+- Person mention CRUD support (`upsert`, filtered query, delete by mention/source, canonical merge)
 - SQL-safe literal escaping via `_escape_sql_literal()` and chunked IN clauses (max 256 values per clause)
 - `_row_to_metadata()` helper for consistent metadata extraction across all query paths
 - Safe upsert for parents with backup/rollback on failure
 - Embedding dimension validation via PyArrow schema introspection
-- Cascading delete across all 4 tables
+- Cascading delete across all 5 tables
 
 ### 4.3 Document Ingestion (`src/ingest.py`)
 
@@ -120,9 +124,19 @@ Text cleaning: `clean_ocr_artifacts()` merges hyphenated line breaks.
 **Optional ingest-time geotagging** (`geotag=True`):
 - Uses GLiNER place NER (`urchade/gliner_medium-v2.1`, label `city`, threshold 0.4) with regex fallback
 - Extracts candidate context windows (`GEOTAG_NER_CONTEXT_WINDOW=8`) and resolves candidates through the offline geocoder
-- Applies geocode confidence filtering (`GEOTAG_MIN_CONFIDENCE=0.75`, fuzzy threshold default 75)
+- Applies geocode confidence filtering (`GEOTAG_MIN_CONFIDENCE`, default 0.50, configurable via env), fuzzy threshold default 75
 - Persists mention rows into `geo_mentions` with confidence, method, ambiguity, candidate-count, and source/chunk linkage
 - If geocoder warmup fails, geotagging is skipped without failing ingest
+
+**Optional ingest-time people indexing** (`peopletag=True`):
+- Uses GLiNER person NER (`person` label, `PEOPLETAG_NER_THRESHOLD=0.45` default) with typed candidate filtering
+- Resolves raw mentions through `PersonResolver` (`src/person_resolver.py`) using exact, surname-fuzzy, and full-name-fuzzy matching
+- Applies confidence floor (`PEOPLETAG_MIN_CONFIDENCE=0.70` default) before persistence
+- Persists canonicalized rows into `person_mentions` with method (`new`, `exact`, `fuzzy_last`, `fuzzy_full`) and context snippet
+- On re-ingest, deletes prior source rows first (`delete_person_mentions_by_source`) to prevent duplication
+
+**Shared NER optimization:**
+- When `geotag=True` and `peopletag=True`, ingest runs a single GLiNER pass via `extract_place_and_person_candidates_ner()` and fans out to `_geotag_chunks()` + `_peopletag_chunks()`
 
 **Supported formats:** `.pdf`, `.md`, `.markdown`
 
@@ -134,12 +148,13 @@ Text cleaning: `clean_ocr_artifacts()` merges hyphenated line breaks.
 
 - **Model:** `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ`, loaded via `mlx_lm.load()` (not a dedicated embedding library)
 - **Lazy loading:** Model loaded on first `encode()` call via `_ensure_loaded()`
-- **Backbone extraction:** `getattr(self._model, "model", self._model)` to get the transformer backbone from the LLM wrapper
-- **Forward pass:** Through backbone hidden states → mean pooling with attention mask (`sum(hidden * mask) / mask_sum`) → L2 normalization on CPU for numerical stability
+- **Backbone extraction:** `_get_backbone()` probes common wrapper attributes (`model`, `transformer`, `encoder`) and falls back with warning
+- **Forward pass:** Through backbone hidden states → **last-token pooling** (`hidden[:, -1, :]` with left-padding) → optional L2 normalization
 - **Tokenization:** Two-strategy fallback: batch tokenizer call (`padding=True, truncation=True`) or per-text `encode()` if batch fails
-- **Padding:** `pad_token_id` → `eos_token_id` → `0` fallback chain
+- **Padding strategy:** Forces tokenizer `padding_side="left"` because Qwen3-Embedding is decoder-style; right-padding fallback logs warning
+- **Instruction-aware query encoding:** `encode(..., prompt_name=<intent>)` wraps queries as `Instruct: {task}\nQuery:{query}` with per-intent task strings
 - **Batch processing:** Default `batch_size=16`, `max_length=512` tokens
-- **Output:** `list[list[float]]` (Python floats, not numpy)
+- **Output:** `list[list[float]]` or `np.ndarray` (`return_numpy=True`)
 - **Embedding dimension:** Detected dynamically from first inference, stored in `_embedding_dim`
 - **LRU-cached query vectors:** Max 100 queries cached in the retrieval engine
 
@@ -349,6 +364,8 @@ Additional optional runtime overrides include `mode`, `model`, `summary_model`, 
 - **Collection guard:** Forces COLLECTION intent for multi-source source-selection queries (via `is_source_selection_query()`)
 - **Low-information query bypass:** Skips retrieval for gibberish/vague queries (via `is_low_information_query()`)
 - **Output sanitization:** `sanitize_output()` strips instruction leakage ("Important:", "Task:", "Format:", "Tone:"), chatter/filler phrases, deduplicates repeated halves (≥85% similarity via `SequenceMatcher`), truncates at incomplete sentences
+- **Citation normalization:** `_dedupe_citations_by_source_page()` collapses duplicate `(source_id, page_number)` citations and renumbers passage blocks to keep markers sequential
+- **Ingest enrichment propagation:** `ingest(..., geotag, peopletag)` supports place and person indexing, including single-pass shared NER when both are enabled
 - **Hallucination detection:** `_check_novel_proper_nouns()` logs warning when >3 capitalized words in output are absent from retrieved context
 - **Offline mode:** `_enable_offline_if_cached()` sets `HF_HUB_OFFLINE=1` when all models are cached locally
 - **Metal cache management:** Explicit `mx.clear_cache()` to release GPU memory between phases
@@ -403,6 +420,10 @@ FastAPI application with SSE streaming support:
 | `/api/geocode/reverse` | GET | Reverse geocode `lat/lon` to nearest canonical places |
 | `/api/geo/mentions` | GET | Grouped geocoded mentions with confidence/source filters |
 | `/api/geo/mentions/{mention_id}` | DELETE | Delete one persisted geo mention |
+| `/api/people` | GET | Canonical people list grouped from mention rows |
+| `/api/people/mentions` | GET | Mention-level rows for a canonical person |
+| `/api/people/merge` | POST | Merge one canonical name into another |
+| `/api/people/mentions/{mention_id}` | DELETE | Delete one persisted person mention |
 | `/api/sources` | GET | List ingested sources with metadata |
 | `/api/sources/ingest` | POST | Ingest document by file path |
 | `/api/sources/upload` | POST | Multipart file upload + ingest (50MB max, `.pdf`/`.md`/`.markdown`) |
@@ -416,10 +437,13 @@ FastAPI application with SSE streaming support:
 **Request/response schemas** (`src/api_schemas.py`):
 - `ChatRequest` -- supports AI SDK v3 (`content` string) and v6 (`parts` array) message formats
 - `QueryRequest` -- `query`, `mode`, `source_ids`, `citations_enabled`, `stream`, `intent_override`
-- `IngestRequest` -- `file_path`, `source_id`, `summarize`, `geotag`, `page_offset`
-- `SourceInfo` -- `source_id`, `summary`, `source_path`, `snapshot_path`, `source_size_bytes`, `content_size_bytes`
+- `IngestRequest` -- `file_path`, `source_id`, `summarize`, `geotag`, `peopletag`, `page_offset`
+- `SourceInfo` -- `source_id`, `summary`, `source_path`, `snapshot_path`, `source_size_bytes`, `content_size_bytes`, `page_offset`
 - `SourceContentResponse` -- `source_id`, `content`, `content_source` ("original"/"snapshot"/"summary"), `format` ("pdf"/"markdown"/"text")
 - `ChunkDetailResponse` & `ChunkBatchResponse` -- chunk text, parent text, page metadata, header path, format, source path
+- `PersonMention` -- `id`, `source_id`, `chunk_id`, `raw_name`, `canonical_name`, `confidence`, `method`, `role_hint`, `context_snippet`
+- `PersonSummary` -- `canonical_name`, `mention_count`, `source_count`, `source_ids[]`, `variants[]`, `roles[]`, `avg_confidence`
+- `PeopleListResponse`, `PersonMentionsResponse`, `PeopleMergeRequest`, `PeopleMergeResponse`
 - `HealthResponse` -- `status`, `engine_loaded`, `system_ram_gb`, `phoenix_configured`, `phoenix_active`, `phoenix_project_name`, `phoenix_endpoint`, `phoenix_error`
 - `FeedbackRequest` -- `trace_id`, `span_id`, `label`, `score?`, `comment?`
 - `ErrorResponse` -- `{error: {code, message}}`
@@ -477,30 +501,57 @@ Caches full-text snapshots so `/content` endpoint works even if original files a
 
 **Thread-safe:** Module-level singleton with threading locks. Model path resolution handles `model.safetensors` → `weights.safetensors` symlink/copy fix.
 
-### 4.15 Geospatial Mapping & Geocoder (`src/geocoder.py`, `src/ner.py`, `src/geo_types.py`)
+### 4.15 Geospatial & People Entity Indexing (`src/geocoder.py`, `src/ner.py`, `src/person_resolver.py`, `src/geo_types.py`)
 
-Offline geospatial subsystem for ingest-time place indexing and map exploration:
+Offline entity indexing subsystem for ingest-time enrichment and overlay exploration:
 
+**Geospatial path:**
 - **Offline geocoder:** `OfflineGeocoder` loads GeoNames `data/cities500.txt`, builds alias indexes + trigram candidate index + KDTree for spatial lookups
 - **Readiness states:** `GeocoderState` = `COLD`, `WARMING`, `READY`, `FAILED` (reported via `/api/geo/status`)
 - **Lookup modes:** exact alias match, trigram fuzzy fallback, region table proxy, reverse geocode, and near-radius lookups
 - **Validation constraints (API):**
   - `/api/geocode/near`: `lat ∈ [-90,90]`, `lon ∈ [-180,180]`, `radius_km ∈ [0,1000]`, `limit <= 200`
   - `/api/geocode/reverse`: `k ∈ [1,10]`
-- **NER bridge:** `extract_place_candidates_ner()` uses GLiNER (`city`) with regex fallback and context windows for disambiguation
-- **Persistence:** ingest geotag pipeline writes canonicalized mentions into `geo_mentions` (with confidence/method/ambiguity diagnostics)
+- **Persistence:** ingest geotag pipeline writes canonicalized rows into `geo_mentions` (confidence, method, ambiguity, candidate-count diagnostics)
 
-Frontend map (`frontend/src/components/map/CorpusMap.tsx`):
-- Uses MapLibre + React Query with cluster rendering
-- Applies source filtering and confidence threshold (persisted via `dh-map-threshold-v1`)
-- Supports mention-to-citation jump and mention deletion (`DELETE /api/geo/mentions/{mention_id}`)
+**People path:**
+- **NER candidates:** `extract_person_candidates_ner()` returns typed person candidates with confidence, offsets, and context windows
+- **Canonicalization:** `PersonResolver` (thread-safe singleton) normalizes titles and resolves mentions through exact, surname-fuzzy, and full-name-fuzzy matching
+- **Persistence:** ingest peopletag pipeline writes canonicalized rows into `person_mentions` (`raw_name`, `canonical_name`, `method`, `role_hint`, `context_snippet`)
+- **Manual curation:** API supports mention delete (`DELETE /api/people/mentions/{id}`) and canonical merge (`POST /api/people/merge`)
+
+**Shared optimization:**
+- When both `geotag=True` and `peopletag=True`, ingest performs one GLiNER pass via `extract_place_and_person_candidates_ner()` and fans out to both pipelines
+
+```mermaid
+flowchart LR
+    CC["Child chunks"]
+    NER["Shared GLiNER pass<br/>city + person"]
+    GEO["Offline geocoder<br/>forward_batch + disambiguation"]
+    PR["PersonResolver<br/>exact + fuzzy canonicalization"]
+    GM[("geo_mentions")]
+    PM[("person_mentions")]
+    API["/api/geo/* and /api/people/*"]
+    UI["Map + People overlays"]
+
+    CC --> NER
+    NER -->|"place candidates"| GEO --> GM
+    NER -->|"person candidates"| PR --> PM
+    GM --> API
+    PM --> API
+    API --> UI
+```
+
+Frontend overlays:
+- Map (`frontend/src/components/map/CorpusMap.tsx`) uses MapLibre + React Query with source filters and threshold controls
+- People dictionary (`frontend/src/components/people/PeopleDictionary.tsx`) provides search, canonical merge, mention deletion, and jump-to-document actions
 
 ### 4.16 CLI (`src/cli.py`)
 
 Thin wrapper around `RagEngine` for terminal workflows:
 
 **Commands:**
-- `ingest FILE --source-id ID [--summarize] [--mode MODE] [--page-number N] [--page-offset N] [--geotag]`
+- `ingest FILE --source-id ID [--summarize] [--mode MODE] [--page-number N] [--page-offset N] [--geotag] [--peopletag]`
 - `query TEXT [--source-id ID] [--cite|--no-cite] [--mode MODE] [--latency] [--intent INTENT] [--dump-prompt] [--no-generate] [--list-sources]`
 
 **Phoenix flags (shared):** `--phoenix`, `--no-phoenix`, `--phoenix-project`, `--phoenix-endpoint`, `--phoenix-api-key`, `--phoenix-auto-instrument`, `--phoenix-no-batch`
@@ -553,46 +604,29 @@ OpenTelemetry tracing integration with Phoenix export + feedback loop:
 
 ```
 Page (app/page.tsx)
-  Providers (app/providers.tsx)
-    ThemeProvider (context/theme-context.tsx)
-      AppProvider (context/app-context.tsx)
-        TooltipProvider
-          Header Bar: Mode Tabs (RAG | Non-RAG) + Map Toggle + New Chat + Theme Picker + History Toggle
-          Body (flex):
-            SourcePanel (aside, 30% max 24rem, collapsible)
-              ─ or ─ CitationPanelReader (replaces source panel when citation active)
-            Main:
-              (RAG mode — always mounted, toggled via opacity)
-                RagArea → AssistantRuntimeProvider + useChatRuntime
-                  MessageIdTracker (headless message ID sync)
-                  Thread (assistant-ui)
-                    ThreadWelcome (typewriter "Hello there!" + suggestion grid)
-                    AssistantMessage
-                      ThinkingPanel (reasoning chain + pipeline steps)
-                      ChatMarkdownRenderer (streamdown, smooth streaming)
-                      MessageReferences (citation drawer + copy)
-                      MessageTimingBadge (time, tokens/sec)
-                    Composer
-                      ModelSelector (RAM-gated)
-                      IntentSelector (12 intents)
-                      Think toggle (3-state, ≥48GB RAM)
-                      Speech button
-                      Send/Cancel button
-              (Freeform mode — always mounted, toggled via opacity)
-                FreeformChatPanel (session-persistent chat)
-                  Model selector (Regular / Deep Research)
-                  Thinking toggle + display (ReasoningRoot)
-                  Custom SSE streaming → /api/freeform/chat
-              MapOverlay (modal card over main area)
-                CorpusMap (MapLibre clusters + mention drill-down)
-                confidence slider + source-count indicator
-            HistoryPanel (right-side drawer, w-72)
-          Background Theme Layer (absolute-positioned WebGL/CSS effects)
+  BackgroundLayer (lazy-loaded theme component)
+  TopBar (mode tabs + map/people/history toggles + theme picker)
+  Body (flex):
+    SourcePanelContainer (collapsible sidebar shell)
+      SourcePanel
+        ─ or ─ CitationPanelReader (when activeCitation is set)
+    Main (relative, always-mounted layers):
+      Layer 1: RagArea (AssistantRuntimeProvider + useChatRuntime)
+        MessageIdTracker
+        Thread (assistant-ui)
+      Layer 2: FreeformChatPanel (custom SSE)
+      OverlayPanel(title="map")
+        CorpusMap + confidence slider
+      OverlayPanel(title="people dictionary")
+        PeopleDictionary (search/sort/merge/delete/view workflows)
+    HistoryPanel (right-side drawer)
 ```
 
 **Dual-mode always-mounted architecture:** Both RAG and Freeform panels are always mounted simultaneously. Visibility is toggled via `opacity` + `pointer-events` CSS -- neither panel loses state when switching modes.
 
 **Re-keying for new chat:** `ragKey` and `freeformKey` state counters force full component re-mount rather than clearing state.
+
+**Overlay exclusivity:** Map and People overlays are mutually exclusive in `page.tsx`; opening one closes the other.
 
 ### 5.3 State Shape (`AppState`)
 
@@ -611,10 +645,11 @@ Page (app/page.tsx)
   currentAssistantMessageId: string | null; // Active streaming message
   intentOverride: string;              // User-forced intent ("auto" = automatic)
   chatMode: "rag" | "freeform";       // Active UI mode
+  selectedSourceIds: string[];         // Source IDs selected in SourcePanel
 }
 ```
 
-**14 action types:** `QUERY_STARTED`, `QUERY_FINISHED`, `SET_STATUS`, `SET_ERROR`, `CLEAR_ERROR`, `SET_INTENT`, `SET_SOURCES`, `SET_CITATIONS`, `SET_CURRENT_MESSAGE_ID`, `SET_ACTIVE_CITATION`, `ADD_THINKING_STEP`, `SET_TRACE_INFO`, `SET_INTENT_OVERRIDE`, `SET_CHAT_MODE`
+**15 action types:** `QUERY_STARTED`, `QUERY_FINISHED`, `SET_STATUS`, `SET_ERROR`, `CLEAR_ERROR`, `SET_INTENT`, `SET_SOURCES`, `SET_CITATIONS`, `SET_CURRENT_MESSAGE_ID`, `SET_ACTIVE_CITATION`, `ADD_THINKING_STEP`, `SET_TRACE_INFO`, `SET_INTENT_OVERRIDE`, `SET_CHAT_MODE`, `SET_SELECTED_SOURCE_IDS`
 
 ### 5.4 API Client (`lib/api-client.ts`)
 
@@ -625,12 +660,16 @@ Page (app/page.tsx)
 | `listSources()` | `GET /api/sources` | |
 | `getContent(sourceId)` | `GET /api/sources/:id/content` | Returns content + format |
 | `deleteSource(sourceId)` | `DELETE /api/sources/:id` | |
-| `uploadDocument(file, sourceId, summarize, pageOffset?, geotag?)` | `POST /api/sources/upload` | **Bypasses Next.js proxy** (calls backend directly) to avoid ~30s timeout |
+| `uploadDocument(file, sourceId, summarize, pageOffset?, geotag?, peopletag?)` | `POST /api/sources/upload` | **Bypasses Next.js proxy** (calls backend directly) to avoid ~30s timeout |
 | `getChunk(sourceId, chunkId)` | `GET /api/sources/:id/chunk/:cid` | |
 | `getChunks(sourceId, chunkIds)` | `GET /api/sources/:id/chunks?ids=...` | Batch fetch |
-| `ingest(filePath, sourceId, summarize, geotag)` | `POST /api/sources/ingest` | JSON body |
+| `ingest(filePath, sourceId, summarize, geotag, peopletag)` | `POST /api/sources/ingest` | JSON body |
 | `getGeoMentions(sourceId?, minConfidence, limit, offset, detailed, sourceIds?)` | `GET /api/geo/mentions` | Source-aware grouped map payload |
 | `deleteGeoMention(mentionId)` | `DELETE /api/geo/mentions/:mentionId` | Manual map mention cleanup |
+| `getPeople(sourceId?, minConfidence, q?, limit, offset, sourceIds?)` | `GET /api/people` | Canonical person list for selected sources |
+| `getPeopleMentions(canonicalName, sourceId?, minConfidence, limit, offset, sourceIds?)` | `GET /api/people/mentions` | Mention-level rows for one canonical person |
+| `deletePeopleMention(mentionId)` | `DELETE /api/people/mentions/:mentionId` | Remove a single person mention |
+| `mergePeopleCanonical(source, target)` | `POST /api/people/merge` | Canonical-name merge operation |
 
 **Backend URL resolution** (`lib/backend-url.ts`): `NEXT_PUBLIC_BACKEND_URL` env var or `http://127.0.0.1:8000`
 
@@ -722,11 +761,11 @@ Multiple coordinated modules handle the full citation lifecycle:
 
 ### 5.10 Background Themes
 
-8 visual themes managed by `ThemeProvider` (persisted to `localStorage` key `dh-background-theme`):
+7 visual themes managed by `ThemeProvider` (persisted to `localStorage` key `dh-background-theme`):
 
-`none`, `beams`, `meteors`, `rain`, `mesh` (gradient), `paths`, `starfield`, `particles`
+`stars`, `meteors`, `rain`, `mesh` (gradient), `starfield`, `particles`, `darkveil`
 
-WebGL backgrounds rendered via `@react-three/fiber` (`components/gl/`). CSS-only fallbacks for simpler effects (beams, meteors, rain). GPU particle simulation with `Leva` parameter controls.
+Backgrounds are lazy-loaded from `components/ui/*` by `BackgroundLayer`; map/people overlays pause background rendering when open and when the tab is hidden.
 
 ### 5.11 Thread Features
 
@@ -740,12 +779,22 @@ WebGL backgrounds rendered via `@react-three/fiber` (`components/gl/`). CSS-only
 ### 5.12 Geospatial Map UX
 
 - Header-level **Map** toggle opens a full main-panel overlay without unmounting chat panels
+- Map and People overlays are mutually exclusive to keep interaction focus
 - Confidence slider range: **0.50–0.99**, persisted in `localStorage` key `dh-map-threshold-v1`
 - Map payload is source-aware: only currently selected source IDs are rendered
 - Clustered points (MapLibre) expand on click; single-place click opens right-side mention detail drawer
 - Mention actions:
   - **View source** → opens citation viewer at chunk with exact matched-input highlight
   - **Delete mention** → calls `DELETE /api/geo/mentions/{mention_id}` then invalidates/refetches query cache to avoid stale map state
+
+### 5.13 People Dictionary UX
+
+- Header-level **People** toggle opens a full main-panel overlay without unmounting chat panels
+- Source-aware filtering: uses selected source IDs from `AppState.selectedSourceIds`
+- React Query keys: `people-list`, `people-mentions`, and `people-merge-candidates`
+- Sorting/search: frequency or alphabetical sort + debounced canonical/variant search
+- Mention actions: view in document (`GET /api/sources/{id}/chunk/{cid}`), delete mention(s), merge canonical names
+- Page resolution: chunk metadata is batch-fetched and cached to produce stable labels (`Page N` / `Pages N-M`)
 
 ---
 
@@ -957,9 +1006,13 @@ Frontend: IngestModal → sequential upload queue → POST /api/sources/upload (
         │
         ├── storage.add_parents(parents) + storage.add_children(children, embeddings)
         │
-        ├── Optional: _geotag_chunks(source_id, children, storage)
-        │     → GLiNER candidate extraction + offline geocoder.forward()
-        │     → storage.upsert_geo_mentions()
+        ├── Optional entity indexing:
+        │     if geotag && peopletag:
+        │       extract_place_and_person_candidates_ner()  # single GLiNER pass
+        │       _geotag_chunks(...)    → storage.upsert_geo_mentions()
+        │       _peopletag_chunks(...) → storage.upsert_person_mentions()
+        │     else:
+        │       _geotag_chunks(...) and/or _peopletag_chunks(...)
         │
         ├── Optional: generator.generate_chat(summary prompt)
         │     → storage.upsert_source_summary()
@@ -988,6 +1041,31 @@ Frontend: Map toggle → CorpusMap
     → React Query invalidate/refetch
 ```
 
+### 8.5 People Dictionary Flow
+
+```
+Frontend: People overlay toggle → PeopleDictionary
+  │
+  ├── sourceApi.getPeople(...sourceIds, q)
+  │     GET /api/people
+  │     → grouped canonical list (mention_count, variants, source_ids)
+  │
+  ├── Expand canonical entry
+  │     sourceApi.getPeopleMentions(canonical_name, ...sourceIds)
+  │     GET /api/people/mentions
+  │
+  ├── View mention in document
+  │     GET /api/sources/{id}/chunk/{cid} → SET_ACTIVE_CITATION
+  │
+  ├── Delete mention(s)
+  │     DELETE /api/people/mentions/{mention_id}
+  │     → invalidate people-list + people-mentions queries
+  │
+  └── Merge canonical names
+        POST /api/people/merge
+        → storage rewrite + resolver re-warm + query refetch
+```
+
 ---
 
 ## 9. File Structure
@@ -996,43 +1074,44 @@ Frontend: Map toggle → CorpusMap
 
 | File | ~Lines | Purpose |
 |------|--------|---------|
-| `api.py` | 1310 | FastAPI endpoints, SSE streaming, engine hot-swap, freeform chat |
-| `api_schemas.py` | 320 | Pydantic request/response models (AI SDK v3 + v6 support) |
-| `rag_engine.py` | 1690 | Central orchestrator, query/ingest pipeline, output sanitization |
-| `retrieval.py` | 680 | 7-stage hybrid search pipeline, intent-scaled parameters |
-| `storage.py` | 655 | LanceDB tables, hybrid search, FTS management, schema migration |
-| `generator.py` | 930 | MLX text generation, streaming, token budget packing, presence penalty |
-| `reranker.py` | 425 | Jina v3 MLX listwise reranker, MLP projector, cosine scoring |
-| `intent.py` | 965 | Heuristic + LLM intent classification (12 intents), typo tolerance |
-| `generation.py` | 560 | Intent-aware prompt/message building (12 profiles × 2 mode variants) |
-| `embeddings.py` | 155 | MLX embedding model wrapper (Qwen3-Embedding-0.6B), mean pooling |
-| `config.py` | 365 | Mode configs, RAM detection, intent retrieval/generation overrides |
-| `ingest.py` | 530 | PDF/Markdown parsing, chunking, summarization |
-| `geocoder.py` | 1077 | Offline GeoNames geocoder (forward/reverse/near + fuzzy disambiguation) |
-| `ner.py` | 164 | GLiNER place extraction with regex fallback for ingest geotagging |
+| `api.py` | 2098 | FastAPI endpoints, SSE streaming, geo/people/source APIs, engine hot-swap |
+| `api_schemas.py` | 437 | Pydantic request/response models (query, source, geo, people, health) |
+| `rag_engine.py` | 2596 | Central orchestrator, query/ingest pipeline, citation dedup/sanitization |
+| `retrieval.py` | 1390 | 7-stage hybrid retrieval, intent-aware scaling, metrics instrumentation |
+| `storage.py` | 1606 | LanceDB tables (child/parent/summaries/geo/person), schema migration, cascades |
+| `generator.py` | 945 | MLX text generation, streaming, token budget packing, presence penalty |
+| `reranker.py` | 423 | Jina v3 MLX listwise reranker, MLP projector, cosine scoring |
+| `intent.py` | 973 | Heuristic + LLM intent classification (12 intents), typo tolerance |
+| `generation.py` | 635 | Intent-aware prompt/message building (12 profiles × 2 mode variants) |
+| `embeddings.py` | 475 | MLX embedding wrapper with last-token pooling and instruction prefixes |
+| `config.py` | 441 | Mode configs, RAM detection, retrieval overrides, geotag/peopletag knobs |
+| `ingest.py` | 1003 | PDF/Markdown parsing, chunking, shared geo/person NER enrichment |
+| `geocoder.py` | 1381 | Offline GeoNames geocoder with hardened fuzzy/coherence disambiguation |
+| `ner.py` | 678 | GLiNER place/person extraction with windowed inference and typed candidates |
+| `person_resolver.py` | 438 | Canonical person resolver with exact/fuzzy matching and promotion |
 | `geo_types.py` | 18 | Shared geocoder enums/states |
-| `models.py` | 35 | ParentChunk, ChildChunk, Metadata (frozen Pydantic) |
-| `stream_protocol.py` | 252 | AI SDK v6 UI Message Stream encoder (SSE frames) |
-| `query_events.py` | 96 | Streaming event dataclasses (9 types, including TraceEvent) |
+| `models.py` | 63 | ParentChunk, ChildChunk, Metadata (frozen Pydantic models) |
+| `stream_protocol.py` | 251 | AI SDK v6 UI Message Stream encoder (SSE frames) |
+| `query_events.py` | 105 | Streaming event dataclasses (9 event types, including TraceEvent) |
 | `metrics.py` | 170 | Retrieval/budget metrics collection (6 dataclasses) |
 | `latency.py` | 107 | Zero-cost wall-clock latency profiler with ASCII chart |
-| `source_cache.py` | 175 | Text snapshot caching with filesystem-safe naming |
-| `transcription.py` | 387 | MLX Whisper speech-to-text with VAD |
-| `phoenix_tracing.py` | 646 | Phoenix/OpenTelemetry setup and span attribute helpers |
-| `cli.py` | 383 | CLI entry point (ingest + query commands) |
+| `source_cache.py` | 182 | Text snapshot caching with filesystem-safe naming |
+| `transcription.py` | 590 | MLX Whisper speech-to-text with VAD |
+| `phoenix_tracing.py` | 752 | Phoenix/OpenTelemetry setup and span attribute helpers |
+| `cli.py` | 583 | CLI entry point (ingest/query with geotag + peopletag options) |
 
 ### Frontend (`frontend/src/`)
 
 | File | Purpose |
 |------|---------|
-| `app/page.tsx` | Entry point, dual-mode layout (always-mounted RAG + Freeform), theme picker, session restore |
+| `app/page.tsx` | Entry point, modular layout composition, dual-mode mount, map/people overlays |
 | `app/layout.tsx` | Root layout, metadata, Geist fonts |
 | `app/providers.tsx` | ThemeProvider → AppProvider → TooltipProvider hierarchy |
 | `app/api/chat/route.ts` | Next.js streaming proxy to backend `/api/chat` (unbuffered, half-duplex) |
 | `app/globals.css` | Dark theme, citation highlight `<mark>`, scrollbar, shimmer animations |
-| `context/app-context.tsx` | Global state (useReducer, 14 actions, dual-context pattern) |
-| `context/theme-context.tsx` | Background theme state (8 themes, localStorage persistence) |
-| `lib/api-client.ts` | Typed API client singleton for source CRUD (direct backend URL for uploads) |
+| `context/app-context.tsx` | Global state (useReducer, 15 actions including selected source IDs) |
+| `context/theme-context.tsx` | Background theme state (7 themes, localStorage persistence) |
+| `lib/api-client.ts` | Typed API client for source + geo + people operations (direct upload path) |
 | `lib/backend-url.ts` | Backend URL resolution (`NEXT_PUBLIC_BACKEND_URL` or `127.0.0.1:8000`) |
 | `lib/event-parser.ts` | AI SDK v6 `onData` → typed `CustomEvent` parser (includes trace-id events) |
 | `lib/session-store.ts` | IndexedDB session persistence (chat history with reasoning content) |
@@ -1042,10 +1121,16 @@ Frontend: Map toggle → CorpusMap
 | `lib/group-citations.ts` | Citation index grouping by source with deduplication |
 | `lib/utils.ts` | `cn()` -- `twMerge(clsx(...))` for Tailwind class merging |
 | `components/source-panel.tsx` | Source management, sequential upload queue, inline status, citation reader swap |
+| `components/people/PeopleDictionary.tsx` | Canonical people list, mention browsing, merge/delete/view actions |
+| `components/layout/top-bar.tsx` | Header chrome with mode tabs, map/people toggles, theme/history controls |
+| `components/layout/source-panel-container.tsx` | Collapsible source sidebar wrapper |
+| `components/layout/overlay-panel.tsx` | Shared animated overlay shell for map and people panels |
+| `components/layout/rag-area.tsx` | RAG runtime wrapper (`useChatRuntime` + stream callbacks) |
+| `components/layout/background-layer.tsx` | Lazy-loaded theme background manager |
 | `components/freeform-chat-panel.tsx` | Freeform streaming chat, model/thinking selection, AI-generated titles |
 | `components/history-panel.tsx` | Chat history drawer with debounced search, session restore, glassmorphism |
 | `components/citation-viewer-modal.tsx` | Inline citation reader (replaces source panel), parallel content + chunk fetch |
-| `components/ingest-modal.tsx` | Drag-drop upload with optional citation reference text field |
+| `components/ingest-modal.tsx` | Drag-drop upload with geotag/peopletag toggles and citation reference input |
 | `components/map/CorpusMap.tsx` | MapLibre geospatial layer with clustering, filtering, and mention actions |
 | `components/chat-markdown.tsx` | Citation-aware react-markdown for freeform mode |
 | `components/markdown-renderer.tsx` | Document markdown rendering with heading anchors + highlight pipeline |
@@ -1059,8 +1144,10 @@ Frontend: Map toggle → CorpusMap
 | `components/assistant-ui/chat-markdown-renderer.tsx` | Streamdown-based citation-aware markdown for RAG mode (smooth streaming) |
 | `components/assistant-ui/markdown-text.tsx` | Standard markdown with code header + copy button |
 | `components/assistant-ui/tool-fallback.tsx` | Collapsible tool call display |
-| `components/gl/` | WebGL background scene (particles, shaders, vignette) |
-| `components/ui/` | 17 UI primitives (button, dialog, picker, avatar, tooltip, starfield, meteors, rain, beams, mesh-gradient, paths, particles, typewriter-text, checkbox, collapsible, liquid-glass-button, velocity-morph) |
+| `components/gl/` | Experimental WebGL background scene modules |
+| `components/ui/` | UI primitives and themed backgrounds (`stars`, `meteors`, `rain`, `mesh`, `starfield`, `particles`, `dark-veil`) |
+| `hooks/use-stream-handler.ts` | AI SDK stream annotation bridge into AppContext dispatch |
+| `hooks/use-persisted-state.ts` | localStorage-backed numeric state with cross-tab sync |
 | `hooks/useSpeechToText.ts` | Offline speech-to-text hook (MediaRecorder → POST /api/transcribe, 2s chunks) |
 | `hooks/useSystemRam.ts` | System RAM detection via `/api/health` (gates Deep Research + Think toggle) |
 
@@ -1074,6 +1161,12 @@ python -m src.cli ingest docs/paper.pdf --source-id my_paper --summarize
 
 # CLI: Ingest + geotag locations
 python -m src.cli ingest docs/paper.pdf --source-id my_paper --summarize --geotag
+
+# CLI: Ingest + people indexing
+python -m src.cli ingest docs/paper.pdf --source-id my_paper --summarize --peopletag
+
+# CLI: Ingest + geotag + people indexing
+python -m src.cli ingest docs/paper.pdf --source-id my_paper --summarize --geotag --peopletag
 
 # CLI: Query (auto mode, with citations)
 python -m src.cli query "What is the main argument?" --cite
@@ -1103,8 +1196,23 @@ curl -F "file=@paper.pdf" -F "source_id=my_paper" -F "summarize=true" \
 curl -F "file=@paper.pdf" -F "source_id=my_paper" -F "summarize=true" -F "geotag=true" \
   http://127.0.0.1:8000/api/sources/upload
 
+# API: Upload + peopletag
+curl -F "file=@paper.pdf" -F "source_id=my_paper" -F "summarize=true" -F "peopletag=true" \
+  http://127.0.0.1:8000/api/sources/upload
+
 # API: List geo mentions (source-filtered)
 curl "http://127.0.0.1:8000/api/geo/mentions?min_confidence=0.75&source_ids=my_paper"
+
+# API: List canonical people (source-filtered)
+curl "http://127.0.0.1:8000/api/people?source_ids=my_paper"
+
+# API: List mention rows for one canonical person
+curl "http://127.0.0.1:8000/api/people/mentions?canonical_name=Noam%20Chomsky&source_ids=my_paper"
+
+# API: Merge canonical names
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"source_canonical_name":"Chomsky","target_canonical_name":"Noam Chomsky"}' \
+  http://127.0.0.1:8000/api/people/merge
 
 # API: Reverse geocode
 curl "http://127.0.0.1:8000/api/geocode/reverse?lat=51.9&lon=-8.47&k=3"
@@ -1137,7 +1245,7 @@ cd frontend && npm run dev
 | **Observability** | `arize-phoenix-otel` |
 | **Speech** | `mlx-whisper`, `soundfile`, `scipy`, `av` (PyAV) |
 | **Geospatial** | `rapidfuzz`, `pycountry` |
-| **NER (Geo ingest)** | `gliner`, `gliner-spacy` |
+| **NER (Geo + People ingest)** | `gliner`, `gliner-spacy` |
 | **System** | `psutil` (optional, RAM detection) |
 
 ### Frontend (Node.js)
@@ -1163,6 +1271,7 @@ data/
     parent_chunks.lance/    # Parent text for context expansion
     source_summaries.lance/ # Per-source metadata + summaries
     geo_mentions.lance/     # Geocoded place mentions for map rendering
+    person_mentions.lance/  # Canonicalized person mentions for People Dictionary
   cities500.txt             # GeoNames canonical place dataset
   geo_version.json          # GeoNames checksum/build metadata
   source_cache/             # Full-text snapshots (.txt)
