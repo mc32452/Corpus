@@ -555,3 +555,134 @@ class TestPersonMentionsStorage:
         kept_rows = tmp_storage.get_person_mentions(source_id="doc_keep", min_confidence=0.0)
         assert deleted_rows == []
         assert len(kept_rows) == 1
+
+    def test_delete_source_cascades_geo_mentions(self, tmp_storage: StorageEngine) -> None:
+        parent = ParentChunk(
+            id="p-geo-del",
+            text="delete-source geo test",
+            metadata=Metadata(
+                source_id="doc_geo_del",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        tmp_storage.add_parents([parent])
+        tmp_storage.upsert_geo_mentions(
+            [
+                {
+                    "id": "gm-del",
+                    "source_id": "doc_geo_del",
+                    "chunk_id": "c-geo-del",
+                    "place_name": "Paris",
+                    "matched_input": "Paris",
+                    "matched_on": "paris",
+                    "geonameid": 2988507,
+                    "lat": 48.8566,
+                    "lon": 2.3522,
+                    "confidence": 0.95,
+                    "method": "exact",
+                },
+                {
+                    "id": "gm-keep",
+                    "source_id": "doc_geo_keep",
+                    "chunk_id": "c-geo-keep",
+                    "place_name": "London",
+                    "matched_input": "London",
+                    "matched_on": "london",
+                    "geonameid": 2643743,
+                    "lat": 51.5072,
+                    "lon": -0.1276,
+                    "confidence": 0.94,
+                    "method": "exact",
+                },
+            ]
+        )
+
+        tmp_storage.delete_source("doc_geo_del")
+
+        deleted_rows = tmp_storage.get_geo_mentions(source_id="doc_geo_del", min_confidence=0.0)
+        kept_rows = tmp_storage.get_geo_mentions(source_id="doc_geo_keep", min_confidence=0.0)
+        assert deleted_rows == []
+        assert len(kept_rows) == 1
+
+    def test_delete_source_cascades_geo_and_person_mentions(self, tmp_storage: StorageEngine) -> None:
+        parent = ParentChunk(
+            id="p-both-del",
+            text="delete-source combined entity test",
+            metadata=Metadata(
+                source_id="doc_both_del",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        tmp_storage.add_parents([parent])
+
+        tmp_storage.upsert_geo_mentions(
+            [
+                {
+                    "id": "gm-both-del",
+                    "source_id": "doc_both_del",
+                    "chunk_id": "c-both-del",
+                    "place_name": "Rome",
+                    "matched_input": "Rome",
+                    "matched_on": "rome",
+                    "geonameid": 3169070,
+                    "lat": 41.9028,
+                    "lon": 12.4964,
+                    "confidence": 0.96,
+                    "method": "exact",
+                },
+                {
+                    "id": "gm-both-keep",
+                    "source_id": "doc_both_keep",
+                    "chunk_id": "c-both-keep",
+                    "place_name": "Athens",
+                    "matched_input": "Athens",
+                    "matched_on": "athens",
+                    "geonameid": 264371,
+                    "lat": 37.9838,
+                    "lon": 23.7275,
+                    "confidence": 0.93,
+                    "method": "exact",
+                },
+            ]
+        )
+        tmp_storage.upsert_person_mentions(
+            [
+                {
+                    "id": "pm-both-del",
+                    "source_id": "doc_both_del",
+                    "chunk_id": "c-both-del",
+                    "raw_name": "Noam Chomsky",
+                    "canonical_name": "Noam Chomsky",
+                    "confidence": 0.92,
+                    "method": "new",
+                    "role_hint": "author",
+                    "context_snippet": "context",
+                },
+                {
+                    "id": "pm-both-keep",
+                    "source_id": "doc_both_keep",
+                    "chunk_id": "c-both-keep",
+                    "raw_name": "Michel Foucault",
+                    "canonical_name": "Michel Foucault",
+                    "confidence": 0.9,
+                    "method": "new",
+                    "role_hint": "subject",
+                    "context_snippet": "context",
+                },
+            ]
+        )
+
+        tmp_storage.delete_source("doc_both_del")
+
+        assert tmp_storage.get_geo_mentions(source_id="doc_both_del", min_confidence=0.0) == []
+        assert tmp_storage.get_person_mentions(source_id="doc_both_del", min_confidence=0.0) == []
+        assert len(tmp_storage.get_geo_mentions(source_id="doc_both_keep", min_confidence=0.0)) == 1
+        assert len(tmp_storage.get_person_mentions(source_id="doc_both_keep", min_confidence=0.0)) == 1
