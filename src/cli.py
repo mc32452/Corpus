@@ -24,14 +24,14 @@ _VALID_FTS_POLICIES = ("immediate", "deferred", "batch")
 
 
 def _get_fts_policy_default() -> str:
-    raw = os.getenv("RAG_FTS_REBUILD_POLICY", "deferred").strip().lower()
+    raw = os.getenv("RAG_FTS_REBUILD_POLICY", "immediate").strip().lower()
     if raw in _VALID_FTS_POLICIES:
         return raw
     if raw:
         logger.warning(
-            "Invalid RAG_FTS_REBUILD_POLICY='%s'; falling back to 'deferred'", raw
+            "Invalid RAG_FTS_REBUILD_POLICY='%s'; falling back to 'immediate'", raw
         )
-    return "deferred"
+    return "immediate"
 
 
 def _get_fts_batch_size_default() -> int:
@@ -114,6 +114,11 @@ def run() -> None:
         type=int,
         default=1,
         help="Starting page number for the first physical PDF page (default: 1). No effect on Markdown files.",
+    )
+    ingest_parser.add_argument(
+        "--citation-reference",
+        default=None,
+        help="Optional citation reference label persisted with source metadata.",
     )
     ingest_parser.add_argument(
         "--lance", default="data/lance", help="LanceDB directory"
@@ -485,6 +490,7 @@ def run() -> None:
             summarize=args.summarize,
             geotag=args.geotag,
             peopletag=args.peopletag,
+            citation_reference=args.citation_reference,
             page_offset=args.page_offset,
         )
         print(f"Ingested {result.parents_count} parents and {result.children_count} children.")

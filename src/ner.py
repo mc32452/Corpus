@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import warnings
 from typing import TypedDict
 
 log = logging.getLogger(__name__)
@@ -175,7 +176,27 @@ def _estimate_token_count(text: str, *, model: object | None = None) -> int:
                 pass
 
     words = len(text.split())
-    return max(1, int(words * _TOKEN_ESTIMATE_MULTIPLIER))
+    word_estimate = int(words * _TOKEN_ESTIMATE_MULTIPLIER)
+    char_estimate = int(len(text) / 3.2)
+    return max(1, word_estimate, char_estimate)
+
+
+def _is_gliner_truncation_warning(message: object) -> bool:
+    text = str(message).lower()
+    return "truncated to" in text and str(_GLINER_MAX_SEQUENCE_TOKENS) in text
+
+
+def _predict_entities_with_warning_capture(
+    model: object,
+    text_or_texts: str | list[str],
+    labels: list[str],
+    threshold: float,
+) -> tuple[object, bool]:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", UserWarning)
+        entities = model.predict_entities(text_or_texts, labels, threshold=threshold)
+    saw_truncation = any(_is_gliner_truncation_warning(warning.message) for warning in captured)
+    return entities, saw_truncation
 
 
 def _token_spans(text: str) -> list[tuple[int, int]]:
@@ -230,28 +251,36 @@ def _predict_entities_windowed(
     word_count = len(text.split())
     estimated_tokens = _estimate_token_count(text, model=model)
     if estimated_tokens <= _GLINER_SAFE_SEQUENCE_TOKENS and word_count <= _GLINER_SAFE_SEQUENCE_TOKENS:
-        entities = model.predict_entities(text, labels, threshold=threshold)
-        rows: list[_EntityCandidate] = []
-        for ent in entities:
-            candidate = str(ent.get("text", "")).strip()
-            if not candidate:
-                continue
-            ent_start, ent_end = _coerce_bounds(text, candidate, ent.get("start"), ent.get("end"))
-            score_raw = ent.get("score", 0.0)
-            try:
-                score = float(score_raw)
-            except (TypeError, ValueError):
-                score = 0.0
-            rows.append(
-                {
-                    "text": candidate,
-                    "entity_type": str(ent.get("label", "")).upper().strip() or "UNKNOWN",
-                    "score": score,
-                    "start": ent_start,
-                    "end": ent_end,
-                }
-            )
-        return rows
+        entities, saw_truncation = _predict_entities_with_warning_capture(
+            model,
+            text,
+            labels,
+            threshold,
+        )
+        if saw_truncation:
+            entities = []
+        else:
+            rows: list[_EntityCandidate] = []
+            for ent in entities:
+                candidate = str(ent.get("text", "")).strip()
+                if not candidate:
+                    continue
+                ent_start, ent_end = _coerce_bounds(text, candidate, ent.get("start"), ent.get("end"))
+                score_raw = ent.get("score", 0.0)
+                try:
+                    score = float(score_raw)
+                except (TypeError, ValueError):
+                    score = 0.0
+                rows.append(
+                    {
+                        "text": candidate,
+                        "entity_type": str(ent.get("label", "")).upper().strip() or "UNKNOWN",
+                        "score": score,
+                        "start": ent_start,
+                        "end": ent_end,
+                    }
+                )
+            return rows
 
     spans = _token_spans(text)
     if not spans:
@@ -284,11 +313,23 @@ def _predict_entities_windowed(
             else:
                 hi = mid - 1
 
-        end_idx = best_end_idx
-        window_end_char = spans[end_idx - 1][1]
-        window_text = text[window_start_char:window_end_char]
+        current_end_idx = best_end_idx
+        while True:
+            window_end_char = spans[current_end_idx - 1][1]
+            window_text = text[window_start_char:window_end_char]
+            entities, saw_truncation = _predict_entities_with_warning_capture(
+                model,
+                window_text,
+                labels,
+                threshold,
+            )
+            if not saw_truncation or current_end_idx <= start_idx + 1:
+                end_idx = current_end_idx
+                break
+            span_size = current_end_idx - start_idx
+            reduced_span = max(1, span_size // 2)
+            current_end_idx = start_idx + reduced_span
 
-        entities = model.predict_entities(window_text, labels, threshold=threshold)
         for ent in entities:
             candidate = str(ent.get("text", "")).strip()
             if not candidate:
@@ -331,6 +372,34 @@ def _predict_entity_candidates(
     labels: list[str],
     threshold: float,
 ) -> list[list[_EntityCandidate]]:
+    def _rows_for_text(text: str, entities_for_text: list[dict]) -> list[_EntityCandidate]:
+        rows: list[_EntityCandidate] = []
+        for ent in entities_for_text or []:
+            candidate = str(ent.get("text", "")).strip()
+            if not candidate:
+                continue
+            ent_start, ent_end = _coerce_bounds(
+                text,
+                candidate,
+                ent.get("start"),
+                ent.get("end"),
+            )
+            score_raw = ent.get("score", 0.0)
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                score = 0.0
+            rows.append(
+                {
+                    "text": candidate,
+                    "entity_type": str(ent.get("label", "")).upper().strip() or "UNKNOWN",
+                    "score": score,
+                    "start": ent_start,
+                    "end": ent_end,
+                }
+            )
+        return rows
+
     model = _get_model()
     if model is None:
         raise RuntimeError("GLiNER model unavailable")
@@ -359,7 +428,12 @@ def _predict_entity_candidates(
         if short_indices:
             batch_texts = [texts[i] for i in short_indices]
             try:
-                raw_batch_entities = model.predict_entities(batch_texts, labels, threshold=threshold)
+                raw_batch_entities, saw_batch_truncation = _predict_entities_with_warning_capture(
+                    model,
+                    batch_texts,
+                    labels,
+                    threshold,
+                )
             except TypeError:
                 # Older GLiNER versions may not support list inputs; fall back to per-text.
                 for i in short_indices:
@@ -370,12 +444,13 @@ def _predict_entity_candidates(
                         threshold=threshold,
                     )
             else:
+                batch_entities: list[list[dict]] | None = None
                 # GLiNER should return a list of lists (one per input text). If we
                 # instead get a flat list or a non-list type, treat that as an
                 # unsupported batch mode and fall back to per-text windowed inference
                 # for this batch to avoid mis-aligning entities to texts.
                 if not isinstance(raw_batch_entities, list):
-                    batch_entities: list[list[dict]] | None = None
+                    batch_entities = None
                 elif raw_batch_entities and all(
                     not isinstance(item, list) for item in raw_batch_entities
                 ):
@@ -393,37 +468,38 @@ def _predict_entity_candidates(
                             labels=labels,
                             threshold=threshold,
                         )
+                elif saw_batch_truncation:
+                    # Detect truncation at per-text granularity and only rerun
+                    # the affected items through windowed inference.
+                    for idx_in_batch, i in enumerate(short_indices):
+                        single_entities, saw_text_truncation = _predict_entities_with_warning_capture(
+                            model,
+                            texts[i],
+                            labels,
+                            threshold,
+                        )
+                        if saw_text_truncation:
+                            results[i] = _predict_entities_windowed(
+                                model,
+                                texts[i],
+                                labels=labels,
+                                threshold=threshold,
+                            )
+                            continue
+
+                        if isinstance(single_entities, list):
+                            entities_for_text = single_entities
+                        else:
+                            entities_for_text = (
+                                batch_entities[idx_in_batch] if idx_in_batch < len(batch_entities) else []
+                            )
+                        results[i] = _rows_for_text(texts[i], entities_for_text)
                 else:
                     for idx_in_batch, i in enumerate(short_indices):
                         entities_for_text = (
                             batch_entities[idx_in_batch] if idx_in_batch < len(batch_entities) else []
                         )
-                        rows: list[_EntityCandidate] = []
-                        for ent in entities_for_text or []:
-                            candidate = str(ent.get("text", "")).strip()
-                            if not candidate:
-                                continue
-                            ent_start, ent_end = _coerce_bounds(
-                                texts[i],
-                                candidate,
-                                ent.get("start"),
-                                ent.get("end"),
-                            )
-                            score_raw = ent.get("score", 0.0)
-                            try:
-                                score = float(score_raw)
-                            except (TypeError, ValueError):
-                                score = 0.0
-                            rows.append(
-                                {
-                                    "text": candidate,
-                                    "entity_type": str(ent.get("label", "")).upper().strip() or "UNKNOWN",
-                                    "score": score,
-                                    "start": ent_start,
-                                    "end": ent_end,
-                                }
-                            )
-                        results[i] = rows
+                        results[i] = _rows_for_text(texts[i], entities_for_text)
 
         # Long texts: fall back to windowed inference, which already dedupes overlapping
         # mentions but preserves distinct mentions at different offsets.

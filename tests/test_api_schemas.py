@@ -206,6 +206,14 @@ class TestIngestRequest:
         )
         assert req.peopletag is True
 
+    def test_citation_reference_optional(self) -> None:
+        req = IngestRequest(
+            file_path="doc.md",
+            source_id="doc",
+            citation_reference="Smith (2024)",
+        )
+        assert req.citation_reference == "Smith (2024)"
+
     def test_empty_file_path_rejected(self) -> None:
         with pytest.raises(ValidationError):
             IngestRequest(file_path="", source_id="doc")
@@ -264,6 +272,10 @@ class TestSourceListResponse:
             snapshot_path="data/source_cache/doc.txt",
         )
         assert info.source_path == "/docs/paper.pdf"
+
+    def test_source_with_citation_reference(self) -> None:
+        info = SourceInfo(source_id="doc", citation_reference="Doe (2023)")
+        assert info.citation_reference == "Doe (2023)"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +337,18 @@ class TestHealthResponse:
         assert data["status"] == "ok"
         assert data["engine_loaded"] is True
         assert "system_ram_gb" in data  # optional field, may be None
+
+    def test_fts_status_fields(self) -> None:
+        resp = HealthResponse(
+            engine_loaded=True,
+            fts_policy="immediate",
+            fts_dirty=False,
+            fts_pending_rows=0,
+        )
+        data = json.loads(resp.model_dump_json())
+        assert data["fts_policy"] == "immediate"
+        assert data["fts_dirty"] is False
+        assert data["fts_pending_rows"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@ Supports PDF and Markdown source documents.
 
 Architecture
 ~~~~~~~~~~~~
-- PDF extraction cascades through four strategies in order: PyPDF →
-  pdfminer → PyMuPDF → Tesseract OCR.  The first strategy that returns
+- PDF extraction cascades through four strategies in order: PyMuPDF →
+  PyPDF → pdfminer → Tesseract OCR.  The first strategy that returns
   non-empty text wins; later strategies are only tried if earlier ones fail
   or return empty output.
 - Text is chunked into overlapping parent chunks (~1 200 tokens with 150-
@@ -439,8 +439,34 @@ def _chunk_pages(
     return parents, children
 
 
+def _extract_pymupdf(path: Path, *, page_offset: int = 1, **_kw) -> list[_PageData]:
+    """Strategy 1: PyMuPDF per-page extraction."""
+    try:
+        import fitz
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("PyMuPDF is required for primary PDF extraction.") from exc
+    doc = fitz.open(str(path))
+    pages: list[_PageData] = []
+    for index in range(doc.page_count):
+        page = doc.load_page(index)
+        page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
+        if not page_text:
+            continue
+        page_label: Optional[str] = None
+        try:
+            if hasattr(page, "get_label"):
+                page_label = page.get_label()
+        except Exception:
+            pass
+        page_number = index + page_offset
+        display_page = str(page_number) if page_offset != 1 else (page_label if page_label else str(page_number))
+        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
+        pages.append(_PageData(marked_text, page_number, page_label, display_page))
+    return pages
+
+
 def _extract_pypdf(reader, *, page_offset: int = 1, **_kw) -> list[_PageData]:
-    """Strategy 1: pypdf per-page extraction."""
+    """Strategy 2: pypdf per-page fallback."""
     pages: list[_PageData] = []
     for index, page in enumerate(reader.pages, start=1):
         page_text = clean_ocr_artifacts((page.extract_text() or "").strip())
@@ -460,7 +486,7 @@ def _extract_pypdf(reader, *, page_offset: int = 1, **_kw) -> list[_PageData]:
 
 
 def _extract_pdfminer(path: Path, *, reader, page_offset: int = 1, **_kw) -> list[_PageData]:
-    """Strategy 2: pdfminer per-page fallback."""
+    """Strategy 3: pdfminer per-page fallback."""
     try:
         from pdfminer.high_level import extract_text
     except Exception as exc:  # pragma: no cover
@@ -482,32 +508,6 @@ def _extract_pdfminer(path: Path, *, reader, page_offset: int = 1, **_kw) -> lis
         page_number = index + page_offset
         marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
         pages.append(_PageData(marked_text, page_number, None, str(page_number)))
-    return pages
-
-
-def _extract_pymupdf(path: Path, *, page_offset: int = 1, **_kw) -> list[_PageData]:
-    """Strategy 3: PyMuPDF per-page fallback."""
-    try:
-        import fitz
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("PyMuPDF is required for additional PDF extraction fallback.") from exc
-    doc = fitz.open(str(path))
-    pages: list[_PageData] = []
-    for index in range(doc.page_count):
-        page = doc.load_page(index)
-        page_text = clean_ocr_artifacts((page.get_text("text") or "").strip())
-        if not page_text:
-            continue
-        page_label: Optional[str] = None
-        try:
-            if hasattr(page, "get_label"):
-                page_label = page.get_label()
-        except Exception:
-            pass
-        page_number = index + page_offset
-        display_page = str(page_number) if page_offset != 1 else (page_label if page_label else str(page_number))
-        marked_text = f"{_format_page_marker(page_number)}\n{page_text}"
-        pages.append(_PageData(marked_text, page_number, page_label, display_page))
     return pages
 
 
@@ -537,7 +537,7 @@ def _extract_ocr(reader, path: Path, *, page_offset: int = 1, **_kw) -> list[_Pa
 
 
 # Ordered extraction strategies for PDF ingestion
-_PDF_STRATEGIES = [_extract_pypdf, _extract_pdfminer, _extract_pymupdf, _extract_ocr]
+_PDF_STRATEGIES = [_extract_pymupdf, _extract_pypdf, _extract_pdfminer, _extract_ocr]
 
 
 def ingest_pdf(
@@ -824,6 +824,7 @@ def ingest_file_to_storage(
     summary_generator: Optional[MlxGenerator] = None,
     geotag: bool = False,
     peopletag: bool = False,
+    citation_reference: Optional[str] = None,
     page_offset: int = 1,
     tracer: Optional[Any] = None,
 ) -> tuple[int, int]:
@@ -842,6 +843,7 @@ def ingest_file_to_storage(
             "rag.ingest.summarize": summarize,
             "rag.ingest.geotag": geotag,
             "rag.ingest.peopletag": peopletag,
+            "rag.ingest.citation_reference": citation_reference,
         },
     ) as ingest_span:
         try:
@@ -970,7 +972,12 @@ def ingest_file_to_storage(
                     context = _sample_context(context, _SUMMARY_CONTEXT_CHAR_LIMIT)
                     messages = build_ingest_summary_messages(context)
                     summary = generator.generate_chat(messages)
-                    storage.upsert_source_summary(source_id=source_id, summary=summary, page_offset=page_offset)
+                    storage.upsert_source_summary(
+                        source_id=source_id,
+                        summary=summary,
+                        citation_reference=citation_reference,
+                        page_offset=page_offset,
+                    )
                     set_span_attributes(
                         summary_span,
                         {
@@ -987,7 +994,11 @@ def ingest_file_to_storage(
                 span_kind=SPAN_KIND_CHAIN,
                 attributes={"rag.ingest.page_offset": page_offset},
             ):
-                storage.persist_source_page_offset(source_id, page_offset)
+                storage.persist_source_page_offset(
+                    source_id,
+                    page_offset,
+                    citation_reference=citation_reference,
+                )
 
             set_span_attributes(
                 ingest_span,

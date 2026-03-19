@@ -11,6 +11,8 @@ export interface SourceInfo {
   summary: string | null;
   source_path: string | null;
   snapshot_path: string | null;
+  citation_reference?: string | null;
+  page_offset?: number;
   source_size_bytes?: number | null;
   content_size_bytes?: number | null;
 }
@@ -251,6 +253,7 @@ class SourceApiClient {
     summarize: boolean = true,
     geotag: boolean = false,
     peopletag: boolean = false,
+    citationReference?: string,
   ): Promise<IngestResponse> {
     const res = await fetch(`${this.baseUrl}/sources/ingest`, {
       method: "POST",
@@ -261,6 +264,7 @@ class SourceApiClient {
         summarize,
         geotag,
         peopletag,
+        citation_reference: citationReference,
       }),
     });
     if (!res.ok) {
@@ -277,6 +281,7 @@ class SourceApiClient {
     pageOffset?: number,
     geotag: boolean = false,
     peopletag: boolean = false,
+    citationReference?: string,
   ): Promise<IngestResponse> {
     const formData = new FormData();
     formData.append("file", file);
@@ -285,6 +290,9 @@ class SourceApiClient {
     formData.append("geotag", String(geotag));
     formData.append("peopletag", String(peopletag));
     formData.append("page_offset", String(pageOffset ?? 1));
+    if (citationReference) {
+      formData.append("citation_reference", citationReference);
+    }
 
     // Call the backend directly to bypass the Next.js dev proxy
     // which has a ~30s timeout — upload+ingest can take minutes.

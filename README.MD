@@ -156,9 +156,9 @@ flowchart LR
 
     subgraph Parse["Parse"]
         direction TB
-        P1["pypdf<br/>Text layer extraction"]
-        P2["pdfminer.six<br/>Fallback"]
-        P3["PyMuPDF<br/>Fallback"]
+        P1["PyMuPDF<br/>Primary extraction"]
+        P2["pypdf<br/>Fallback"]
+        P3["pdfminer.six<br/>Per-page fallback"]
         P4["OCR<br/>Rasterise + pytesseract<br/>for scanned pages"]
         P1 --> P2
         P2 --> P3
@@ -272,7 +272,7 @@ The model is instructed to cite passages inline as `[N]`. After generation, a `C
 
 Duplicate source-page citations are collapsed and renumbered after generation so citation markers remain sequential and export-safe.
 
-Clicking a citation badge opens the citation viewer: the full document and the cited chunk are fetched in parallel, and the passage is highlighted in context. An optional citation reference string can be entered per source at ingest time and used when exporting responses as formatted footnotes or Harvard bibliography entries.
+Clicking a citation badge opens the citation viewer: the full document and the cited chunk are fetched in parallel, and the passage is highlighted in context. An optional citation reference string can be entered per source at ingest time, persisted in backend source metadata, and used when exporting responses as formatted footnotes or Harvard bibliography entries.
 
 ![Citation viewer demo](docs/images/citation-demo.png)
 
@@ -340,7 +340,7 @@ data/
 | Speech-to-text | mlx-whisper / Whisper large-v3 (4-bit) | Offline audio transcription with VAD |
 | Vector database | lancedb + pyarrow | Vector ANN + BM25 FTS with RRF fusion |
 | API framework | fastapi + uvicorn | REST endpoints and SSE streaming |
-| PDF parsing | pypdf, pdfminer.six, PyMuPDF, pytesseract | Four-strategy fallback chain including OCR |
+| PDF parsing | PyMuPDF, pypdf, pdfminer.six, pytesseract | Quality-first per-page fallback chain including OCR |
 | Geospatial + people stack | GeoNames + rapidfuzz + GLiNER + PersonResolver | Offline place geocoding and person canonicalization for map + people dictionary |
 | Observability | arize-phoenix-otel | OpenTelemetry tracing across ingest, retrieval, and generation |
 
@@ -358,7 +358,7 @@ data/
 | 3D / visual | @react-three/fiber, Three.js | WebGL background themes and particle systems |
 | Animations | framer-motion | UI transitions |
 | Session storage | IndexedDB | Persistent chat history with reasoning content |
-| Citation storage | localStorage | User-provided citation reference strings per source |
+| Citation storage | LanceDB source metadata | User-provided citation reference strings per source |
 | Geospatial UI | maplibre-gl, @vis.gl/react-maplibre, @tanstack/react-query | Clustered map overlay with confidence and source filters |
 
 </details>

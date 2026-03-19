@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 class StorageConfig:
     lance_dir: Path
     lance_table: str = "child_chunks"
-    fts_rebuild_policy: str = "deferred"
+    fts_rebuild_policy: str = "immediate"
     fts_rebuild_batch_size: int = 0
 
 
@@ -147,7 +147,7 @@ class StorageEngine:
     # Schema migrations
     # ------------------------------------------------------------------
 
-    _SUMMARIES_V2_COLUMNS = ("source_path", "snapshot_path")
+    _SUMMARIES_V2_COLUMNS = ("source_path", "snapshot_path", "citation_reference")
     _SUMMARIES_V3_COLUMNS = ("page_offset",)  # int32; absence treated as 1 at read time
     _RANGE_COLUMNS = ("start_page", "end_page")
 
@@ -357,6 +357,13 @@ class StorageEngine:
         if self._fts_dirty:
             self._ensure_fts_index(force_rebuild=True)
             logger.info("Refreshed dirty FTS index before hybrid search")
+
+    def get_fts_status(self) -> dict[str, Any]:
+        return {
+            "fts_policy": self._config.fts_rebuild_policy,
+            "fts_dirty": self._fts_dirty,
+            "fts_pending_rows": int(self._pending_fts_rows),
+        }
 
     def get_child_vector_dimension(self) -> Optional[int]:
         """Return child vector dimension if available, otherwise None."""
@@ -712,7 +719,15 @@ class StorageEngine:
         rows = self._parents.to_arrow().to_pylist()
         return sorted(set(r["source_id"] for r in rows if r.get("source_id")))
 
-    def persist_source_page_offset(self, source_id: str, page_offset: int = 1) -> None:
+    def persist_source_page_offset(
+        self,
+        source_id: str,
+        page_offset: int = 1,
+        *,
+        source_path: Optional[str] = None,
+        snapshot_path: Optional[str] = None,
+        citation_reference: Optional[str] = None,
+    ) -> None:
         """Persist the page offset for a source, preserving existing summary/path fields.
 
         Creates a minimal record if no record exists yet — this handles the
@@ -726,6 +741,7 @@ class StorageEngine:
         existing_summary = ""
         existing_source_path = ""
         existing_snapshot_path = ""
+        existing_citation_reference = ""
 
         if self._summaries is not None:
             rows = (
@@ -739,13 +755,19 @@ class StorageEngine:
                 existing_summary = r.get("summary") or ""
                 existing_source_path = r.get("source_path") or ""
                 existing_snapshot_path = r.get("snapshot_path") or ""
+                existing_citation_reference = r.get("citation_reference") or ""
                 self._summaries.delete(self._where_eq("source_id", sid))
 
         record: dict[str, Any] = {
             "source_id": sid,
             "summary": existing_summary,
-            "source_path": existing_source_path,
-            "snapshot_path": existing_snapshot_path,
+            "source_path": source_path if source_path is not None else existing_source_path,
+            "snapshot_path": snapshot_path if snapshot_path is not None else existing_snapshot_path,
+            "citation_reference": (
+                citation_reference
+                if citation_reference is not None
+                else existing_citation_reference
+            ),
             "page_offset": page_offset,
         }
         if self._summaries is None:
@@ -764,6 +786,7 @@ class StorageEngine:
         summary: str,
         source_path: Optional[str] = None,
         snapshot_path: Optional[str] = None,
+        citation_reference: Optional[str] = None,
         page_offset: int = 1,
     ) -> None:
         """Insert or update a source summary record (schema v3).
@@ -791,6 +814,7 @@ class StorageEngine:
             "summary": summary.strip(),
             "source_path": source_path or "",
             "snapshot_path": snapshot_path or "",
+            "citation_reference": citation_reference or "",
             "page_offset": page_offset,
         }
         if self._summaries is None:
@@ -835,7 +859,7 @@ class StorageEngine:
         """Return full details for all sources (schema v3 fields).
 
         Returns list of dicts with keys: source_id, summary, source_path,
-        snapshot_path, page_offset.
+        snapshot_path, citation_reference, page_offset.
         """
         if self._summaries is None:
             return []
@@ -846,6 +870,7 @@ class StorageEngine:
                 "summary": r.get("summary", ""),
                 "source_path": r.get("source_path", ""),
                 "snapshot_path": r.get("snapshot_path", ""),
+                "citation_reference": r.get("citation_reference", ""),
                 "page_offset": int(r.get("page_offset") or 1),
             }
             for r in rows
@@ -870,6 +895,7 @@ class StorageEngine:
             "summary": r.get("summary", ""),
             "source_path": r.get("source_path", ""),
             "snapshot_path": r.get("snapshot_path", ""),
+            "citation_reference": r.get("citation_reference", ""),
             "page_offset": int(r.get("page_offset") or 1),
         }
 

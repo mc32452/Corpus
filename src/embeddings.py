@@ -130,6 +130,7 @@ class MlxEmbeddingModel:
         self._tokenizer: Any = None
         self._mx: Any = None                    # cached mlx.core reference
         self._embedding_dim: Optional[int] = None
+        self._resolved_backbone: Any = None
         self._load_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -163,6 +164,7 @@ class MlxEmbeddingModel:
             self._mx = mx
             logger.info("Loading MLX embedding model: %s", self._model_id)
             self._model, self._tokenizer = mlx_lm.load(self._model_id)
+            self._resolved_backbone = self._resolve_backbone()
 
             # Qwen3-Embedding is a decoder model.  Left-padding is required so
             # the last column always holds a real (non-pad) token.
@@ -177,17 +179,14 @@ class MlxEmbeddingModel:
             try:
                 dummy_ids = self._tokenizer.encode("hello", add_special_tokens=True)
                 probe = mx.array([dummy_ids[: min(8, len(dummy_ids))]])
-                backbone = self._get_backbone()
-                out = backbone(probe)
-                mx.eval(out)
-                self._embedding_dim = int(out.shape[-1])
+                hidden = self._run_backbone(probe)
+                mx.eval(hidden)
+                self._embedding_dim = int(hidden.shape[-1])
                 logger.debug("Embedding dim probed at load: %d", self._embedding_dim)
             except Exception as exc:             # noqa: BLE001
-                logger.warning(
-                    "Could not probe embedding dim at load time (%s). "
-                    "Dim will be set after the first encode() call.",
-                    exc,
-                )
+                raise RuntimeError(
+                    f"Embedding backbone probe failed for model '{self._model_id}': {exc}"
+                ) from exc
 
     def unload(self) -> None:
         """Release the model, tokenizer, and MLX reference to free memory."""
@@ -195,29 +194,51 @@ class MlxEmbeddingModel:
         self._tokenizer = None
         self._mx = None
         self._embedding_dim = None
+        self._resolved_backbone = None
         logger.info("Unloaded MLX embedding model: %s", self._model_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_backbone(self) -> Any:
-        """Return the transformer backbone used for hidden-state extraction.
-
-        mlx_lm wraps the underlying transformer in an outer language-model
-        object.  Different model families use different attribute names for
-        the inner backbone.  We probe the most common names in order and fall
-        back to the top-level model with a warning.
-        """
+    def _resolve_backbone(self) -> Any:
+        if self._model is None:
+            raise RuntimeError("Embedding model is not loaded.")
         for attr in ("model", "transformer", "encoder"):
             if hasattr(self._model, attr):
-                return getattr(self._model, attr)
-        logger.warning(
-            "Could not locate a recognised sub-model attribute on %s. "
-            "Using the top-level model object — embeddings may be incorrect.",
-            type(self._model).__name__,
+                backbone = getattr(self._model, attr)
+                if callable(backbone):
+                    return backbone
+                raise RuntimeError(
+                    f"Resolved embedding backbone '{attr}' is not callable on {type(self._model).__name__}."
+                )
+        raise RuntimeError(
+            f"Could not resolve a trusted embedding backbone on {type(self._model).__name__}. "
+            "Expected one of: model, transformer, encoder."
         )
-        return self._model
+
+    def _get_backbone(self) -> Any:
+        if self._resolved_backbone is None:
+            self._resolved_backbone = self._resolve_backbone()
+        return self._resolved_backbone
+
+    def _coerce_hidden(self, output: Any) -> Any:
+        hidden = output
+        if isinstance(hidden, (list, tuple)):
+            if not hidden:
+                raise RuntimeError("Embedding backbone returned an empty sequence.")
+            hidden = hidden[0]
+        shape = getattr(hidden, "shape", None)
+        if shape is None or len(shape) != 3:
+            raise RuntimeError(
+                f"Embedding backbone returned invalid shape: {shape}. Expected (batch, seq, dim)."
+            )
+        return hidden
+
+    def _run_backbone(self, input_ids: Any) -> Any:
+        backbone = self._get_backbone()
+        output = backbone(input_ids)
+        return self._coerce_hidden(output)
 
     def _apply_instruction(self, text: str, task: str) -> str:
         """Wrap a query with a Qwen3-Embedding instruction prefix.
@@ -336,8 +357,7 @@ class MlxEmbeddingModel:
             return np.zeros((0, 0), dtype=np.float32)
 
         input_ids = mx.array(input_ids_np)
-        backbone = self._get_backbone()
-        hidden = backbone(input_ids)
+        hidden = self._run_backbone(input_ids)
 
         # Last-token pooling — required for Qwen3-Embedding (decoder architecture).
         pooled = self._last_token_pool(hidden, attention_mask)

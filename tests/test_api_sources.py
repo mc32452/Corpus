@@ -47,11 +47,12 @@ class MockEngineWithStorage:
         page_number=None,
         geotag=False,
         peopletag=False,
+        citation_reference=None,
         page_offset=1,
     ):
         """Simulate ingest by storing parent chunks and a summary."""
         from src.models import Metadata, ParentChunk
-        _ = page_number, geotag, peopletag, page_offset
+        _ = page_number, geotag, peopletag, page_offset, citation_reference
 
         # Read the file content
         text = Path(file_path).read_text(encoding="utf-8")
@@ -353,6 +354,31 @@ class TestIngestEndpoint:
         data = resp.json()
         assert data["source_id"] == "people_ingest_doc"
 
+    @pytest.mark.anyio
+    async def test_ingest_persists_citation_reference_in_source_list(self, mock_engine, sample_file) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                ingest_resp = await client.post(
+                    "/api/sources/ingest",
+                    json={
+                        "file_path": str(sample_file),
+                        "source_id": "citation_doc",
+                        "summarize": False,
+                        "citation_reference": "Smith (2024) Citation",
+                    },
+                )
+                assert ingest_resp.status_code == 200
+                list_resp = await client.get("/api/sources")
+
+        assert list_resp.status_code == 200
+        sources = list_resp.json()["sources"]
+        row = next(source for source in sources if source["source_id"] == "citation_doc")
+        assert row["citation_reference"] == "Smith (2024) Citation"
+        assert row["source_path"] is not None
+        assert row["snapshot_path"] is not None
+
 
 # ---------------------------------------------------------------------------
 # POST /api/sources/upload
@@ -430,6 +456,31 @@ class TestUploadEndpoint:
 
         assert resp.status_code == 200
         assert resp.json()["source_id"] == "people_upload_doc"
+
+    @pytest.mark.anyio
+    async def test_upload_persists_citation_reference(self, mock_engine, sample_file) -> None:
+        with patch("src.api._get_engine", return_value=mock_engine):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with sample_file.open("rb") as handle:
+                    upload_resp = await client.post(
+                        "/api/sources/upload",
+                        files={"file": ("sample.md", handle, "text/markdown")},
+                        data={
+                            "source_id": "upload_citation_doc",
+                            "summarize": "false",
+                            "citation_reference": "Doe (2025) Upload Citation",
+                            "page_offset": "1",
+                        },
+                    )
+                assert upload_resp.status_code == 200
+                list_resp = await client.get("/api/sources")
+
+        assert list_resp.status_code == 200
+        sources = list_resp.json()["sources"]
+        row = next(source for source in sources if source["source_id"] == "upload_citation_doc")
+        assert row["citation_reference"] == "Doe (2025) Upload Citation"
 
 
 # ---------------------------------------------------------------------------

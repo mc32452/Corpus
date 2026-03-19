@@ -33,7 +33,7 @@ The application is a **full-stack offline RAG system** designed for local-first 
 | Geospatial + People | `GeoNames` + `rapidfuzz` + `gliner` + in-process person resolver | Offline place geocoding + canonical person indexing for map and people dictionary overlays |
 | Observability | `arize-phoenix-otel` | OpenTelemetry tracing + Phoenix export/runtime status |
 | Speech-to-Text | `mlx-whisper` | Offline transcription with VAD |
-| PDF Extraction | `pypdf`, `pdfminer.six`, `PyMuPDF`, `pytesseract` | Four-strategy fallback chain |
+| PDF Extraction | `PyMuPDF`, `pypdf`, `pdfminer.six`, `pytesseract` | Quality-first, per-page fallback chain |
 
 ---
 
@@ -71,16 +71,16 @@ Unified LanceDB-backed storage managing five table types:
 |-------|---------|-------------|
 | `child_chunks` | Vectors + FTS, hybrid-searched | `id`, `text`, `vector`, `source_id`, `parent_id`, `page_number`, `header_path` |
 | `parent_chunks` | Parent text for context expansion | `parent_id`, `source_id`, `text`, page metadata |
-| `source_summaries` | Per-source metadata (schema v3) | `source_id`, `summary`, `source_path`, `snapshot_path`, `page_offset` |
+| `source_summaries` | Per-source metadata (schema v4) | `source_id`, `summary`, `source_path`, `snapshot_path`, `citation_reference`, `page_offset` |
 | `geo_mentions` | Ingest-time geocoded mentions for map UX | `id`, `source_id`, `chunk_id`, `place_name`, `geonameid`, `lat`, `lon`, `confidence`, `method` |
 | `person_mentions` | Ingest-time canonical person mentions for People Dictionary UX | `id`, `source_id`, `chunk_id`, `raw_name`, `canonical_name`, `confidence`, `method`, `role_hint` |
 
-**`StorageConfig`:** `lance_dir` (default `data/lance`), `lance_table` (default `child_chunks`), `fts_rebuild_policy` (default `deferred`), `fts_rebuild_batch_size` (default 0)
+**`StorageConfig`:** `lance_dir` (default `data/lance`), `lance_table` (default `child_chunks`), `fts_rebuild_policy` (default `immediate`), `fts_rebuild_batch_size` (default 0)
 
 **Key capabilities:**
 - Native hybrid search (vector ANN + BM25 + RRF) via single LanceDB call with auto-retry on FTS rebuild
 - FTS index management with configurable rebuild policies (`immediate`, `deferred`, `batch`)
-- Automatic schema migration for summary columns (`source_path`, `snapshot_path`, `page_offset`)
+- Automatic schema migration for summary columns (`source_path`, `snapshot_path`, `citation_reference`, `page_offset`)
 - Geo-mentions schema migration and best-effort scalar indexes (`source_id`, `confidence`, `geonameid`)
 - Person-mentions table creation + best-effort scalar indexes (`source_id`, `canonical_name`, `confidence`)
 - Person mention CRUD support (`upsert`, filtered query, delete by mention/source, canonical merge)
@@ -112,9 +112,9 @@ Unified LanceDB-backed storage managing five table types:
 
 **PDF ingestion:** Four-strategy fallback chain, each producing `_PageData` tuples that feed into a shared `_chunk_pages()` helper:
 
-1. **pypdf** -- per-page text extraction with page labels
-2. **pdfminer.six** -- whole-document fallback (no page boundaries)
-3. **PyMuPDF (fitz)** -- per-page alternative extraction
+1. **PyMuPDF (fitz)** -- primary per-page extraction for better layout-aware text quality
+2. **pypdf** -- per-page fallback with page labels
+3. **pdfminer.six** -- per-page fallback (`extract_text(..., page_numbers=[index])`)
 4. **OCR (pytesseract + pdf2image)** -- rasterize-and-OCR, one page at a time to limit memory
 
 Text cleaning: `clean_ocr_artifacts()` merges hyphenated line breaks.
@@ -338,7 +338,7 @@ Central orchestrator consumed by both CLI and API:
 |-------|---------|
 | `lance_dir` | `"data/lance"` |
 | `collection` | `"child_chunks"` |
-| `fts_rebuild_policy` | `"deferred"` |
+| `fts_rebuild_policy` | `"immediate"` |
 | `intent_confidence_threshold` | 0.6 |
 | `llm_fallback` | True |
 | `llm_fallback_threshold` | 0.70 |
@@ -437,14 +437,14 @@ FastAPI application with SSE streaming support:
 **Request/response schemas** (`src/api_schemas.py`):
 - `ChatRequest` -- supports AI SDK v3 (`content` string) and v6 (`parts` array) message formats
 - `QueryRequest` -- `query`, `mode`, `source_ids`, `citations_enabled`, `stream`, `intent_override`
-- `IngestRequest` -- `file_path`, `source_id`, `summarize`, `geotag`, `peopletag`, `page_offset`
-- `SourceInfo` -- `source_id`, `summary`, `source_path`, `snapshot_path`, `source_size_bytes`, `content_size_bytes`, `page_offset`
+- `IngestRequest` -- `file_path`, `source_id`, `summarize`, `geotag`, `peopletag`, `page_offset`, `citation_reference`
+- `SourceInfo` -- `source_id`, `summary`, `source_path`, `snapshot_path`, `source_size_bytes`, `content_size_bytes`, `page_offset`, `citation_reference`
 - `SourceContentResponse` -- `source_id`, `content`, `content_source` ("original"/"snapshot"/"summary"), `format` ("pdf"/"markdown"/"text")
 - `ChunkDetailResponse` & `ChunkBatchResponse` -- chunk text, parent text, page metadata, header path, format, source path
 - `PersonMention` -- `id`, `source_id`, `chunk_id`, `raw_name`, `canonical_name`, `confidence`, `method`, `role_hint`, `context_snippet`
 - `PersonSummary` -- `canonical_name`, `mention_count`, `source_count`, `source_ids[]`, `variants[]`, `roles[]`, `avg_confidence`
 - `PeopleListResponse`, `PersonMentionsResponse`, `PeopleMergeRequest`, `PeopleMergeResponse`
-- `HealthResponse` -- `status`, `engine_loaded`, `system_ram_gb`, `phoenix_configured`, `phoenix_active`, `phoenix_project_name`, `phoenix_endpoint`, `phoenix_error`
+- `HealthResponse` -- `status`, `engine_loaded`, `system_ram_gb`, `phoenix_configured`, `phoenix_active`, `phoenix_project_name`, `phoenix_endpoint`, `phoenix_error`, `fts_policy`, `fts_dirty`, `fts_pending_rows`
 - `FeedbackRequest` -- `trace_id`, `span_id`, `label`, `score?`, `comment?`
 - `ErrorResponse` -- `{error: {code, message}}`
 
@@ -551,7 +551,7 @@ Frontend overlays:
 Thin wrapper around `RagEngine` for terminal workflows:
 
 **Commands:**
-- `ingest FILE --source-id ID [--summarize] [--mode MODE] [--page-number N] [--page-offset N] [--geotag] [--peopletag]`
+- `ingest FILE --source-id ID [--summarize] [--mode MODE] [--page-number N] [--page-offset N] [--citation-reference TEXT] [--geotag] [--peopletag]`
 - `query TEXT [--source-id ID] [--cite|--no-cite] [--mode MODE] [--latency] [--intent INTENT] [--dump-prompt] [--no-generate] [--list-sources]`
 
 **Phoenix flags (shared):** `--phoenix`, `--no-phoenix`, `--phoenix-project`, `--phoenix-endpoint`, `--phoenix-api-key`, `--phoenix-auto-instrument`, `--phoenix-no-batch`
@@ -660,7 +660,7 @@ Page (app/page.tsx)
 | `listSources()` | `GET /api/sources` | |
 | `getContent(sourceId)` | `GET /api/sources/:id/content` | Returns content + format |
 | `deleteSource(sourceId)` | `DELETE /api/sources/:id` | |
-| `uploadDocument(file, sourceId, summarize, pageOffset?, geotag?, peopletag?)` | `POST /api/sources/upload` | **Bypasses Next.js proxy** (calls backend directly) to avoid ~30s timeout |
+| `uploadDocument(file, sourceId, summarize, pageOffset?, geotag?, peopletag?, citationReference?)` | `POST /api/sources/upload` | **Bypasses Next.js proxy** (calls backend directly) to avoid ~30s timeout |
 | `getChunk(sourceId, chunkId)` | `GET /api/sources/:id/chunk/:cid` | |
 | `getChunks(sourceId, chunkIds)` | `GET /api/sources/:id/chunks?ids=...` | Batch fetch |
 | `ingest(filePath, sourceId, summarize, geotag, peopletag)` | `POST /api/sources/ingest` | JSON body |
@@ -681,12 +681,11 @@ Page (app/page.tsx)
 
 Multiple coordinated modules handle the full citation lifecycle:
 
-- **`citation-meta-store.ts`:** `localStorage` persistence (key: `dh-citation-meta-v1`) for user-provided citation reference strings (keyed by `source_id`). Populated at ingest time via optional text field in `IngestModal`; cleared on source deletion.
 - **`format-citations.ts`:** Three formatters:
   - `formatFootnotes()` -- numbered list: `1. Label, p.N.`
   - `formatHarvardBibliography()` -- grouped by source: `Label. pp. 8, 16.`
   - `formatFootnotesWithText()` -- renumbers sparse `[N]` markers to sequential `[1], [2], ...` in body text + matching footnotes
-  - Source label priority: user-provided citation reference → cleaned source_id (underscores/hyphens → spaces, title-cased)
+  - Source label priority: backend `citation_reference` metadata → cleaned source_id (underscores/hyphens → spaces, title-cased)
 - **`group-citations.ts`:** Groups raw `[N]` citation indices by `source_id` into `GroupedReference` objects with deduplication and numeric sorting
 - **`text-highlighter.ts`:** Exact substring matching (normalised whitespace). DOM `TreeWalker` wraps matched text nodes in `<mark class="citation-highlight">`. Normalisation-aware offset mapping handles whitespace collapsing.
 
@@ -922,7 +921,7 @@ During streaming query execution, a structured citation list is emitted as a `Ci
 
 ### 7.4 Citation Reference Metadata
 
-The `IngestModal` exposes an optional "Citation reference" text field. Whatever the user enters is persisted in `localStorage` via `citation-meta-store.ts` (key: `dh-citation-meta-v1`). This is used by `format-citations.ts` to produce properly formatted footnote or Harvard-style citations when the user clicks "Copy as citation" in `MessageReferences`. If no reference string was stored, the formatter falls back to the source filename stem (cleaned: underscores/hyphens → spaces, title-cased) + page numbers.
+The `IngestModal` exposes an optional "Citation reference" text field. Whatever the user enters is sent to the backend during ingest and persisted in `source_summaries.citation_reference`. This is used by `format-citations.ts` (via `GET /api/sources`) to produce properly formatted footnote or Harvard-style citations when the user clicks "Copy as citation" in `MessageReferences`. If no reference string was stored, the formatter falls back to the source filename stem (cleaned: underscores/hyphens → spaces, title-cased) + page numbers.
 
 ### 7.5 MessageReferences Component
 
@@ -1020,7 +1019,7 @@ Frontend: IngestModal → sequential upload queue → POST /api/sources/upload (
         └── source_cache.save_snapshot() → data/source_cache/
               │
               └── Frontend: refresh source list, highlight new source (3s flash)
-                    Save citation reference to localStorage if provided
+                    Persist citation reference in backend source metadata if provided
 ```
 
 ### 8.4 Geospatial Map Flow
@@ -1116,7 +1115,6 @@ Frontend: People overlay toggle → PeopleDictionary
 | `lib/event-parser.ts` | AI SDK v6 `onData` → typed `CustomEvent` parser (includes trace-id events) |
 | `lib/session-store.ts` | IndexedDB session persistence (chat history with reasoning content) |
 | `lib/text-highlighter.ts` | Exact substring match + DOM `<mark>` injection |
-| `lib/citation-meta-store.ts` | localStorage persistence for user-provided citation reference strings |
 | `lib/format-citations.ts` | Footnote + Harvard citation formatters with marker renumbering |
 | `lib/group-citations.ts` | Citation index grouping by source with deduplication |
 | `lib/utils.ts` | `cn()` -- `twMerge(clsx(...))` for Tailwind class merging |
@@ -1240,7 +1238,7 @@ cd frontend && npm run dev
 | **ML/Inference** | `mlx`, `mlx-lm`, `safetensors` |
 | **Tokenization** | `transformers`, `huggingface-hub` |
 | **Storage** | `lancedb`, `pyarrow`, `pydantic` |
-| **PDF** | `pypdf`, `pdfminer.six`, `PyMuPDF` (fitz), `pytesseract`, `pdf2image` |
+| **PDF** | `PyMuPDF` (fitz), `pypdf`, `pdfminer.six`, `pytesseract`, `pdf2image` |
 | **API** | `fastapi`, `uvicorn`, `python-multipart`, `httpx` (test only) |
 | **Observability** | `arize-phoenix-otel` |
 | **Speech** | `mlx-whisper`, `soundfile`, `scipy`, `av` (PyAV) |

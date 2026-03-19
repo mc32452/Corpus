@@ -322,6 +322,44 @@ class TestSourceSummaries:
         summaries = tmp_storage.get_source_summaries()
         assert summaries[quoted_source] == "v2"
 
+    def test_upsert_and_read_citation_reference(self, tmp_storage: StorageEngine):
+        tmp_storage.upsert_source_summary(
+            source_id="doc_citation",
+            summary="summary",
+            citation_reference="Smith (2024) Test",
+        )
+        detail = tmp_storage.get_source_detail("doc_citation")
+        assert detail is not None
+        assert detail["citation_reference"] == "Smith (2024) Test"
+
+    def test_persist_source_page_offset_updates_metadata_without_summary(self, tmp_storage: StorageEngine):
+        tmp_storage.persist_source_page_offset(
+            source_id="doc_meta",
+            page_offset=3,
+            source_path="/tmp/doc.pdf",
+            snapshot_path="/tmp/doc.snapshot.txt",
+            citation_reference="Doe (2025) Metadata",
+        )
+        detail = tmp_storage.get_source_detail("doc_meta")
+        assert detail is not None
+        assert detail["summary"] == ""
+        assert detail["source_path"] == "/tmp/doc.pdf"
+        assert detail["snapshot_path"] == "/tmp/doc.snapshot.txt"
+        assert detail["page_offset"] == 3
+        assert detail["citation_reference"] == "Doe (2025) Metadata"
+
+
+class TestFtsPolicy:
+    def test_storage_config_defaults_to_immediate_policy(self):
+        cfg = StorageConfig(lance_dir=Path(tempfile.mkdtemp()))
+        assert cfg.fts_rebuild_policy == "immediate"
+
+    def test_get_fts_status_includes_policy_dirty_and_pending_rows(self, tmp_storage: StorageEngine):
+        status = tmp_storage.get_fts_status()
+        assert status["fts_policy"] in {"immediate", "deferred", "batch"}
+        assert isinstance(status["fts_dirty"], bool)
+        assert isinstance(status["fts_pending_rows"], int)
+
 
 # ===========================================================================
 # Latency: index operations

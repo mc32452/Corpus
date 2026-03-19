@@ -567,7 +567,7 @@ class RagEngineConfig:
     mode: Optional[str] = None
     model: Optional[str] = None
     summary_model: str = "mlx-community/LFM2-8B-A1B-4bit"
-    fts_rebuild_policy: str = "deferred"
+    fts_rebuild_policy: str = "immediate"
     fts_rebuild_batch_size: int = 0
     citations_enabled: Optional[bool] = None
 
@@ -970,6 +970,7 @@ class RagEngine:
         summarize: bool = True,
         geotag: bool = False,
         peopletag: bool = False,
+        citation_reference: Optional[str] = None,
         page_offset: int = 1,
     ) -> IngestResult:
         """Ingest a document (PDF or Markdown) into the RAG store."""
@@ -988,6 +989,7 @@ class RagEngine:
                 "rag.ingest.summarize": summarize,
                 "rag.ingest.geotag": geotag,
                 "rag.ingest.peopletag": peopletag,
+                "rag.ingest.citation_reference": citation_reference,
             },
         ) as ingest_span:
             try:
@@ -1007,6 +1009,7 @@ class RagEngine:
                     summary_generator=generator,
                     geotag=geotag,
                     peopletag=peopletag,
+                    citation_reference=citation_reference,
                     page_offset=page_offset,
                     tracer=self._tracer,
                 )

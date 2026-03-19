@@ -193,6 +193,10 @@ class IngestRequest(BaseModel):
         ge=1,
         description="Starting page number for the first physical PDF page. No effect on Markdown files.",
     )
+    citation_reference: Optional[str] = Field(
+        default=None,
+        description="Optional citation reference label persisted with source metadata.",
+    )
 
 
 class IngestResponse(BaseModel):
@@ -235,6 +239,10 @@ class SourceInfo(BaseModel):
     page_offset: int = Field(
         default=1,
         description="Starting page number for the first physical PDF page.",
+    )
+    citation_reference: Optional[str] = Field(
+        default=None,
+        description="Optional citation reference label persisted at ingest time.",
     )
 
 
@@ -434,4 +442,16 @@ class HealthResponse(BaseModel):
     phoenix_error: Optional[str] = Field(
         default=None,
         description="Last Phoenix initialization error, if any.",
+    )
+    fts_policy: Optional[str] = Field(
+        default=None,
+        description="Active full-text index rebuild policy.",
+    )
+    fts_dirty: Optional[bool] = Field(
+        default=None,
+        description="Whether FTS index has pending updates not yet rebuilt.",
+    )
+    fts_pending_rows: Optional[int] = Field(
+        default=None,
+        description="Approximate number of rows pending FTS index rebuild.",
     )

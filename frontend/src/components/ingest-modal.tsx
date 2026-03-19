@@ -9,9 +9,7 @@ export interface UploadRequest {
   summarize: boolean;
   geotag: boolean;
   peopletag: boolean;
-  /** Optional citation reference string for Harvard/footnote copy feature.
-   *  e.g. "Smith, J. et al. (2024) 'Climate Change Review'"
-   *  Stored in localStorage keyed by source_id. */
+  /** Optional citation reference string for Harvard/footnote copy feature. */
   citationRef?: string;
   /** Starting page number for the first physical PDF page (default 1). */
   pageOffset?: number;
@@ -343,8 +341,7 @@ export function IngestModal({
                     </code>
                     <p className="mt-1 text-(--muted-foreground)/70">
                       Leave blank to use the filename as the reference.
-                      You can also add this later — the reference is stored
-                      locally and used whenever you copy citations.
+                      You can also add this later by re-ingesting the source.
                     </p>
                   </div>
 

@@ -312,6 +312,17 @@ async def health():
     from .config import get_system_ram_gb
 
     phoenix_status = get_phoenix_runtime_status()
+    fts_policy: Optional[str] = None
+    fts_dirty: Optional[bool] = None
+    fts_pending_rows: Optional[int] = None
+    if _engine is not None:
+        try:
+            fts_status = _engine.storage.get_fts_status()  # type: ignore[union-attr]
+            fts_policy = fts_status.get("fts_policy")
+            fts_dirty = bool(fts_status.get("fts_dirty"))
+            fts_pending_rows = int(fts_status.get("fts_pending_rows", 0))
+        except Exception:
+            logger.debug("Unable to collect FTS status for health endpoint", exc_info=True)
 
     return HealthResponse(
         status="ok",
@@ -322,6 +333,9 @@ async def health():
         phoenix_project_name=phoenix_status.project_name,
         phoenix_endpoint=phoenix_status.endpoint,
         phoenix_error=phoenix_status.error,
+        fts_policy=fts_policy,
+        fts_dirty=fts_dirty,
+        fts_pending_rows=fts_pending_rows,
     )
 
 
@@ -1513,7 +1527,7 @@ async def list_sources():
     engine = await asyncio.to_thread(_get_engine)
     storage = engine.storage  # type: ignore[union-attr]
 
-    # Get full details from summaries table (schema v2)
+    # Get full details from summaries table
     details = storage.get_source_details()
     # Also get source IDs from parent chunks (may include sources without summaries)
     all_ids = set(storage.list_source_ids())
@@ -1536,6 +1550,7 @@ async def list_sources():
             source_size_bytes=source_size_bytes,
             content_size_bytes=source_size_bytes or snapshot_size_bytes,
             page_offset=detail.get("page_offset") or 1,
+            citation_reference=detail.get("citation_reference") or None,
         ))
 
     # Add any source IDs that have chunks but no summary
@@ -1550,6 +1565,7 @@ async def _post_ingest_snapshot(
     source_id: str,
     file_path: str,
     *,
+    citation_reference: Optional[str] = None,
     page_offset: int = 1,
 ) -> None:
     """Create text snapshot and update summary record with file paths.
@@ -1573,18 +1589,16 @@ async def _post_ingest_snapshot(
     except Exception as snap_exc:
         logger.warning("Failed to create snapshot for %s: %s", source_id, snap_exc)
 
-    # Update the summary record with file paths (schema v3)
+    resolved_source_path = str(Path(file_path).resolve())
+
     try:
-        summaries = storage.get_source_summaries()
-        summary_text = summaries.get(source_id, "")
-        if summary_text:
-            storage.upsert_source_summary(
-                source_id=source_id,
-                summary=summary_text,
-                source_path=str(Path(file_path).resolve()),
-                snapshot_path=snapshot_path,
-                page_offset=page_offset,
-            )
+        storage.persist_source_page_offset(
+            source_id=source_id,
+            page_offset=page_offset,
+            source_path=resolved_source_path,
+            snapshot_path=snapshot_path,
+            citation_reference=citation_reference,
+        )
     except Exception as path_exc:
         logger.warning("Failed to update source paths for %s: %s", source_id, path_exc)
 
@@ -1617,6 +1631,7 @@ async def ingest_source(request: IngestRequest):
             "source_id": source_id,
             "summarize": request.summarize,
             "page_offset": page_offset,
+            "citation_reference": request.citation_reference,
         }
         if request.geotag:
             ingest_kwargs["geotag"] = True
@@ -1630,7 +1645,13 @@ async def ingest_source(request: IngestRequest):
             **ingest_kwargs,
         )
 
-        await _post_ingest_snapshot(engine, source_id, file_path, page_offset=page_offset)
+        await _post_ingest_snapshot(
+            engine,
+            source_id,
+            file_path,
+            citation_reference=request.citation_reference,
+            page_offset=page_offset,
+        )
 
         return IngestResponse(
             source_id=result.source_id,
@@ -1688,6 +1709,7 @@ async def upload_source(
     geotag: bool = Form(False),
     peopletag: bool = Form(False),
     page_offset: int = Form(1),
+    citation_reference: str = Form(""),
 ):
     """Upload and ingest a document (PDF or Markdown) from the browser.
 
@@ -1755,6 +1777,7 @@ async def upload_source(
             "source_id": sid,
             "summarize": summarize,
             "page_offset": page_offset,
+            "citation_reference": citation_reference.strip() or None,
         }
         if geotag:
             ingest_kwargs["geotag"] = True
@@ -1768,7 +1791,13 @@ async def upload_source(
             **ingest_kwargs,
         )
 
-        await _post_ingest_snapshot(engine, sid, str(dest), page_offset=page_offset)
+        await _post_ingest_snapshot(
+            engine,
+            sid,
+            str(dest),
+            citation_reference=citation_reference.strip() or None,
+            page_offset=page_offset,
+        )
 
         return IngestResponse(
             source_id=result.source_id,
