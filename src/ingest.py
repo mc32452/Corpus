@@ -68,7 +68,6 @@ PARENT_OVERLAP_TOKENS = 150
 CHILD_MIN_TOKENS = 120
 CHILD_MAX_TOKENS = 250
 CHILD_TARGET_TOKENS = 200
-CHILD_OVERLAP_TOKENS = 40
 CHILD_OVERLAP_SENTENCES = 2
 
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -572,10 +571,6 @@ def ingest_pdf(
                 return parents, children
 
     raise ValueError("No extractable text found in PDF, even after OCR.")
-    if not children:
-        raise ValueError("No child chunks produced from PDF content.")
-
-    return parents, children
 
 
 def _coerce_embeddings(raw_embeddings: object) -> list[list[float]]:
@@ -654,9 +649,6 @@ def _geotag_chunks(
             str(c.get("entity_type", "")).upper().strip() or None
             for _, c in flat_candidates
         ]
-
-        # TEMP DEBUG
-        logger.warning("DEBUG geo place_names: %s", place_names)
 
         batch_results = geocoder.forward_batch(
             place_names,
