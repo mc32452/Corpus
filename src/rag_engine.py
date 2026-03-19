@@ -187,6 +187,11 @@ _REPETITION_PATTERN = re.compile(
     r"(\d+\.\s+[A-Z][^.]{10,50}\.?)(\s*\1)+", re.IGNORECASE
 )
 
+_PASSAGE_BLOCK_RE = re.compile(
+    r"^\[PASSAGE\s+(\d+)\]\n.*?^\[PASSAGE END\]$",
+    re.MULTILINE | re.DOTALL,
+)
+
 _CHATTER_PHRASES = [
     "answer ends here",
     "this answer acknowledges",
@@ -287,6 +292,105 @@ def _dedupe_context(texts: Iterable[str]) -> str:
             seen.add(cleaned)
             unique_texts.append(cleaned)
     return "\n\n".join(unique_texts)
+
+
+def _normalize_page_number(value: Any) -> Optional[int]:
+    """Normalize citation page numbers to ``int`` when possible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return None
+        return parsed if parsed >= 1 else None
+    return None
+
+
+def _extract_passage_blocks(context: str) -> dict[int, str]:
+    """Extract ``[PASSAGE N] ... [PASSAGE END]`` blocks keyed by passage index."""
+    blocks: dict[int, str] = {}
+    if not context:
+        return blocks
+
+    for match in _PASSAGE_BLOCK_RE.finditer(context):
+        try:
+            index = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        blocks[index] = match.group(0).strip()
+    return blocks
+
+
+def _renumber_passage_block(block: str, new_index: int) -> str:
+    return re.sub(
+        r"^\[PASSAGE\s+\d+\]",
+        f"[PASSAGE {new_index}]",
+        block,
+        count=1,
+    )
+
+
+def _dedupe_citations_by_source_page(
+    citation_list: list[dict[str, Any]],
+    context: str,
+) -> tuple[list[dict[str, Any]], str, list[int]]:
+    """Collapse duplicate citations using key ``(source_id, page_number)``.
+
+    Returns a tuple of ``(deduped_citations, deduped_context, kept_positions)``.
+    If context blocks cannot be safely remapped, this function is a no-op.
+    """
+    if not citation_list:
+        return citation_list, context, []
+
+    seen: set[tuple[str, Optional[int]]] = set()
+    kept_entries: list[dict[str, Any]] = []
+    kept_positions: list[int] = []
+
+    for pos, entry in enumerate(citation_list):
+        source_id = str(entry.get("source_id", "")).strip()
+        page_number = _normalize_page_number(entry.get("page_number"))
+        key = (source_id, page_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept_entries.append(entry)
+        kept_positions.append(pos)
+
+    if len(kept_entries) == len(citation_list):
+        return citation_list, context, list(range(len(citation_list)))
+
+    passage_blocks = _extract_passage_blocks(context)
+    renumbered_citations: list[dict[str, Any]] = []
+    renumbered_blocks: list[str] = []
+
+    for new_index, entry in enumerate(kept_entries, start=1):
+        raw_old_index = entry.get("index")
+        try:
+            old_index = int(raw_old_index)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Citation dedupe fallback: invalid citation index %r", raw_old_index
+            )
+            return citation_list, context, list(range(len(citation_list)))
+
+        old_block = passage_blocks.get(old_index)
+        if old_block is None:
+            logger.warning(
+                "Citation dedupe fallback: missing passage block for index %d", old_index
+            )
+            return citation_list, context, list(range(len(citation_list)))
+
+        updated_entry = {**entry, "index": new_index}
+        renumbered_citations.append(updated_entry)
+        renumbered_blocks.append(_renumber_passage_block(old_block, new_index))
+
+    return renumbered_citations, "\n\n".join(renumbered_blocks), kept_positions
 
 
 def _build_openinference_retrieval_documents(
@@ -1115,6 +1219,10 @@ class RagEngine:
                     packed = self._step_pack_budget(retrieved, config, generator)
                 cite = packed.cite
 
+                with profiler.span("Citation dedupe"):
+                    packed = self._step_dedupe_citations(packed)
+                cite = packed.cite
+
                 # -- build prompt -------------------------------------------
                 self._on_status("Building prompt...")
                 with profiler.span("Build prompt / messages"):
@@ -1579,6 +1687,12 @@ class RagEngine:
         generator = self._consume_preloaded_generator(retrieved.generator_preload_future)
         yield StatusEvent(status="Packing token budget...")
         packed = self._step_pack_budget(retrieved, config, generator)
+        cite = packed.cite
+
+        packed = self._step_dedupe_citations(
+            packed,
+            span_name="rag.citations.dedupe.stream",
+        )
         cite = packed.cite
 
         # -- budget summary status -----------------------------------------
@@ -2327,6 +2441,89 @@ class RagEngine:
                 pack_result=pack_result_obj,
                 packed_metadatas=packed_metadatas,
             )
+
+    def _step_dedupe_citations(
+        self,
+        packed: _PackResult,
+        *,
+        span_name: str = "rag.citations.dedupe",
+    ) -> _PackResult:
+        """Deduplicate packed citations by ``(source_id, page_number)``.
+
+        Retrieval-stage deduplication optimizes candidate diversity. This stage is
+        intentionally later in the pipeline and only collapses citation references.
+        """
+        with start_span(
+            self._tracer,
+            span_name,
+            span_kind=SPAN_KIND_CHAIN,
+            attributes={
+                "rag.citations_enabled": packed.cite,
+                "rag.citation_dedupe.before": len(packed.citation_list),
+                "rag.context_chars_before": len(packed.context or ""),
+            },
+        ) as dedupe_span:
+            if not packed.cite or not packed.citation_list:
+                set_span_attributes(
+                    dedupe_span,
+                    {
+                        "rag.citation_dedupe.applied": False,
+                        "rag.citation_dedupe.after": len(packed.citation_list),
+                        "rag.citation_dedupe.removed": 0,
+                        "rag.context_chars_after": len(packed.context or ""),
+                    },
+                )
+                return packed
+
+            deduped_citations, deduped_context, kept_positions = _dedupe_citations_by_source_page(
+                packed.citation_list,
+                packed.context,
+            )
+
+            before_count = len(packed.citation_list)
+            after_count = len(deduped_citations)
+            removed_count = max(0, before_count - after_count)
+
+            if removed_count == 0:
+                set_span_attributes(
+                    dedupe_span,
+                    {
+                        "rag.citation_dedupe.applied": False,
+                        "rag.citation_dedupe.after": after_count,
+                        "rag.citation_dedupe.removed": 0,
+                        "rag.context_chars_after": len(packed.context or ""),
+                    },
+                )
+                return packed
+
+            deduped_results = [
+                packed.packed_retrieval_results[pos]
+                for pos in kept_positions
+                if pos < len(packed.packed_retrieval_results)
+            ]
+
+            logger.info(
+                "Citation dedupe (source_id,page_number): %d -> %d",
+                before_count,
+                after_count,
+            )
+
+            updated = _dc_replace(
+                packed,
+                context=deduped_context,
+                citation_list=deduped_citations,
+                packed_retrieval_results=deduped_results,
+            )
+            set_span_attributes(
+                dedupe_span,
+                {
+                    "rag.citation_dedupe.applied": True,
+                    "rag.citation_dedupe.after": after_count,
+                    "rag.citation_dedupe.removed": removed_count,
+                    "rag.context_chars_after": len(updated.context or ""),
+                },
+            )
+            return updated
 
     # -- internal pipeline helpers -----------------------------------------
 
