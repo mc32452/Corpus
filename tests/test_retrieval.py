@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from src.config import ModelConfig
+from src.models import ChildChunk, Metadata, ParentChunk
 from src import retrieval
 from src.retrieval import RetrievalEngine, RetrievalResult
 from src.metrics import DeduplicationMetrics, ThresholdMetrics
@@ -118,6 +119,45 @@ class TestHybridSearch:
         )
         assert len(results) > 0
         assert all((r.get("metadata") or {}).get("source_id") == "test_doc_linguistics" for r in results)
+
+    def test_subword_heavy_query_runs_without_error(self, retrieval_engine: RetrievalEngine):
+        response = retrieval_engine.search("noam chomsky's theory of language")
+        assert isinstance(response.results, list)
+
+    def test_custom_bm25_weight_is_forwarded(self, retrieval_engine: RetrievalEngine, monkeypatch):
+        captured: dict[str, float] = {}
+
+        def _fake_hybrid_search(*, query_text, query_vector, top_k, source_id=None, bm25_weight=0.5):
+            _ = query_text, query_vector, top_k, source_id
+            captured["bm25_weight"] = float(bm25_weight)
+            return []
+
+        monkeypatch.setattr(retrieval_engine._storage, "hybrid_search", _fake_hybrid_search)
+
+        response = retrieval_engine.search("Chomsky language", bm25_weight=0.2)
+
+        assert response.results == []
+        assert captured["bm25_weight"] == pytest.approx(0.2)
+
+    def test_use_hybrid_false_uses_vector_search(self, retrieval_engine: RetrievalEngine, monkeypatch):
+        calls = {"vector": 0}
+
+        def _fake_vector_search(*, query_vector, top_k, source_id=None):
+            _ = query_vector, top_k, source_id
+            calls["vector"] += 1
+            return []
+
+        def _fail_hybrid_search(*args, **kwargs):
+            _ = args, kwargs
+            raise AssertionError("hybrid_search should not be called when use_hybrid=False")
+
+        monkeypatch.setattr(retrieval_engine._storage, "vector_search", _fake_vector_search)
+        monkeypatch.setattr(retrieval_engine._storage, "hybrid_search", _fail_hybrid_search)
+
+        response = retrieval_engine.search("Chomsky language", use_hybrid=False)
+
+        assert response.results == []
+        assert calls["vector"] == 1
 
 
 # ===========================================================================
@@ -584,6 +624,94 @@ class TestFullSearch:
         response = retrieval_engine.search("Chomsky theory")
         r2 = response.results
         assert [r.child_id for r in r1] == [r.child_id for r in r2]
+
+    def test_identical_passage_across_sources_both_retrievable(
+        self,
+        tmp_storage,
+        mock_embedder: MockEmbeddingModel,
+        mock_reranker: MockReranker,
+    ):
+        shared_text = (
+            "Noam Chomsky's theory of language acquisition argues that children "
+            "acquire grammar despite limited input from the environment."
+        )
+
+        parent_a = ParentChunk(
+            id="p-shared-a",
+            text=shared_text,
+            metadata=Metadata(
+                source_id="shared_doc_a",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        parent_b = ParentChunk(
+            id="p-shared-b",
+            text=shared_text,
+            metadata=Metadata(
+                source_id="shared_doc_b",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=None,
+            ),
+        )
+        child_a = ChildChunk(
+            id="c-shared-a",
+            text=shared_text,
+            metadata=Metadata(
+                source_id="shared_doc_a",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=parent_a.id,
+            ),
+        )
+        child_b = ChildChunk(
+            id="c-shared-b",
+            text=shared_text,
+            metadata=Metadata(
+                source_id="shared_doc_b",
+                page_number=1,
+                page_label="1",
+                display_page="1",
+                header_path="Document",
+                parent_id=parent_b.id,
+            ),
+        )
+
+        tmp_storage.add_parents([parent_a, parent_b])
+        tmp_storage.add_children(
+            [child_a, child_b],
+            embeddings=mock_embedder.encode([shared_text, shared_text], normalize_embeddings=True),
+        )
+
+        engine = RetrievalEngine(
+            storage=tmp_storage,
+            embedding_model=mock_embedder,
+            reranker=mock_reranker,
+            config=_make_config("regular"),
+        )
+        response = engine.search(
+            "noam chomsky's theory of language",
+            top_k_fused=32,
+            top_k_rerank=24,
+            top_k_final=12,
+        )
+
+        source_ids = {
+            str(result.metadata.get("source_id"))
+            for result in response.results
+            if isinstance(result.metadata, dict) and result.metadata.get("source_id")
+        }
+
+        assert "shared_doc_a" in source_ids
+        assert "shared_doc_b" in source_ids
 
 
 # ===========================================================================

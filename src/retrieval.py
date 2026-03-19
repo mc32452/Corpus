@@ -321,24 +321,34 @@ class RetrievalEngine:
         top_k: int,
         source_id: Optional[str] = None,
         query_vector: Optional[list[float]] = None,
+        bm25_weight: float = 0.5,
+        use_hybrid: bool = True,
     ) -> list[dict[str, Any]]:
-        """Hybrid search with separate queries for embedding and BM25.
+        """Search with separate embedding/BM25 queries and optional hybrid toggle.
 
         When *query_vector* is supplied the embedding encode step is skipped;
         the caller is responsible for timing that encode separately.
         """
         if not embedding_query.strip():
             raise ValueError("embedding_query must be a non-empty string.")
-        if not bm25_query.strip():
+        if use_hybrid and not bm25_query.strip():
             raise ValueError("bm25_query must be a non-empty string.")
         if query_vector is None:
             query_vector = self._encode_query(self._embedding_model, embedding_query)
+
+        if not use_hybrid:
+            return self._storage.vector_search(
+                query_vector=query_vector,
+                top_k=top_k,
+                source_id=source_id,
+            )
 
         return self._storage.hybrid_search(
             query_text=bm25_query,
             query_vector=query_vector,
             top_k=top_k,
             source_id=source_id,
+            bm25_weight=bm25_weight,
         )
 
     @staticmethod
@@ -446,11 +456,13 @@ class RetrievalEngine:
         bm25_query: str,
         k_fused: int,
         source_id: Optional[str],
+        bm25_weight: float,
+        use_hybrid: bool,
         timing: "TimingMetrics",
         *,
         embed_parent_id: str = "retrieval.search",
     ) -> tuple[list[dict[str, Any]], Any]:
-        """Stage 1: LanceDB native hybrid search + query embedding."""
+        """Stage 1: query embedding + hybrid or vector retrieval."""
         t0 = time.perf_counter()
         import collections
         with start_span(self._tracer, "retrieval.embedding") as embed_span:
@@ -490,17 +502,37 @@ class RetrievalEngine:
 
 
         t0 = time.perf_counter()
-        fused = self._hybrid_search_decoupled(
-            embedding_query=embedding_query,
-            bm25_query=bm25_query,
-            top_k=k_fused,
-            source_id=source_id,
-            query_vector=query_vector,
-        )
+        try:
+            fused = self._hybrid_search_decoupled(
+                embedding_query=embedding_query,
+                bm25_query=bm25_query,
+                top_k=k_fused,
+                source_id=source_id,
+                query_vector=query_vector,
+                bm25_weight=bm25_weight,
+                use_hybrid=use_hybrid,
+            )
+        except TypeError as exc:
+            # Backward compatibility for tests/patches that override
+            # _hybrid_search_decoupled with the legacy signature.
+            if "bm25_weight" not in str(exc) and "use_hybrid" not in str(exc):
+                raise
+            fused = self._hybrid_search_decoupled(
+                embedding_query=embedding_query,
+                bm25_query=bm25_query,
+                top_k=k_fused,
+                source_id=source_id,
+                query_vector=query_vector,
+            )
         timing.hybrid_search_ms = (time.perf_counter() - t0) * 1000
         timing.sparse_search_ms = 0.0
         timing.rrf_fusion_ms = 0.0
-        logger.info("LanceDB hybrid search returned %d hits in %.3fms", len(fused), timing.hybrid_search_ms)
+        logger.info(
+            "LanceDB %s search returned %d hits in %.3fms",
+            "hybrid" if use_hybrid else "vector",
+            len(fused),
+            timing.hybrid_search_ms,
+        )
         return fused, query_vector
 
     def _stage_rerank(
@@ -809,14 +841,16 @@ class RetrievalEngine:
         retrieval_budget: Optional[int] = None,
         embedding_query: Optional[str] = None,
         bm25_query: Optional[str] = None,
+        bm25_weight: Optional[float] = None,
+        use_hybrid: Optional[bool] = None,
         intent: Optional[str] = None,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> SearchResponse:
-        """Execute hybrid search with timing and metrics collection.
+        """Execute retrieval with timing and metrics collection.
 
         Pipeline stages:
-        1. Hybrid search (vector ANN + FTS BM25 w/ RRF)
+        1. Hybrid search (vector + BM25) or vector-only search
         2. Rerank (Jina v3)
         3. Dedup by parent
         4. Threshold filter (adaptive)
@@ -832,12 +866,23 @@ class RetrievalEngine:
             k_final = params.top_k_final
             reranker_threshold = params.reranker_threshold
             reranker_min_docs = params.reranker_min_docs
+            resolved_bm25_weight = float(params.bm25_weight)
+            resolved_use_hybrid = bool(params.use_hybrid)
         else:
             k_fused = top_k_fused or (cfg.top_k_fused if cfg else 50)
             k_rerank = top_k_rerank or (cfg.top_k_rerank if cfg else 20)
             k_final = top_k_final or (cfg.top_k_final if cfg else 5)
             reranker_threshold = float(cfg.reranker_threshold) if cfg else 0.05
             reranker_min_docs = cfg.reranker_min_docs if cfg else 3
+            resolved_bm25_weight = float(cfg.bm25_weight) if cfg else 0.5
+            resolved_use_hybrid = bool(cfg.use_hybrid) if cfg else True
+
+        if bm25_weight is not None:
+            resolved_bm25_weight = float(bm25_weight)
+        if use_hybrid is not None:
+            resolved_use_hybrid = bool(use_hybrid)
+
+        resolved_bm25_weight = max(0.0, min(1.0, resolved_bm25_weight))
 
         reranker_enabled = bool(cfg.reranker_enabled) if cfg else self._reranker is not None
         context_expansion_enabled = bool(cfg.context_expansion_enabled) if cfg else True
@@ -868,6 +913,8 @@ class RetrievalEngine:
                 k_rerank=k_rerank,
                 k_final=k_final,
                 source_id=source_id,
+                bm25_weight=resolved_bm25_weight,
+                use_hybrid=resolved_use_hybrid,
                 reranker_enabled=reranker_enabled,
                 reranker_threshold=reranker_threshold,
                 reranker_min_docs=reranker_min_docs,
@@ -906,6 +953,8 @@ class RetrievalEngine:
         k_rerank: int,
         k_final: int,
         source_id: Optional[str],
+        bm25_weight: float,
+        use_hybrid: bool,
         reranker_enabled: bool,
         reranker_threshold: float,
         reranker_min_docs: int,
@@ -927,6 +976,8 @@ class RetrievalEngine:
                 "rag.top_k_fused": k_fused,
                 "rag.top_k_rerank": k_rerank,
                 "rag.top_k_final": k_final,
+                "rag.use_hybrid": use_hybrid,
+                "rag.bm25_weight": bm25_weight,
                 "rag.reranker_enabled": reranker_enabled,
                 "rag.context_expansion_enabled": context_expansion_enabled,
             }) as search_span:
@@ -952,6 +1003,8 @@ class RetrievalEngine:
                             _bm25_q,
                             k_fused,
                             source_id,
+                            bm25_weight,
+                            use_hybrid,
                             timing,
                         )
 
