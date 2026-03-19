@@ -300,7 +300,8 @@ class TestThresholdFiltering:
             reranker=mock_reranker,
             config=config,
         )
-        results = engine.search("Chomsky")
+        response = engine.search("Chomsky")
+        results = response.results
         # Should still get results (safety net if needed)
         assert len(results) >= 1
 
@@ -325,7 +326,8 @@ class TestThresholdFiltering:
             reranker=mock_reranker,
             config=config,
         )
-        results = engine.search("Chomsky language theory")
+        response = engine.search("Chomsky language theory")
+        results = response.results
         # Safety net should provide at least min_docs
         assert len(results) >= 1  # May be less due to final dedup
 
@@ -337,9 +339,10 @@ class TestThresholdFiltering:
             reranker=mock_reranker,
             config=_make_config("regular"),
         )
-        results = engine.search("Chomsky theory")
-        if results and results[0].metrics:
-            metrics = results[0].metrics
+        response = engine.search("Chomsky theory")
+        results = response.results
+        if results and response.metrics:
+            metrics = response.metrics
             assert metrics.threshold is not None
 
     def test_safety_net_tags_below_threshold_items(
@@ -392,7 +395,9 @@ class TestThresholdFiltering:
         monkeypatch.setattr(engine, "_hybrid_search_decoupled", _fake_hybrid)
         monkeypatch.setattr(engine, "_rerank", _fake_rerank)
 
-        results = engine.search("test query")
+        response = engine.search("test query")
+
+        results = response.results
 
         # Safety net fires: threshold=0.5 passes only a1 (score 0.90), but
         # min_docs=3 extends to b1 and c1.
@@ -464,7 +469,9 @@ class TestThresholdFiltering:
         monkeypatch.setattr(engine, "_rerank", _fake_rerank)
         monkeypatch.setattr(retrieval, "_WORD_TO_TOKEN_RATIO", 1.0)
 
-        results = engine.search("what mentions of ChatGPT are there", intent="factual")
+        response = engine.search("what mentions of ChatGPT are there", intent="factual")
+
+        results = response.results
         sources = {r.metadata.get("source_id") for r in results if r.metadata.get("source_id")}
         assert "source_b" not in sources
         assert sources == {"source_a"}
@@ -518,7 +525,9 @@ class TestThresholdFiltering:
         monkeypatch.setattr(engine, "_rerank", _fake_rerank)
         monkeypatch.setattr(retrieval, "_WORD_TO_TOKEN_RATIO", 1.0)
 
-        results = engine.search("who is Romeo", intent="factual")
+        response = engine.search("who is Romeo", intent="factual")
+
+        results = response.results
         sources = {r.metadata.get("source_id") for r in results if r.metadata.get("source_id")}
         assert "source_b" in sources
 
@@ -529,24 +538,28 @@ class TestThresholdFiltering:
 
 class TestFullSearch:
     def test_search_returns_results(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine.search("Chomsky language theory")
+        response = retrieval_engine.search("Chomsky language theory")
+        results = response.results
         assert len(results) > 0
         assert isinstance(results[0], RetrievalResult)
 
     def test_search_results_have_text(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine.search("epistemology knowledge")
+        response = retrieval_engine.search("epistemology knowledge")
+        results = response.results
         for r in results:
             assert r.text or r.parent_text
 
     def test_search_results_have_score(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine.search("ethics moral philosophy")
+        response = retrieval_engine.search("ethics moral philosophy")
+        results = response.results
         for r in results:
             assert isinstance(r.score, float)
 
     def test_search_metrics_collected(self, retrieval_engine: RetrievalEngine):
-        results = retrieval_engine.search("Chomsky", collect_metrics=True)
+        response = retrieval_engine.search("Chomsky", collect_metrics=True)
+        results = response.results
         if results:
-            metrics = results[0].metrics
+            metrics = response.metrics
             assert metrics is not None
             assert metrics.timing.total_ms > 0
             assert metrics.timing.hybrid_search_ms >= 0
@@ -555,7 +568,8 @@ class TestFullSearch:
     def test_search_max_two_children_per_parent(self, retrieval_engine: RetrievalEngine):
         """Final results should have at most 2 children per parent_id (max_children_per_parent=2)."""
         from collections import Counter
-        results = retrieval_engine.search("Chomsky language")
+        response = retrieval_engine.search("Chomsky language")
+        results = response.results
         parent_ids = [
             r.metadata.get("parent_id") for r in results
             if r.metadata.get("parent_id")
@@ -565,8 +579,10 @@ class TestFullSearch:
 
     def test_search_deterministic(self, retrieval_engine: RetrievalEngine):
         """Same query should produce same results."""
-        r1 = retrieval_engine.search("Chomsky theory")
-        r2 = retrieval_engine.search("Chomsky theory")
+        response = retrieval_engine.search("Chomsky theory")
+        r1 = response.results
+        response = retrieval_engine.search("Chomsky theory")
+        r2 = response.results
         assert [r.child_id for r in r1] == [r.child_id for r in r2]
 
 
@@ -624,7 +640,8 @@ class TestRetrievalLatency:
         queries = [q for q in FIXED_QUERIES if q.strip()]
         for q in queries:
             with Timer("full_search", query=q) as t:
-                results = retrieval_engine.search(q)
+                response = retrieval_engine.search(q)
+                results = response.results
             result_count = len(results)
             logger.info(
                 f"full_search '{q[:40]}...': {t.result.elapsed_ms:.2f}ms, {result_count} results"

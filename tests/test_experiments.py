@@ -238,7 +238,8 @@ class TestExp2DedupOrder:
                 reranker=reranker, config=config,
             )
             t0 = time.perf_counter()
-            current_results = engine_current.search(q)
+            response = engine_current.search(q)
+            current_results = response.results
             current_ms = (time.perf_counter() - t0) * 1000
 
             # --- Alternative: hybrid → rerank → dedup ---
@@ -634,8 +635,10 @@ class TestExp4Caching:
         )
 
         for q in EXPERIMENT_QUERIES:
-            direct = engine_direct.search(q)
-            cached = engine_cached.search(q)
+            response = engine_direct.search(q)
+            direct = response.results
+            response = engine_cached.search(q)
+            cached = response.results
             assert len(direct) == len(cached), f"Result count mismatch for '{q}'"
             for d, c in zip(direct, cached):
                 assert d.child_id == c.child_id, f"Child ID mismatch for '{q}'"

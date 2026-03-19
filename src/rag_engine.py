@@ -2013,13 +2013,15 @@ class RagEngine:
                     generator_preload_future = self._start_generator_preload()
 
                 with _span("Retrieval (hybrid search + rerank)"):
-                    results = retrieval_engine.search(
+                    response = retrieval_engine.search(
                         query_text,
                         source_id=source_id,
                         params=classified.retrieval_params,
                         retrieval_budget=config.retrieval_budget,
                         intent=classified.intent_result.intent.value,
                     )
+                    results = response.results
+                    retrieval_metrics = response.metrics
 
                 source_ids = sorted(
                     {
@@ -2033,8 +2035,6 @@ class RagEngine:
                     for r in results
                     if (r.parent_text if r.parent_text else r.text)
                 ]
-
-            retrieval_metrics = results[0].metrics if results and results[0].metrics else None
 
             _scores = [r.score for r in results] if results else []
             top_score = max(_scores) if _scores else 0.0

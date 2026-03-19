@@ -24,6 +24,16 @@ import time
 from dataclasses import dataclass
 from operator import itemgetter
 from typing import Any, Optional
+import json
+from opentelemetry.trace import StatusCode, Status
+from openinference.semconv.trace import (
+    SpanAttributes,
+    OpenInferenceSpanKindValues,
+    RerankerAttributes,
+    EmbeddingAttributes,
+    DocumentAttributes,
+)
+
 
 from .config import ModelConfig, ResolvedRetrievalParams
 from .metrics import (
@@ -38,6 +48,7 @@ from .phoenix_tracing import (
     SPAN_KIND_RERANKER,
     SPAN_KIND_RETRIEVER,
     format_openinference_document,
+    set_graph_node,
     set_reranker_documents,
     set_retrieval_documents,
     set_span_attributes,
@@ -233,6 +244,12 @@ def build_source_legend(source_mapping: dict[str, str]) -> str:
         lines.append(f"- {source_id} → {doc_name}")
     return "\n".join(lines)
 
+
+@dataclass(frozen=True)
+class SearchResponse:
+    results: list[RetrievalResult]
+    metrics: Optional[RetrievalMetrics] = None
+
 @dataclass(frozen=True)
 class RetrievalResult:
     """Result from retrieval pipeline."""
@@ -389,6 +406,11 @@ class RetrievalEngine:
             scores = list(scores)
         
         raw_scores = [float(s) for s in scores]
+
+        if len(raw_scores) != len(items):
+            raise RuntimeError(
+                f"Reranker returned {len(raw_scores)} scores for {len(items)} pairs"
+            )
         
         reranked = [
             {**item, "rerank_score": float(score), "score": float(score)}
@@ -405,11 +427,46 @@ class RetrievalEngine:
         k_fused: int,
         source_id: Optional[str],
         timing: "TimingMetrics",
+        *,
+        embed_parent_id: str = "retrieval.search",
     ) -> tuple[list[dict[str, Any]], Any]:
         """Stage 1: LanceDB native hybrid search + query embedding."""
         t0 = time.perf_counter()
-        query_vector = self._encode_query(self._embedding_model, embedding_query)
-        timing.query_embedding_ms = (time.perf_counter() - t0) * 1000
+        import collections
+        with start_span(self._tracer, "retrieval.embedding") as embed_span:
+            try:
+                embed_span.set_attribute(
+                    SpanAttributes.OPENINFERENCE_SPAN_KIND,
+                    OpenInferenceSpanKindValues.EMBEDDING.value,
+                )
+                set_graph_node(
+                    embed_span,
+                    node_id="stage.embedding",
+                    parent_id=embed_parent_id,
+                    name="Query Embedding",
+                )
+                embed_span.set_attribute(
+                    SpanAttributes.EMBEDDING_MODEL_NAME,
+                    self._embedding_model.model_id if hasattr(self._embedding_model, "model_id") else (self._config.embedding_model if self._config else "unknown"),
+                )
+                embed_span.set_attribute(
+                    "embedding.embeddings.0.embedding.text",
+                    embedding_query,
+                )
+                embed_span.set_attribute(SpanAttributes.INPUT_VALUE, embedding_query)
+                query_vector = self._encode_query(self._embedding_model, embedding_query)
+
+                timing.query_embedding_ms = (time.perf_counter() - t0) * 1000
+                embed_span.set_attribute(
+                    SpanAttributes.METADATA,
+                    json.dumps({"duration_ms": round(timing.query_embedding_ms, 2)})
+                )
+                embed_span.set_status(StatusCode.OK)
+            except Exception as exc:
+                embed_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                embed_span.record_exception(exc)
+                raise
+
 
         t0 = time.perf_counter()
         fused = self._hybrid_search_decoupled(
@@ -462,14 +519,14 @@ class RetrievalEngine:
         if not reranked:
             return reranked, above_threshold_results, threshold, threshold_metrics
 
-        config_threshold = reranker_threshold
         min_docs = reranker_min_docs
         items_before = len(reranked)
         score_key = "rerank_score" if reranker_enabled else "score"
 
         top_score = float(reranked[0].get(score_key, 0.0))
         relative_factor = _ADAPTIVE_THRESHOLD_FACTOR
-        adaptive_threshold = max(config_threshold, top_score * relative_factor)
+        adaptive_threshold = max(reranker_threshold, top_score * relative_factor)
+        config_threshold = self._config.reranker_threshold if self._config else None
         logger.info(
             "Adaptive threshold: top_score=%.4f relative=%.4f effective=%.4f (config floor=%.4f)",
             top_score, top_score * relative_factor, adaptive_threshold, config_threshold,
@@ -490,10 +547,12 @@ class RetrievalEngine:
             reranked = reranked[:min_docs]
             for item in reranked:
                 if float(item.get(score_key, float("-inf"))) < threshold:
-                    item["below_threshold"] = True
-                    meta = item.get("metadata")
-                    if isinstance(meta, dict):
-                        meta["below_threshold"] = True
+                    # Copy-on-write
+                    reranked[reranked.index(item)] = {
+                        **item,
+                        "below_threshold": True,
+                        "metadata": {**item.get("metadata", {}), "below_threshold": True}
+                    }
             threshold_metrics = ThresholdMetrics(
                 threshold_value=threshold, items_before_threshold=items_before,
                 items_after_threshold=min_docs, safety_net_triggered=True, min_docs=min_docs,
@@ -591,11 +650,13 @@ class RetrievalEngine:
                 item_tok = _est_tokens(item.get("text", ""))
                 if running_sub + item_tok > sub_ceiling:
                     break
-                meta = item.get("metadata")
-                if isinstance(meta, dict):
-                    meta["below_threshold"] = True
-                item["below_threshold"] = True
-                reranked.append(item)
+                # Copy-on-write
+                new_item = {
+                    **item,
+                    "below_threshold": True,
+                    "metadata": {**item.get("metadata", {}), "below_threshold": True}
+                }
+                reranked.append(new_item)
                 running_sub += item_tok
                 sub_added += 1
                 k_final += 1
@@ -608,11 +669,40 @@ class RetrievalEngine:
 
         return reranked, k_final
 
+    def _stage_final_dedup(
+        self,
+        reranked: list[dict[str, Any]],
+        k_final: int,
+        max_children_per_parent: int,
+    ) -> list[dict[str, Any]]:
+        final: list[dict[str, Any]] = []
+        parent_counts: dict[str, int] = {}
+        seen_children: set[str] = set()
+        for item in reranked:
+            child_id = item.get("id")
+            if isinstance(child_id, str):
+                if child_id in seen_children:
+                    continue
+                seen_children.add(child_id)
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            parent_id = metadata.get("parent_id")
+            if isinstance(parent_id, str):
+                count = parent_counts.get(parent_id, 0)
+                if count >= max_children_per_parent:
+                    continue
+                parent_counts[parent_id] = count + 1
+            final.append(item)
+            if len(final) >= k_final:
+                break
+        return final
+
     def _stage_context_expand(
         self,
         final: list[dict[str, Any]],
         context_expansion_enabled: bool,
-    ) -> list[RetrievalResult]:
+    ) -> SearchResponse:
         """Stage 7: Expand to parent text and build RetrievalResult list."""
         parent_cache: dict[str, str] = {}
         if context_expansion_enabled:
@@ -699,7 +789,9 @@ class RetrievalEngine:
         embedding_query: Optional[str] = None,
         bm25_query: Optional[str] = None,
         intent: Optional[str] = None,
-    ) -> list[RetrievalResult]:
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> SearchResponse:
         """Execute hybrid search with timing and metrics collection.
 
         Pipeline stages:
@@ -739,13 +831,73 @@ class RetrievalEngine:
         _embedding_q = embedding_query or query
         _bm25_q = bm25_query or query
 
-        with start_span(
-            self._tracer,
-            "retrieval.search",
-            span_kind=SPAN_KIND_RETRIEVER,
-            attributes={
-                "input.value": query,
-                "input.mime_type": "text/plain",
+        # Resolve sub-threshold policy early so we can stamp tag.tags on the
+        # root span before it closes (Task 3).  The result is also passed down
+        # to _stage_budget_expand so the logic is unchanged.
+        policy_name, _early_policy = _resolve_sub_threshold_policy(query=query, intent=intent)
+
+        def _run_search() -> SearchResponse:
+            return self._run_search_impl(
+                query=query,
+                _embedding_q=_embedding_q,
+                _bm25_q=_bm25_q,
+                intent=intent,
+                policy_name=policy_name,
+                k_fused=k_fused,
+                k_rerank=k_rerank,
+                k_final=k_final,
+                source_id=source_id,
+                reranker_enabled=reranker_enabled,
+                reranker_threshold=reranker_threshold,
+                reranker_min_docs=reranker_min_docs,
+                context_expansion_enabled=context_expansion_enabled,
+                _max_children=_max_children,
+                collect_metrics=collect_metrics,
+                retrieval_budget=retrieval_budget,
+                timing=timing,
+                total_start=total_start,
+                cfg=cfg,
+            )
+
+        # Task 2: propagate session_id / user_id to all child spans.
+        if session_id is not None or user_id is not None:
+            try:
+                from openinference.instrumentation import using_attributes  # type: ignore[import-untyped]
+                with using_attributes(
+                    session_id=session_id,
+                    user_id=user_id,
+                ):
+                    return _run_search()
+            except ImportError:
+                pass  # openinference not installed — fall through
+
+        return _run_search()
+
+    def _run_search_impl(
+        self,
+        *,
+        query: str,
+        _embedding_q: str,
+        _bm25_q: str,
+        intent: Optional[str],
+        policy_name: str,
+        k_fused: int,
+        k_rerank: int,
+        k_final: int,
+        source_id: Optional[str],
+        reranker_enabled: bool,
+        reranker_threshold: float,
+        reranker_min_docs: int,
+        context_expansion_enabled: bool,
+        _max_children: int,
+        collect_metrics: bool,
+        retrieval_budget: Optional[int],
+        timing: "TimingMetrics",
+        total_start: float,
+        cfg: Any,
+    ) -> SearchResponse:
+        """Internal implementation extracted to allow using_attributes wrapping."""
+        with start_span(self._tracer, "retrieval.search", attributes={
                 "rag.intent": intent,
                 "rag.source_id": source_id,
                 "rag.query_chars": len(query),
@@ -756,305 +908,454 @@ class RetrievalEngine:
                 "rag.top_k_final": k_final,
                 "rag.reranker_enabled": reranker_enabled,
                 "rag.context_expansion_enabled": context_expansion_enabled,
-            },
-        ) as search_span:
-            # Stage 1: Hybrid search
-            with start_span(
-                self._tracer,
-                "retrieval.stage.hybrid_search",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                fused, _ = self._stage_hybrid_search(
-                    query,
-                    _embedding_q,
-                    _bm25_q,
-                    k_fused,
-                    source_id,
-                    timing,
-                )
+            }) as search_span:
+            try:
+                search_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.CHAIN.value)
+                search_span.set_attribute(SpanAttributes.INPUT_VALUE, query)
+                search_span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, "text/plain")
+                # Stage 1: Hybrid search
+                with start_span(self._tracer, "retrieval.stage.hybrid_search") as stage_span:
+                    try:
+                        stage_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.RETRIEVER.value)
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.hybrid_search",
+                            parent_id="retrieval.search",
+                            name="Hybrid Search",
+                        )
+                        fused, _ = self._stage_hybrid_search(
+                            query,
+                            _embedding_q,
+                            _bm25_q,
+                            k_fused,
+                            source_id,
+                            timing,
+                        )
+
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "hybrid_search",
+                                "rag.results_count": len(fused),
+                                "rag.query_embedding_ms": timing.query_embedding_ms,
+                                "rag.hybrid_search_ms": timing.hybrid_search_ms,
+                            },
+                        )
+                        for i, doc in enumerate(fused):
+                            stage_span.set_attribute(f"retrieval.documents.{i}.document.id", str(doc.get("id", "")))
+                            stage_span.set_attribute(f"retrieval.documents.{i}.document.score", float(doc.get("score", 0.0)))
+                            stage_span.set_attribute(f"retrieval.documents.{i}.document.content", str(doc.get("text", ""))[:500])
+                            metadata = doc.get("metadata") or {}
+                            if metadata:
+                                stage_span.set_attribute(f"retrieval.documents.{i}.document.metadata", json.dumps(metadata))
+                        stage_span.set_attribute(SpanAttributes.INPUT_VALUE, query)
+                        stage_span.set_attribute(SpanAttributes.OUTPUT_VALUE, f"{len(fused)} documents retrieved")
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({"duration_ms": round(timing.hybrid_search_ms, 2)})
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                # Stage 2: Rerank
+                with start_span(self._tracer, "retrieval.stage.rerank") as stage_span:
+                    try:
+                        stage_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.RERANKER.value)
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.rerank",
+                            parent_id="retrieval.search",
+                            name="Reranker",
+                        )
+                        stage_span.set_attribute(RerankerAttributes.RERANKER_QUERY, query)
+                        stage_span.set_attribute(RerankerAttributes.RERANKER_MODEL_NAME, self._reranker.model_id if hasattr(self._reranker, "model_id") else (self._config.reranker_model if self._config else "unknown"))
+                        stage_span.set_attribute(RerankerAttributes.RERANKER_TOP_K, k_rerank)
+                        # Build input documents for RERANKER span before reranking
+                        input_docs_for_span = self._build_retrieval_documents_from_items(
+                            fused[:k_rerank], limit=k_rerank, max_content_chars=220,
+                        )
+                        # NOTE: Do NOT add a manual loop here — set_reranker_documents
+                        # (called below after reranking) emits the correct flattened attrs.
+
+                        reranked, raw_scores = self._stage_rerank(
+                            query,
+                            fused,
+                            k_rerank,
+                            reranker_enabled,
+                            timing,
+                        )
+                        # Build output documents for RERANKER span after reranking
+                        output_docs_for_span = self._build_retrieval_documents_from_items(
+                            reranked, limit=k_rerank, max_content_chars=220,
+                        )
+                        # No manual loop — set_reranker_documents handles all flattened attrs.
+                        
+                        rerank_min = min(raw_scores) if raw_scores else 0.0
+                        rerank_max = max(raw_scores) if raw_scores else 0.0
+                        rerank_mean = (sum(raw_scores) / len(raw_scores)) if raw_scores else 0.0
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "rerank",
+                                "rag.rerank_ms": timing.rerank_ms,
+                                "rag.items_in": len(fused),
+                                "rag.items_out": len(reranked),
+                                "rag.rerank.score_min": rerank_min,
+                                "rag.rerank.score_max": rerank_max,
+                                "rag.rerank.score_mean": rerank_mean,
+                            },
+                        )
+                        set_reranker_documents(
+                            stage_span,
+                            input_documents=input_docs_for_span,
+                            output_documents=output_docs_for_span,
+                            query=query,
+                            top_k=k_rerank,
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({"duration_ms": round(timing.rerank_ms, 2)})
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+                all_reranked = list(reranked)
+
+                # Stage 3: Dedup by parent
+                with start_span(
+                    self._tracer,
+                    "retrieval.stage.dedup_initial",
+                    span_kind=SPAN_KIND_RETRIEVER,
+                ) as stage_span:
+                    try:
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.dedup_initial",
+                            parent_id="retrieval.search",
+                            name="Initial Deduplication",
+                        )
+                        t0 = time.perf_counter()
+                        reranked, dedup_metrics = self._deduplicate_by_parent(
+                            reranked,
+                            top_k=len(reranked),
+                            max_children_per_parent=_max_children,
+                        )
+                        timing.dedup_ms = (time.perf_counter() - t0) * 1000
+                        logger.debug(
+                            "Parent dedup (post-rerank): %d -> %d (%.1f%% reduction)",
+                            dedup_metrics.children_before_dedup,
+                            dedup_metrics.children_after_dedup,
+                            dedup_metrics.reduction_pct,
+                        )
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "dedup_initial",
+                                "rag.dedup_ms": timing.dedup_ms,
+                                "rag.children_before": dedup_metrics.children_before_dedup,
+                                "rag.children_after": dedup_metrics.children_after_dedup,
+                                "rag.parents_deduplicated": dedup_metrics.parents_deduplicated,
+                            },
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({
+                                "duration_ms": round(timing.dedup_ms, 2),
+                                "input_count": dedup_metrics.children_before_dedup,
+                                "output_count": dedup_metrics.children_after_dedup,
+                            })
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                # Stage 4: Threshold filter
+                with start_span(
+                    self._tracer,
+                    "retrieval.stage.threshold_filter",
+                ) as stage_span:
+                    try:
+                        # Task 5 — semantically a guardrail: rejects low-relevance candidates.
+                        stage_span.set_attribute(
+                            SpanAttributes.OPENINFERENCE_SPAN_KIND,
+                            OpenInferenceSpanKindValues.GUARDRAIL.value,
+                        )
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.threshold_filter",
+                            parent_id="retrieval.search",
+                            name="Threshold Filter",
+                        )
+                        t0 = time.perf_counter()
+                        reranked, above_threshold_results, threshold, threshold_metrics = self._stage_threshold_filter(
+                            reranked,
+                            reranker_enabled,
+                            reranker_threshold,
+                            reranker_min_docs,
+                        )
+                        duration_ms = (time.perf_counter() - t0) * 1000
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "threshold_filter",
+                                "rag.threshold": threshold,
+                                "rag.items_before": threshold_metrics.items_before_threshold,
+                                "rag.items_after": threshold_metrics.items_after_threshold,
+                                "rag.safety_net_triggered": threshold_metrics.safety_net_triggered,
+                                "input.value": f"{threshold_metrics.items_before_threshold} candidates before thresholding",
+                                                        "output.value": (
+                                    f"{threshold_metrics.items_after_threshold} candidates after threshold={threshold:.6f}"
+                                ),
+                                "output.mime_type": "text/plain",
+                            },
+                        )
+                        set_retrieval_documents(
+                            stage_span,
+                            self._build_retrieval_documents_from_items(reranked),
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({
+                                "duration_ms": round(duration_ms, 2),
+                                "input_count": threshold_metrics.items_before_threshold,
+                                "output_count": threshold_metrics.items_after_threshold,
+                            })
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                reranker_metrics = compute_reranker_stats(raw_scores)
+                if reranker_metrics.items_reranked > 0:
+                    logger.debug(
+                        "Rerank score stats: min=%.4f max=%.4f mean=%.4f std=%.4f (n=%d)",
+                        reranker_metrics.score_min,
+                        reranker_metrics.score_max,
+                        reranker_metrics.score_mean,
+                        reranker_metrics.score_std,
+                        reranker_metrics.items_reranked,
+                    )
+
+                # Stage 5: Budget expansion
+                budget = retrieval_budget or (cfg.retrieval_budget if cfg else 0)
+                with start_span(
+                    self._tracer,
+                    "retrieval.stage.budget_expand",
+                    span_kind=SPAN_KIND_RETRIEVER,
+                ) as stage_span:
+                    try:
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.budget_expand",
+                            parent_id="retrieval.search",
+                            name="Budget Expansion",
+                        )
+                        t0 = time.perf_counter()
+                        before_expand_count = len(reranked)
+                        before_k_final = k_final
+                        reranked, k_final = self._stage_budget_expand(
+                            query,
+                            reranked,
+                            all_reranked,
+                            above_threshold_results,
+                            k_final,
+                            budget,
+                            threshold,
+                            intent,
+                        )
+                        duration_ms = (time.perf_counter() - t0) * 1000
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "budget_expand",
+                                "rag.retrieval_budget": budget,
+                                "rag.threshold": threshold,
+                                "rag.items_before": before_expand_count,
+                                "rag.items_after": len(reranked),
+                                "rag.k_final_before": before_k_final,
+                                "rag.k_final_after": k_final,
+                            },
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({
+                                "duration_ms": round(duration_ms, 2),
+                                "input_count": before_expand_count,
+                                "output_count": len(reranked),
+                            })
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                # Stage 6: Final dedup
+                with start_span(
+                    self._tracer,
+                    "retrieval.stage.final_dedup",
+                    span_kind=SPAN_KIND_RETRIEVER,
+                ) as stage_span:
+                    try:
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.final_dedup",
+                            parent_id="retrieval.search",
+                            name="Final Deduplication",
+                        )
+                        t0 = time.perf_counter()
+                        items_before = len(reranked)
+                        final = self._stage_final_dedup(reranked, k_final, _max_children)
+                        duration_ms = (time.perf_counter() - t0) * 1000
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "final_dedup",
+                                "rag.items_before": items_before,
+                                "rag.items_after": len(final),
+                            },
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({
+                                "duration_ms": round(duration_ms, 2),
+                                "input_count": items_before,
+                                "output_count": len(final),
+                            })
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                # Stage 7: Context expansion
+                with start_span(
+                    self._tracer,
+                    "retrieval.stage.context_expand",
+                    span_kind=SPAN_KIND_RETRIEVER,
+                ) as stage_span:
+                    try:
+                        set_graph_node(
+                            stage_span,
+                            node_id="stage.context_expand",
+                            parent_id="retrieval.search",
+                            name="Context Expansion",
+                        )
+                        t0 = time.perf_counter()
+                        results = self._stage_context_expand(final, context_expansion_enabled)
+                        duration_ms = (time.perf_counter() - t0) * 1000
+                        unique_sources = {
+                            result.metadata.get("source_id")
+                            for result in results
+                            if isinstance(result.metadata, dict) and result.metadata.get("source_id")
+                        }
+                        set_span_attributes(
+                            stage_span,
+                            {
+                                "rag.stage": "context_expand",
+                                "rag.results_count": len(results),
+                                "rag.sources_count": len(unique_sources),
+                            },
+                        )
+                        stage_span.set_attribute(
+                            SpanAttributes.METADATA,
+                            json.dumps({
+                                "duration_ms": round(duration_ms, 2),
+                                "input_count": len(final),
+                                "output_count": len(results),
+                            })
+                        )
+                        stage_span.set_status(StatusCode.OK)
+                    except Exception as exc:
+                        stage_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        stage_span.record_exception(exc)
+                        raise
+
+                timing.total_ms = (time.perf_counter() - total_start) * 1000
+
+                metrics = None
+                if collect_metrics and results:
+                    metrics = RetrievalMetrics(
+                        timing=timing,
+                        reranker=reranker_metrics,
+                        deduplication=dedup_metrics,
+                        threshold=threshold_metrics,
+                        query=query,
+                        mode=cfg.mode if cfg else "unknown",
+                    )
+
+                top_results_preview = []
+                top_source_ids: list[str] = []
+                for rank, result in enumerate(results[:5], start=1):
+                    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                    source_value = metadata.get("source_id")
+                    if isinstance(source_value, str) and source_value:
+                        top_source_ids.append(source_value)
+                    top_results_preview.append(
+                        {
+                            "rank": rank,
+                            "source_id": source_value,
+                            "display_page": metadata.get("display_page"),
+                            "page_number": metadata.get("page_number"),
+                            "chunk_id": result.child_id,
+                            "score": round(float(result.score), 6),
+                        }
+                    )
 
                 set_span_attributes(
-                    stage_span,
+                    search_span,
                     {
-                        "rag.stage": "hybrid_search",
-                        "rag.results_count": len(fused),
+                        "rag.total_ms": timing.total_ms,
                         "rag.query_embedding_ms": timing.query_embedding_ms,
                         "rag.hybrid_search_ms": timing.hybrid_search_ms,
-                    },
-                )
-
-            # Stage 2: Rerank
-            with start_span(
-                self._tracer,
-                "retrieval.stage.rerank",
-                span_kind=SPAN_KIND_RERANKER,
-            ) as stage_span:
-                # Build input documents for RERANKER span before reranking
-                input_docs_for_span = self._build_retrieval_documents_from_items(
-                    fused[:k_rerank], limit=k_rerank, max_content_chars=220,
-                )
-                reranked, raw_scores = self._stage_rerank(
-                    query,
-                    fused,
-                    k_rerank,
-                    reranker_enabled,
-                    timing,
-                )
-                # Build output documents for RERANKER span after reranking
-                output_docs_for_span = self._build_retrieval_documents_from_items(
-                    reranked, limit=k_rerank, max_content_chars=220,
-                )
-                rerank_min = min(raw_scores) if raw_scores else 0.0
-                rerank_max = max(raw_scores) if raw_scores else 0.0
-                rerank_mean = (sum(raw_scores) / len(raw_scores)) if raw_scores else 0.0
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "rerank",
                         "rag.rerank_ms": timing.rerank_ms,
-                        "rag.items_in": len(fused),
-                        "rag.items_out": len(reranked),
-                        "rag.rerank.score_min": rerank_min,
-                        "rag.rerank.score_max": rerank_max,
-                        "rag.rerank.score_mean": rerank_mean,
-                    },
-                )
-                set_reranker_documents(
-                    stage_span,
-                    input_documents=input_docs_for_span,
-                    output_documents=output_docs_for_span,
-                    query=query,
-                    top_k=k_rerank,
-                )
-            all_reranked = list(reranked)
-
-            # Stage 3: Dedup by parent
-            with start_span(
-                self._tracer,
-                "retrieval.stage.dedup_initial",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                t0 = time.perf_counter()
-                reranked, dedup_metrics = self._deduplicate_by_parent(
-                    reranked,
-                    top_k=len(reranked),
-                    max_children_per_parent=_max_children,
-                )
-                timing.dedup_ms = (time.perf_counter() - t0) * 1000
-                logger.debug(
-                    "Parent dedup (post-rerank): %d -> %d (%.1f%% reduction)",
-                    dedup_metrics.children_before_dedup,
-                    dedup_metrics.children_after_dedup,
-                    dedup_metrics.reduction_pct,
-                )
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "dedup_initial",
                         "rag.dedup_ms": timing.dedup_ms,
-                        "rag.children_before": dedup_metrics.children_before_dedup,
-                        "rag.children_after": dedup_metrics.children_after_dedup,
-                        "rag.parents_deduplicated": dedup_metrics.parents_deduplicated,
-                    },
-                )
-
-            # Stage 4: Threshold filter
-            with start_span(
-                self._tracer,
-                "retrieval.stage.threshold_filter",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                reranked, above_threshold_results, threshold, threshold_metrics = self._stage_threshold_filter(
-                    reranked,
-                    reranker_enabled,
-                    reranker_threshold,
-                    reranker_min_docs,
-                )
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "threshold_filter",
+                        "rag.results_count": len(results),
                         "rag.threshold": threshold,
-                        "rag.items_before": threshold_metrics.items_before_threshold,
-                        "rag.items_after": threshold_metrics.items_after_threshold,
-                        "rag.safety_net_triggered": threshold_metrics.safety_net_triggered,
-                        "input.value": f"{threshold_metrics.items_before_threshold} candidates before thresholding",
-                        "input.mime_type": "text/plain",
-                        "output.value": (
-                            f"{threshold_metrics.items_after_threshold} candidates after threshold={threshold:.6f}"
-                        ),
+                        "rag.reranker.items_reranked": reranker_metrics.items_reranked,
+                        "rag.reranker.score_min": reranker_metrics.score_min,
+                        "rag.reranker.score_max": reranker_metrics.score_max,
+                        "rag.threshold.items_after": threshold_metrics.items_after_threshold,
+                        "rag.threshold.safety_net": threshold_metrics.safety_net_triggered,
+                        "rag.top_source_ids": sorted(set(top_source_ids))[:10],
+                        "rag.top_results": top_results_preview,
                         "output.mime_type": "text/plain",
+                        SpanAttributes.OUTPUT_VALUE: str(len(results)) + " results returned",
                     },
                 )
                 set_retrieval_documents(
-                    stage_span,
-                    self._build_retrieval_documents_from_items(reranked),
+                    search_span,
+                    self._build_retrieval_documents_from_results(results),
                 )
 
-            reranker_metrics = compute_reranker_stats(raw_scores)
-            if reranker_metrics.items_reranked > 0:
-                logger.debug(
-                    "Rerank score stats: min=%.4f max=%.4f mean=%.4f std=%.4f (n=%d)",
-                    reranker_metrics.score_min,
-                    reranker_metrics.score_max,
-                    reranker_metrics.score_mean,
-                    reranker_metrics.score_std,
-                    reranker_metrics.items_reranked,
+                search_span.set_attribute(SpanAttributes.OUTPUT_VALUE, f"{len(results)} results returned")
+                search_span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, "text/plain")
+                search_span.set_attribute(SpanAttributes.METADATA, json.dumps({
+                    "total_duration_ms": round(timing.total_ms, 2),
+                    "intent": intent,
+                    "top_k_final": k_final,
+                    "result_count": len(results),
+                }))
+                # Task 3 — tag root span with resolved intent and query type.
+                search_span.set_attribute(
+                    "tag.tags",
+                    [intent or "unknown", policy_name],
                 )
+                search_span.set_status(StatusCode.OK)
 
-            # Stage 5: Budget expansion
-            budget = retrieval_budget or (cfg.retrieval_budget if cfg else 0)
-            with start_span(
-                self._tracer,
-                "retrieval.stage.budget_expand",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                before_expand_count = len(reranked)
-                before_k_final = k_final
-                reranked, k_final = self._stage_budget_expand(
-                    query,
-                    reranked,
-                    all_reranked,
-                    above_threshold_results,
-                    k_final,
-                    budget,
-                    threshold,
-                    intent,
-                )
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "budget_expand",
-                        "rag.retrieval_budget": budget,
-                        "rag.threshold": threshold,
-                        "rag.items_before": before_expand_count,
-                        "rag.items_after": len(reranked),
-                        "rag.k_final_before": before_k_final,
-                        "rag.k_final_after": k_final,
-                    },
-                )
+                return SearchResponse(results=results, metrics=metrics)
 
-            # Stage 6: Final dedup
-            with start_span(
-                self._tracer,
-                "retrieval.stage.final_dedup",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                final: list[dict[str, Any]] = []
-                parent_counts: dict[str, int] = {}
-                seen_children: set[str] = set()
-                for item in reranked:
-                    child_id = item.get("id")
-                    if isinstance(child_id, str):
-                        if child_id in seen_children:
-                            continue
-                        seen_children.add(child_id)
-                    metadata = item.get("metadata")
-                    if not isinstance(metadata, dict):
-                        metadata = {}
-                    parent_id = metadata.get("parent_id")
-                    if isinstance(parent_id, str):
-                        count = parent_counts.get(parent_id, 0)
-                        if count >= _max_children:
-                            continue
-                        parent_counts[parent_id] = count + 1
-                    final.append(item)
-                    if len(final) >= k_final:
-                        break
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "final_dedup",
-                        "rag.items_before": len(reranked),
-                        "rag.items_after": len(final),
-                    },
-                )
-
-            # Stage 7: Context expansion
-            with start_span(
-                self._tracer,
-                "retrieval.stage.context_expand",
-                span_kind=SPAN_KIND_RETRIEVER,
-            ) as stage_span:
-                results = self._stage_context_expand(final, context_expansion_enabled)
-                unique_sources = {
-                    result.metadata.get("source_id")
-                    for result in results
-                    if isinstance(result.metadata, dict) and result.metadata.get("source_id")
-                }
-                set_span_attributes(
-                    stage_span,
-                    {
-                        "rag.stage": "context_expand",
-                        "rag.results_count": len(results),
-                        "rag.sources_count": len(unique_sources),
-                        "output.mime_type": "text/plain",
-                        "output.value": f"{len(results)} retrieved passages",
-                    },
-                )
-
-            timing.total_ms = (time.perf_counter() - total_start) * 1000
-
-            if collect_metrics and results:
-                metrics = RetrievalMetrics(
-                    timing=timing,
-                    reranker=reranker_metrics,
-                    deduplication=dedup_metrics,
-                    threshold=threshold_metrics,
-                    query=query,
-                    mode=cfg.mode if cfg else "unknown",
-                )
-                results[0] = RetrievalResult(
-                    child_id=results[0].child_id,
-                    text=results[0].text,
-                    metadata=results[0].metadata,
-                    score=results[0].score,
-                    parent_text=results[0].parent_text,
-                    metrics=metrics,
-                )
-
-            top_results_preview = []
-            top_source_ids: list[str] = []
-            for rank, result in enumerate(results[:5], start=1):
-                metadata = result.metadata if isinstance(result.metadata, dict) else {}
-                source_value = metadata.get("source_id")
-                if isinstance(source_value, str) and source_value:
-                    top_source_ids.append(source_value)
-                top_results_preview.append(
-                    {
-                        "rank": rank,
-                        "source_id": source_value,
-                        "display_page": metadata.get("display_page"),
-                        "page_number": metadata.get("page_number"),
-                        "chunk_id": result.child_id,
-                        "score": round(float(result.score), 6),
-                    }
-                )
-
-            set_span_attributes(
-                search_span,
-                {
-                    "rag.total_ms": timing.total_ms,
-                    "rag.query_embedding_ms": timing.query_embedding_ms,
-                    "rag.hybrid_search_ms": timing.hybrid_search_ms,
-                    "rag.rerank_ms": timing.rerank_ms,
-                    "rag.dedup_ms": timing.dedup_ms,
-                    "rag.results_count": len(results),
-                    "rag.threshold": threshold,
-                    "rag.reranker.items_reranked": reranker_metrics.items_reranked,
-                    "rag.reranker.score_min": reranker_metrics.score_min,
-                    "rag.reranker.score_max": reranker_metrics.score_max,
-                    "rag.threshold.items_after": threshold_metrics.items_after_threshold,
-                    "rag.threshold.safety_net": threshold_metrics.safety_net_triggered,
-                    "rag.top_source_ids": sorted(set(top_source_ids))[:10],
-                    "rag.top_results": top_results_preview,
-                    "output.mime_type": "text/plain",
-                    "output.value": f"{len(results)} retrieval results",
-                },
-            )
-            set_retrieval_documents(
-                search_span,
-                self._build_retrieval_documents_from_results(results),
-            )
-
-            return results
+            except Exception as exc:
+                search_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                search_span.record_exception(exc)
+                raise
