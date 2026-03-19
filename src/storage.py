@@ -307,6 +307,12 @@ class StorageEngine:
         escaped = ", ".join(f"'{cls._escape_sql_literal(v)}'" for v in values)
         return f"{column} IN ({escaped})"
 
+    @classmethod
+    def _where_contains_ci(cls, column: str, value: str) -> str:
+        """Case-insensitive SQL substring predicate for Lance/DataFusion backends."""
+        escaped = cls._escape_sql_literal(value.lower())
+        return f"LOWER({column}) LIKE '%{escaped}%'"
+
     @staticmethod
     def _chunk(values: list[str], size: int) -> Iterable[list[str]]:
         for start in range(0, len(values), size):
@@ -638,6 +644,7 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str],
+        bm25_weight: float,
     ) -> list[dict[str, Any]]:
         if self._table is None:
             return []
@@ -647,8 +654,25 @@ class StorageEngine:
             .search(query_type="hybrid")
             .vector(query_vector)
             .text(query_text)
-            .limit(top_k)
         )
+
+        # Preserve the current default hybrid ranking behavior unless an
+        # explicit non-default BM25 coefficient is requested.
+        clamped_bm25_weight = max(0.0, min(1.0, float(bm25_weight)))
+        if abs(clamped_bm25_weight - 0.5) > 1e-9:
+            try:
+                from lancedb.rerankers import LinearCombinationReranker
+
+                vector_weight = 1.0 - clamped_bm25_weight
+                builder = builder.rerank(LinearCombinationReranker(weight=vector_weight))
+            except Exception as exc:
+                logger.warning(
+                    "Unable to apply bm25_weight=%s; using default LanceDB hybrid fusion instead: %s",
+                    clamped_bm25_weight,
+                    exc,
+                )
+
+        builder = builder.limit(top_k)
         if source_id:
             builder = builder.where(self._where_eq("source_id", source_id), prefilter=True)
         return builder.to_list()
@@ -660,6 +684,7 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str],
+        bm25_weight: float,
     ) -> list[dict[str, Any]]:
         try:
             return self._execute_hybrid_search(
@@ -667,6 +692,7 @@ class StorageEngine:
                 query_vector=query_vector,
                 top_k=top_k,
                 source_id=source_id,
+                bm25_weight=bm25_weight,
             )
         except Exception as exc:
             logger.warning(
@@ -679,6 +705,7 @@ class StorageEngine:
                 query_vector=query_vector,
                 top_k=top_k,
                 source_id=source_id,
+                bm25_weight=bm25_weight,
             )
 
     def hybrid_search(
@@ -688,6 +715,7 @@ class StorageEngine:
         query_vector: list[float],
         top_k: int,
         source_id: Optional[str] = None,
+        bm25_weight: float = 0.5,
     ) -> list[dict[str, Any]]:
         """LanceDB native hybrid search (vector ANN + full-text BM25 with RRF fusion)."""
         if self._table is None:
@@ -699,6 +727,7 @@ class StorageEngine:
             query_vector=query_vector,
             top_k=top_k,
             source_id=source_id,
+            bm25_weight=bm25_weight,
         )
 
         results: list[dict[str, Any]] = []
@@ -711,6 +740,44 @@ class StorageEngine:
                 "score": float(row.get("_relevance_score", 0.0)),
                 "rank": rank,
             })
+        return results
+
+    def vector_search(
+        self,
+        *,
+        query_vector: list[float],
+        top_k: int,
+        source_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Dense vector-only search used when hybrid retrieval is disabled."""
+        if self._table is None:
+            raise RuntimeError("LanceDB table is not initialized. Run ingest first.")
+
+        builder = self._table.search(query_vector).limit(top_k)
+        if source_id:
+            builder = builder.where(self._where_eq("source_id", source_id), prefilter=True)
+
+        rows = builder.to_list()
+        results: list[dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            distance_raw = row.get("_distance")
+            score: float
+            try:
+                distance = float(distance_raw)
+            except (TypeError, ValueError):
+                score = float(row.get("_score", 0.0))
+            else:
+                score = 1.0 / (1.0 + max(0.0, distance))
+
+            results.append(
+                {
+                    "id": row.get("id", ""),
+                    "text": row.get("text", ""),
+                    "metadata": self._row_to_metadata(row),
+                    "score": score,
+                    "rank": rank,
+                }
+            )
         return results
 
     def list_source_ids(self) -> list[str]:
@@ -1037,6 +1104,7 @@ class StorageEngine:
         source_id: str | None = None,
         source_ids: Optional[list[str]] = None,
         min_confidence: float = 0.0,
+        q: str | None = None,
         limit: int = 1000,
         offset: int = 0,
     ) -> list[dict]:
@@ -1070,6 +1138,8 @@ class StorageEngine:
         if source_ids is not None and not normalized_sources and not normalized_single:
             return []
 
+        search_text = q.strip().lower() if isinstance(q, str) else ""
+
         table = self._geo_mentions
         if table is None:
             try:
@@ -1086,36 +1156,71 @@ class StorageEngine:
             where_parts.append(self._where_in("source_id", normalized_sources))
         elif normalized_single:
             where_parts.append(self._where_eq("source_id", normalized_single))
-        where = " AND ".join(f"({part})" for part in where_parts)
+        base_where = " AND ".join(f"({part})" for part in where_parts)
+        select_columns = [
+            "id",
+            "source_id",
+            "chunk_id",
+            "place_name",
+            "matched_input",
+            "matched_on",
+            "geonameid",
+            "lat",
+            "lon",
+            "confidence",
+            "method",
+            "raw_score",
+            "is_ambiguous",
+            "candidate_count",
+            "margin_score",
+            "entity_type",
+            "ner_score",
+            "geocoder_version",
+            "geocoded_at",
+        ]
 
-        rows = (
-            table.search()
-            .where(where, prefilter=True)
-            .select([
-                "id",
-                "source_id",
-                "chunk_id",
-                "place_name",
-                "matched_input",
-                "matched_on",
-                "geonameid",
-                "lat",
-                "lon",
-                "confidence",
-                "method",
-                "raw_score",
-                "is_ambiguous",
-                "candidate_count",
-                "margin_score",
-                "entity_type",
-                "ner_score",
-                "geocoder_version",
-                "geocoded_at",
-            ])
-            .offset(offset)
-            .limit(limit)
-            .to_list()
-        )
+        rows: list[dict[str, Any]]
+        if search_text:
+            search_predicate = (
+                f"({self._where_contains_ci('place_name', search_text)}) OR "
+                f"({self._where_contains_ci('matched_input', search_text)})"
+            )
+            pushed_where = f"({base_where}) AND ({search_predicate})"
+            try:
+                rows = (
+                    table.search()
+                    .where(pushed_where, prefilter=True)
+                    .select(select_columns)
+                    .offset(offset)
+                    .limit(limit)
+                    .to_list()
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Geo mention text filter pushdown unsupported; falling back to in-memory filtering: %s",
+                    exc,
+                )
+                rows = (
+                    table.search()
+                    .where(base_where, prefilter=True)
+                    .select(select_columns)
+                    .to_list()
+                )
+                rows = [
+                    row
+                    for row in rows
+                    if search_text in str(row.get("place_name", "")).lower()
+                    or search_text in str(row.get("matched_input", "")).lower()
+                ][offset : offset + limit]
+        else:
+            rows = (
+                table.search()
+                .where(base_where, prefilter=True)
+                .select(select_columns)
+                .offset(offset)
+                .limit(limit)
+                .to_list()
+            )
         return [
             {
                 "id": str(row.get("id", "")),
@@ -1287,35 +1392,63 @@ class StorageEngine:
             where_parts.append(self._where_eq("source_id", normalized_single))
         if normalized_canonical:
             where_parts.append(self._where_eq("canonical_name", normalized_canonical))
-        where = " AND ".join(f"({part})" for part in where_parts)
-
-        base_query = (
-            table.search()
-            .where(where, prefilter=True)
-            .select([
-                "id",
-                "source_id",
-                "chunk_id",
-                "raw_name",
-                "canonical_name",
-                "confidence",
-                "method",
-                "role_hint",
-                "context_snippet",
-            ])
-        )
+        base_where = " AND ".join(f"({part})" for part in where_parts)
+        select_columns = [
+            "id",
+            "source_id",
+            "chunk_id",
+            "raw_name",
+            "canonical_name",
+            "confidence",
+            "method",
+            "role_hint",
+            "context_snippet",
+        ]
 
         if search_text:
-            rows = base_query.to_list()
-            filtered: list[dict[str, Any]] = []
-            for row in rows:
-                canonical = str(row.get("canonical_name", ""))
-                raw_name = str(row.get("raw_name", ""))
-                if search_text in canonical.lower() or search_text in raw_name.lower():
-                    filtered.append(row)
-            rows = filtered[offset : offset + limit]
+            search_predicate = (
+                f"({self._where_contains_ci('canonical_name', search_text)}) OR "
+                f"({self._where_contains_ci('raw_name', search_text)})"
+            )
+            pushed_where = f"({base_where}) AND ({search_predicate})"
+            try:
+                rows = (
+                    table.search()
+                    .where(pushed_where, prefilter=True)
+                    .select(select_columns)
+                    .offset(offset)
+                    .limit(limit)
+                    .to_list()
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Person mention text filter pushdown unsupported; falling back to in-memory filtering: %s",
+                    exc,
+                )
+                # Fallback path intentionally pulls the already source/confidence-scoped
+                # result set and filters in Python. This is acceptable for the expected
+                # mention-table sizes in offline single-user workspaces.
+                rows = (
+                    table.search()
+                    .where(base_where, prefilter=True)
+                    .select(select_columns)
+                    .to_list()
+                )
+                rows = [
+                    row
+                    for row in rows
+                    if search_text in str(row.get("canonical_name", "")).lower()
+                    or search_text in str(row.get("raw_name", "")).lower()
+                ][offset : offset + limit]
         else:
-            rows = base_query.offset(offset).limit(limit).to_list()
+            rows = (
+                table.search()
+                .where(base_where, prefilter=True)
+                .select(select_columns)
+                .offset(offset)
+                .limit(limit)
+                .to_list()
+            )
 
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -1595,6 +1728,9 @@ class StorageEngine:
                 logger.error("Failed to delete summary for source '%s': %s", sid, exc)
                 errors.append(f"summary: {exc}")
 
+        # Entity mention tables are not DB-enforced foreign-key cascades, so
+        # source deletes must explicitly clear both geo/person side tables.
+        # Keep these calls paired with parent/child/summary deletion.
         # Delete geo mentions
         try:
             self.delete_geo_mentions_by_source(sid)
