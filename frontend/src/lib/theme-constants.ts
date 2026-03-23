@@ -33,7 +33,7 @@ export const GLASS: Record<
   darkveil: {
     bg: "rgba(0,0,0,0.34)",
     backdrop: "blur(10px) saturate(120%)",
-    border: "rgba(139, 92, 246, 0.15)",
+    border: "rgba(0, 0, 0, 0.15)",
   },
 };
 
