@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -1581,6 +1582,9 @@ class RagEngine:
         """Internal implementation of query_events (unwrapped from error handling)."""
         logger.info("query_events_impl: started")
         config = self._model_config
+        stream_started_at = time.perf_counter()
+        retrieval_ms: Optional[float] = None
+        generation_ms: Optional[float] = None
 
         # -- resolve citation mode -----------------------------------------
         if citations_enabled is not None:
@@ -1672,14 +1676,20 @@ class RagEngine:
         else:
             yield StatusEvent(status="Searching knowledge base...")
 
+        retrieval_started_at = time.perf_counter()
         retrieved = self._step_retrieve(
             query_text, source_id, classified, retrieval_engine, cite, no_generate=False
         )
+        retrieval_ms = (time.perf_counter() - retrieval_started_at) * 1000.0
         cite = retrieved.cite
 
         if retrieved.context is None:
             yield TextTokenEvent(token="No documents found in the database.")
-            yield FinishEvent(finish_reason="stop")
+            yield FinishEvent(
+                finish_reason="stop",
+                retrieval_ms=retrieval_ms,
+                total_ms=(time.perf_counter() - stream_started_at) * 1000.0,
+            )
             return
 
         # -- emit detailed retrieval step statuses -------------------------
@@ -1865,6 +1875,7 @@ class RagEngine:
         chunk_event_count = 0
         answer_tokens: list[str] = []
         thinking_tokens: list[str] = []
+        generation_started_at = time.perf_counter()
 
         with start_span(
             self._tracer,
@@ -1961,6 +1972,7 @@ class RagEngine:
             answer_text = "".join(answer_tokens)
             completion_token_count = count_tokens(answer_text, generator.tokenizer)
             total_token_count = prompt_token_count + completion_token_count
+            generation_ms = (time.perf_counter() - generation_started_at) * 1000.0
             set_llm_output_message(generation_span, answer_text)
             set_llm_token_counts(
                 generation_span,
@@ -2002,6 +2014,9 @@ class RagEngine:
             finish_reason="stop",
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
+            retrieval_ms=retrieval_ms,
+            generation_ms=generation_ms,
+            total_ms=(time.perf_counter() - stream_started_at) * 1000.0,
         )
 
     # -- shared pipeline step methods --------------------------------------

@@ -89,6 +89,9 @@ class FinishEvent:
     finish_reason: str = "stop"  # "stop" or "error"
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    retrieval_ms: Optional[float] = None
+    generation_ms: Optional[float] = None
+    total_ms: Optional[float] = None
 
 
 # Union type for type checking (Python 3.9 compatible)

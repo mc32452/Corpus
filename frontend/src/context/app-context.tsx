@@ -38,6 +38,14 @@ export interface ThinkingStep {
   message: string;
 }
 
+export interface MessageMetrics {
+  promptTokens: number;
+  completionTokens: number;
+  retrievalMs?: number;
+  generationMs?: number;
+  totalMs?: number;
+}
+
 // ---------------------------------------------------------------------------
 // State shape
 // ---------------------------------------------------------------------------
@@ -61,6 +69,8 @@ export interface AppState {
   thinkingSteps: ThinkingStep[];
   /** Trace ID and Span ID grouped by assistant message ID */
   traceInfoByMessage: Record<string, { traceId: string; spanId: string }>;
+  /** Backend timing/token metrics grouped by assistant message ID */
+  messageMetricsByMessage: Record<string, MessageMetrics>;
   /** Internal counter for generating unique ThinkingStep IDs */
   _stepCounter: number;
   /** The message ID of the assistant response currently generating */
@@ -83,6 +93,7 @@ const initialState: AppState = {
   activeCitation: null,
   thinkingSteps: [],
   traceInfoByMessage: {},
+  messageMetricsByMessage: {},
   _stepCounter: 0,
   currentAssistantMessageId: null,
   intentOverride: "auto",
@@ -119,6 +130,7 @@ export type AppAction =
   | { type: "SET_ACTIVE_CITATION"; citation: Citation | null }
   | { type: "ADD_THINKING_STEP"; message: string }
   | { type: "SET_TRACE_INFO"; traceId: string; spanId: string }
+  | { type: "SET_MESSAGE_METRICS"; metrics: MessageMetrics }
   | { type: "SET_INTENT_OVERRIDE"; intentOverride: string }
   | { type: "SET_CHAT_MODE"; mode: "rag" | "freeform" }
   | { type: "SET_SELECTED_SOURCE_IDS"; sourceIds: string[] };
@@ -203,6 +215,18 @@ function appReducer(state: AppState, action: AppAction): AppState {
           ...state.traceInfoByMessage,
           [state.currentAssistantMessageId]: { traceId: action.traceId, spanId: action.spanId }
         }
+      };
+    case "SET_MESSAGE_METRICS":
+      if (!state.currentAssistantMessageId) {
+        return state;
+      }
+      const existingMetricsByMessage = state.messageMetricsByMessage ?? {};
+      return {
+        ...state,
+        messageMetricsByMessage: {
+          ...existingMetricsByMessage,
+          [state.currentAssistantMessageId]: action.metrics,
+        },
       };
     case "SET_INTENT_OVERRIDE":
       return { ...state, intentOverride: action.intentOverride };

@@ -84,6 +84,7 @@ from .stream_protocol import (
     annotation_error_with_metadata,
     annotation_citations,
     annotation_intent,
+    annotation_metrics,
     annotation_sources,
     annotation_status,
     encode_annotation,
@@ -863,7 +864,14 @@ def _encode_event(event: QueryEvent) -> Optional[str]:
         return annotation_error(event.code, event.message) + encode_error(event.message)
     elif isinstance(event, FinishEvent):
         return (
-            encode_finish_step(event.finish_reason)
+            annotation_metrics(
+                prompt_tokens=event.prompt_tokens,
+                completion_tokens=event.completion_tokens,
+                retrieval_ms=event.retrieval_ms,
+                generation_ms=event.generation_ms,
+                total_ms=event.total_ms,
+            )
+            + encode_finish_step(event.finish_reason)
             + encode_finish_message(event.finish_reason)
         )
     elif isinstance(event, TraceEvent):

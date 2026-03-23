@@ -226,6 +226,29 @@ def annotation_citations(citations: list[dict[str, Any]]) -> str:
     return encode_annotation([{"type": "citations", "citations": citations}])
 
 
+def annotation_metrics(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    retrieval_ms: Optional[float] = None,
+    generation_ms: Optional[float] = None,
+    total_ms: Optional[float] = None,
+) -> str:
+    """Encode backend-measured timing/token metrics as a custom annotation part."""
+    payload: dict[str, Any] = {
+        "type": "metrics",
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+    }
+    if retrieval_ms is not None:
+        payload["retrieval_ms"] = float(retrieval_ms)
+    if generation_ms is not None:
+        payload["generation_ms"] = float(generation_ms)
+    if total_ms is not None:
+        payload["total_ms"] = float(total_ms)
+    return encode_annotation([payload])
+
+
 # ---------------------------------------------------------------------------
 # HTTP error body helper (for non-streaming error responses)
 # ---------------------------------------------------------------------------

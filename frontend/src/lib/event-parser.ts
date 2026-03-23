@@ -77,6 +77,15 @@ export interface FinishStepEvent {
   isContinued: boolean;
 }
 
+export interface MetricsEvent {
+  type: "metrics";
+  promptTokens: number;
+  completionTokens: number;
+  retrievalMs?: number;
+  generationMs?: number;
+  totalMs?: number;
+}
+
 export interface TraceEvent {
   type: "trace-id";
   traceId: string;
@@ -91,6 +100,7 @@ export type CustomEvent =
   | CitationsEvent
   | ErrorEvent
   | FinishStepEvent
+  | MetricsEvent
   | TraceEvent;
 
 // ---------------------------------------------------------------------------
@@ -212,6 +222,24 @@ export function parseCustomEvent(dataPart: unknown): CustomEvent | null {
         };
       }
       return null;
+    }
+
+    case "data-metrics": {
+      const d = part["data"] as Record<string, unknown> | null | undefined;
+      const promptTokens = d?.["prompt_tokens"];
+      const completionTokens = d?.["completion_tokens"];
+      if (typeof promptTokens !== "number" || typeof completionTokens !== "number") {
+        return null;
+      }
+      const event: MetricsEvent = {
+        type: "metrics",
+        promptTokens,
+        completionTokens,
+      };
+      if (typeof d?.["retrieval_ms"] === "number") event.retrievalMs = d["retrieval_ms"];
+      if (typeof d?.["generation_ms"] === "number") event.generationMs = d["generation_ms"];
+      if (typeof d?.["total_ms"] === "number") event.totalMs = d["total_ms"];
+      return event;
     }
 
     default:

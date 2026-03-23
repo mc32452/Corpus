@@ -84,6 +84,19 @@ export function useStreamHandler(dispatch: AppDispatch) {
             spanId: event.spanId,
           });
           break;
+
+        case "metrics":
+          dispatch({
+            type: "SET_MESSAGE_METRICS",
+            metrics: {
+              promptTokens: event.promptTokens,
+              completionTokens: event.completionTokens,
+              retrievalMs: event.retrievalMs,
+              generationMs: event.generationMs,
+              totalMs: event.totalMs,
+            },
+          });
+          break;
       }
     },
     [dispatch],

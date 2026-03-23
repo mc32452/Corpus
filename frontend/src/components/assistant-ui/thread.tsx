@@ -635,6 +635,8 @@ const MessageTimingBadge: FC = () => {
   const messageId = useAuiState((s) => s.message.id);
   const isLast = useAuiState((s) => s.message.isLast);
   const isRunning = useAuiState((s) => s.message.status?.type === "running");
+  const { messageMetricsByMessage = {} } = useAppState();
+  const backendMetrics = messageMetricsByMessage[messageId];
   const text = useAuiState((s) =>
     s.message.parts.reduce((allText, part) => {
       if (part.type !== "text") return allText;
@@ -672,19 +674,50 @@ const MessageTimingBadge: FC = () => {
 
   if (!isLast) return null;
   if (isRunning) return null;
-  if (streamStartAt === undefined || completedAt === undefined) return null;
-
-  const totalMs = Math.max(0, completedAt - streamStartAt);
-
-  const estimatedTokenCount = Math.max(1, Math.round(text.length / 4));
-  const tokensPerSecond =
-    totalMs >= 400 && estimatedTokenCount >= 8
-      ? estimatedTokenCount / (totalMs / 1000)
+  const fallbackTotalMs =
+    streamStartAt !== undefined && completedAt !== undefined
+      ? Math.max(0, completedAt - streamStartAt)
       : undefined;
-  const retrievalMs =
+  const fallbackRetrievalMs =
     streamStartAt !== undefined && firstTokenAt !== undefined
       ? Math.max(0, firstTokenAt - streamStartAt)
       : undefined;
+
+  const totalMs =
+    backendMetrics?.totalMs !== undefined
+      ? Math.max(0, backendMetrics.totalMs)
+      : fallbackTotalMs;
+
+  const retrievalMs =
+    backendMetrics?.retrievalMs !== undefined
+      ? Math.max(0, backendMetrics.retrievalMs)
+      : fallbackRetrievalMs;
+
+  const generationMsFromBackend =
+    backendMetrics?.generationMs !== undefined
+      ? Math.max(0, backendMetrics.generationMs)
+      : undefined;
+
+  const completionTokensFromBackend = backendMetrics?.completionTokens;
+  const estimatedTokenCount = Math.max(1, Math.round(text.length / 4));
+
+  const generationMsForSpeed =
+    generationMsFromBackend ??
+    (totalMs !== undefined && retrievalMs !== undefined
+      ? Math.max(0, totalMs - retrievalMs)
+      : totalMs);
+
+  const tokensPerSecond =
+    generationMsForSpeed !== undefined && generationMsForSpeed >= 100
+      ? (
+          (completionTokensFromBackend && completionTokensFromBackend > 0
+            ? completionTokensFromBackend
+            : estimatedTokenCount) /
+          (generationMsForSpeed / 1000)
+        )
+      : undefined;
+
+  if (totalMs === undefined) return null;
 
   const formatDetailedMs = (ms: number) =>
     ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(2)}s`;
