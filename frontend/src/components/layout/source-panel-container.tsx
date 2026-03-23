@@ -3,9 +3,11 @@
 import { ChevronRight } from "lucide-react";
 import { SourcePanel } from "@/components/source-panel";
 import { CHROME_TRANSITION, type ChromeStyles } from "@/lib/theme-constants";
+import type { BackgroundTheme } from "@/context/theme-context";
 
 interface SourcePanelContainerProps {
   chatMode: "rag" | "freeform";
+  theme: BackgroundTheme;
   isPanelCollapsed: boolean;
   chromeStyles: ChromeStyles;
   selectedSourceIds: string[];
@@ -17,6 +19,7 @@ interface SourcePanelContainerProps {
 
 export function SourcePanelContainer({
   chatMode,
+  theme,
   isPanelCollapsed,
   chromeStyles,
   selectedSourceIds,
@@ -26,6 +29,7 @@ export function SourcePanelContainer({
   onSourcesChanged,
 }: SourcePanelContainerProps) {
   const hidden = chatMode !== "rag";
+  const isDarkVeil = theme === "darkveil";
 
   return (
     <aside
@@ -45,12 +49,18 @@ export function SourcePanelContainer({
         opacity: hidden ? 0 : 1,
         pointerEvents: hidden ? "none" : "auto",
         transition: `width 280ms cubic-bezier(0.4,0,0.2,1), min-width 280ms cubic-bezier(0.4,0,0.2,1), opacity 240ms ease, ${CHROME_TRANSITION}`,
-        background: chromeStyles.bg,
-        borderRight: `1px solid ${chromeStyles.borderColor}`,
+        background: isDarkVeil ? "rgba(0,0,0,0.42)" : chromeStyles.bg,
+        borderRight: isDarkVeil
+          ? "1px solid rgba(139, 92, 246, 0.15)"
+          : `1px solid ${chromeStyles.borderColor}`,
         boxShadow:
           "2px 0 8px rgba(0,0,0,0.45), 1px 0 2px rgba(0,0,0,0.35), inset -1px 0 0 rgba(255,255,255,0.04)",
-        backdropFilter: chromeStyles.backdrop,
-        WebkitBackdropFilter: chromeStyles.backdrop,
+        backdropFilter: isDarkVeil
+          ? "blur(10px) saturate(120%)"
+          : chromeStyles.backdrop,
+        WebkitBackdropFilter: isDarkVeil
+          ? "blur(10px) saturate(120%)"
+          : chromeStyles.backdrop,
         willChange: "opacity, background, backdrop-filter",
         isolation: "isolate",
       }}

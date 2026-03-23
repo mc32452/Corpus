@@ -81,12 +81,12 @@ export function SpeechToTextButton({
         if (!disabled && !isTranscribing) toggle();
       }}
       className={cn(
-        "w-10 h-10 flex items-center justify-center rounded-full transition-colors shrink-0",
+        "w-10 h-10 flex items-center justify-center rounded-full border transition-colors shrink-0",
         isListening
-          ? "bg-red-600 hover:bg-red-700"
+          ? "bg-red-500/16 border-red-300/35 hover:bg-red-500/24"
           : isTranscribing
-          ? "bg-gray-600"
-          : "bg-gray-700 hover:bg-gray-600",
+          ? "bg-white/10 border-white/16"
+          : "bg-white/6 border-white/14 hover:bg-white/10",
         (disabled || isTranscribing) && "opacity-50 cursor-not-allowed",
       )}
       title={isTranscribing ? "Transcribing…" : isListening ? "Stop listening" : "Voice input"}
@@ -96,8 +96,8 @@ export function SpeechToTextButton({
       ) : (
         <MicIcon
           className={cn(
-            "w-4 h-4 text-white",
-            isListening && "animate-pulse",
+            "w-4 h-4",
+            isListening ? "text-red-200 animate-pulse" : "text-(--icon-accent)",
           )}
         />
       )}

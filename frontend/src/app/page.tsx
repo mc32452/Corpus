@@ -189,6 +189,7 @@ export default function Page() {
       <div className="flex flex-1 min-h-0 overflow-hidden relative">
         <SourcePanelContainer
           chatMode={chatMode}
+          theme={theme}
           isPanelCollapsed={isPanelCollapsed}
           chromeStyles={chromeStyles}
           selectedSourceIds={selectedSourceIds}

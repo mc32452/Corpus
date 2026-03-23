@@ -324,16 +324,6 @@ export function FreeformChatPanel({
     }
   }, []);
 
-  const startNewConversation = useCallback(() => {
-    setMessages([]);
-    setErrorText("");
-    sessionIdRef.current = crypto.randomUUID();
-    isRestoredRef.current = false;
-    titleGeneratedRef.current = false;
-    setInputValue("");
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
-
   // ── Speech-to-text ─────────────────────────────────────────────────────────
   const applyTranscript = useCallback(
     (chunk: string) => {
@@ -705,18 +695,6 @@ export function FreeformChatPanel({
 
         {/* Sticky footer with composer */}
         <div className="sticky bottom-0 mx-auto mt-auto flex w-full max-w-(--thread-max-width) flex-col gap-3 overflow-visible bg-transparent pb-4 pt-3 md:pb-6">
-          {messages.length > 0 && (
-            <div className="flex justify-center">
-              <button
-                type="button"
-                onClick={startNewConversation}
-                className="text-xs text-muted-foreground hover:text-foreground hover:bg-accent px-3 py-1 rounded-md transition-colors"
-              >
-                New conversation
-              </button>
-            </div>
-          )}
-
           {/* Composer pill — identical to RAG Thread */}
           <form onSubmit={onSubmit}>
             <div

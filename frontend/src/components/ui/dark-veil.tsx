@@ -20,6 +20,7 @@ uniform float uNoise;
 uniform float uScan;
 uniform float uScanFreq;
 uniform float uWarp;
+uniform float uCenterShift;
 #define iTime uTime
 #define iResolution uResolution
 
@@ -62,6 +63,7 @@ vec4 cppn_fn(vec2 coordinate,float in0,float in1,float in2){
 void mainImage(out vec4 fragColor,in vec2 fragCoord){
     vec2 uv=fragCoord/uResolution.xy*2.-1.;
     uv.y*=-1.;
+  uv.x-=uCenterShift;
     uv+=uWarp*vec2(sin(uv.y*6.283+uTime*0.5),cos(uv.x*6.283+uTime*0.5))*0.05;
     fragColor=cppn_fn(uv,0.1*sin(0.3*uTime),0.1*sin(0.69*uTime),0.1*sin(0.44*uTime));
 }
@@ -121,6 +123,7 @@ export function DarkVeilBackground({
         uScan: { value: scanlineIntensity },
         uScanFreq: { value: scanlineFrequency },
         uWarp: { value: warpAmount },
+        uCenterShift: { value: 0.26 },
       },
     });
 
@@ -146,6 +149,7 @@ export function DarkVeilBackground({
       program.uniforms.uScan.value = scanlineIntensity;
       program.uniforms.uScanFreq.value = scanlineFrequency;
       program.uniforms.uWarp.value = warpAmount;
+      program.uniforms.uCenterShift.value = 0.26;
       renderer.render({ scene: mesh });
       frame = requestAnimationFrame(loop);
     };
