@@ -23,6 +23,7 @@
 # misc
 .DS_Store
 *.pem
+*.pbf
 /public/basemap/*.pmtiles
 /public/basemap/*.tmp
 

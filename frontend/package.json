@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "bundle:basemap-fonts": "node scripts/bundle-basemap-fonts.mjs",
+    "prebuild": "npm run bundle:basemap-fonts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
