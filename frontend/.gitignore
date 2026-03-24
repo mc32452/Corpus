@@ -23,6 +23,8 @@
 # misc
 .DS_Store
 *.pem
+/public/basemap/*.pmtiles
+/public/basemap/*.tmp
 
 # debug
 npm-debug.log*

@@ -6,7 +6,10 @@ import { Globe, Trash2 } from "lucide-react";
 import { Map, Layer, Popup, Source } from "@vis.gl/react-maplibre";
 import type { MapRef, MapLayerMouseEvent } from "@vis.gl/react-maplibre";
 import type { Feature, FeatureCollection, Point } from "geojson";
-import type { GeoJSONSource, LayerSpecification } from "maplibre-gl";
+import { layers as protomapsLayers, namedFlavor } from "@protomaps/basemaps";
+import { Protocol } from "pmtiles";
+import type { GeoJSONSource, LayerSpecification, StyleSpecification } from "maplibre-gl";
+import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import {
@@ -15,6 +18,7 @@ import {
   type GeoMentionGroup,
   type GeoMentionsResponse,
 } from "@/lib/api-client";
+import { getBackendApiBase } from "@/lib/backend-url";
 import { useAppDispatch } from "@/context/app-context";
 import {
   Dialog,
@@ -63,13 +67,172 @@ const CLUSTER_COUNT_LAYER: LayerSpecification = {
   filter: ["has", "point_count"],
   layout: {
     "text-field": "{point_count_abbreviated}",
+    "text-font": ["Noto Sans Regular"],
     "text-size": 12,
-    "text-font": ["Open Sans Bold"],
   },
-  paint: { "text-color": "#ffffff" },
+  paint: {
+    "text-color": "#ffffff",
+  },
 };
 
-const DARK_MAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+let pmtilesProtocol: Protocol | null = null;
+let pmtilesProtocolRegistered = false;
+
+const OFFLINE_TILE_MAX_ZOOM = (() => {
+  const parsed = Number.parseInt(process.env.NEXT_PUBLIC_BASEMAP_MAX_ZOOM ?? "7", 10);
+  if (parsed === 6 || parsed === 7) {
+    return parsed;
+  }
+  return 7;
+})();
+
+const OFFLINE_TILE_MIN_ZOOM = 1;
+const PMTILES_SOURCE_PATH = process.env.NEXT_PUBLIC_PM_TILES_PATH ?? "/basemap/world_cities.pmtiles";
+const PMTILES_GLYPHS_PATH =
+  process.env.NEXT_PUBLIC_PM_TILES_GLYPHS ?? "/basemap-assets/fonts/{fontstack}/{range}.pbf";
+const DEFAULT_PM_TILES_SOURCE_URL = "https://demo-bucket.protomaps.com/v4.pmtiles";
+const BASEMAP_STATUS_POLL_MS = 1200;
+
+const CARTO_DARK_FLAVOR = {
+  ...namedFlavor("black"),
+  background: "#0e0e0e",
+  earth: "#1a1c26",
+  water: "#242b35",
+  water_shadow: "#1e252e",
+  boundaries: "#3d3f4d",
+  country_label: "#c0c0d0",
+  state_label: "#8a8aa0",
+  state_label_halo: "#1a1c26",
+  city_label: "#b0b0c8",
+  city_label_halo: "#1a1c26",
+  ocean_label: "#7a9aaa",
+  subplace_label: "#8a8aa0",
+  subplace_label_halo: "#1a1c26",
+};
+
+const INCLUDE_BASEMAP_LAYER = /(country|boundary|admin|coast|coastline|ocean|water|city|town|place)/i;
+const EXCLUDE_BASEMAP_LAYER = /(road|street|path|rail|transit|building|poi|airport|aeroway|runway|bridge|tunnel)/i;
+
+type BasemapSetupStatus = {
+  status: "idle" | "running" | "ready" | "error";
+  progress: number;
+  message: string;
+  error?: string | null;
+  file_exists?: boolean;
+};
+
+function resolveAbsoluteUrl(pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl;
+  }
+  if (typeof window === "undefined") {
+    return pathOrUrl;
+  }
+  const normalized = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+  return `${window.location.origin}${normalized}`;
+}
+
+async function urlExists(pathOrUrl: string): Promise<boolean> {
+  const target = resolveAbsoluteUrl(pathOrUrl);
+  try {
+    const head = await fetch(target, { method: "HEAD", cache: "no-store" });
+    if (head.ok) {
+      return true;
+    }
+    if (head.status !== 405) {
+      return false;
+    }
+
+    // Some static hosts disallow HEAD; probe with a tiny byte range instead.
+    const ranged = await fetch(target, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Range: "bytes=0-0" },
+    });
+    return ranged.ok || ranged.status === 206;
+  } catch {
+    return false;
+  }
+}
+
+function ensurePmtilesProtocolRegistered() {
+  if (pmtilesProtocolRegistered) {
+    return;
+  }
+  pmtilesProtocol = new Protocol({ metadata: true });
+  maplibregl.addProtocol("pmtiles", pmtilesProtocol.tile);
+  pmtilesProtocolRegistered = true;
+}
+
+function buildOfflineBasemapStyle(opts: {
+  pmtilesUrl: string;
+}): StyleSpecification {
+  const basemapSourceName = "protomaps-city";
+  const layers = protomapsLayers(basemapSourceName, CARTO_DARK_FLAVOR, {
+    lang: "en",
+  }) as LayerSpecification[];
+
+  const filteredLayers = layers
+    .filter((layer) => {
+      const id = String(layer.id ?? "");
+      if (!id) {
+        return false;
+      }
+      if (EXCLUDE_BASEMAP_LAYER.test(id)) {
+        return false;
+      }
+      return INCLUDE_BASEMAP_LAYER.test(id);
+    })
+    .map((layer) => {
+      const capped: LayerSpecification = {
+        ...layer,
+        minzoom: layer.minzoom == null ? OFFLINE_TILE_MIN_ZOOM : Math.max(OFFLINE_TILE_MIN_ZOOM, layer.minzoom),
+        maxzoom:
+          layer.maxzoom == null ? OFFLINE_TILE_MAX_ZOOM : Math.min(OFFLINE_TILE_MAX_ZOOM, layer.maxzoom),
+      };
+      return capped;
+    });
+
+  return {
+    version: 8,
+    name: "corpus-offline-map",
+    glyphs: PMTILES_GLYPHS_PATH,
+    sources: {
+      [basemapSourceName]: {
+        type: "vector",
+        url: `pmtiles://${opts.pmtilesUrl}`,
+        minzoom: OFFLINE_TILE_MIN_ZOOM,
+        maxzoom: OFFLINE_TILE_MAX_ZOOM,
+        attribution: "© OpenStreetMap contributors",
+      },
+    },
+    layers: [
+      {
+        id: "background",
+        type: "background",
+        paint: {
+          "background-color": "#0e0e0e",
+        },
+      },
+      ...filteredLayers,
+    ],
+  };
+}
+
+const OFFLINE_MAP_STYLE: StyleSpecification = {
+  version: 8,
+  name: "corpus-offline-map",
+  sources: {},
+  layers: [
+    {
+      id: "background",
+      type: "background",
+      paint: {
+        "background-color": "#0e0e0e",
+      },
+    },
+  ],
+};
 
 interface CorpusMapProps {
   onCountChange?: (count: number) => void;
@@ -145,6 +308,139 @@ export function CorpusMap({
   const [selectedGroup, setSelectedGroup] = useState<GeoMentionGroup | null>(null);
   const [deletingMentionId, setDeletingMentionId] = useState<string | null>(null);
   const [pendingDeleteMention, setPendingDeleteMention] = useState<GeoMentionDetail | null>(null);
+  const [mapStyle, setMapStyle] = useState<StyleSpecification>(OFFLINE_MAP_STYLE);
+  const [basemapReady, setBasemapReady] = useState(false);
+  const [basemapStatus, setBasemapStatus] = useState<BasemapSetupStatus | null>(null);
+
+  const fetchBasemapStatus = useCallback(async (): Promise<BasemapSetupStatus> => {
+    const res = await fetch(`${getBackendApiBase()}/basemap/setup/status`, { cache: "no-store" });
+    if (!res.ok) {
+      throw new Error(`Failed to check basemap status (HTTP ${res.status})`);
+    }
+    return (await res.json()) as BasemapSetupStatus;
+  }, []);
+
+  const startBasemapSetup = useCallback(async (): Promise<BasemapSetupStatus> => {
+    const params = new URLSearchParams({
+      max_zoom: String(OFFLINE_TILE_MAX_ZOOM),
+      source_url: DEFAULT_PM_TILES_SOURCE_URL,
+    });
+    const res = await fetch(`${getBackendApiBase()}/basemap/setup?${params.toString()}`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to start basemap setup (HTTP ${res.status})`);
+    }
+    return (await res.json()) as BasemapSetupStatus;
+  }, []);
+
+  const applyLocalBasemapStyle = useCallback(() => {
+    setMapStyle(
+      buildOfflineBasemapStyle({
+        pmtilesUrl: resolveAbsoluteUrl(PMTILES_SOURCE_PATH),
+      }),
+    );
+    setBasemapReady(true);
+  }, []);
+
+  const handleStartSetup = useCallback(async () => {
+    try {
+      const status = await startBasemapSetup();
+      setBasemapStatus(status);
+    } catch (err) {
+      setBasemapStatus({
+        status: "error",
+        progress: 0,
+        message: "Basemap setup failed to start.",
+        error: err instanceof Error ? err.message : "Unknown setup error",
+      });
+    }
+  }, [startBasemapSetup]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const initBasemap = async () => {
+      try {
+        const hasLocalPmtiles = await urlExists(PMTILES_SOURCE_PATH);
+        if (cancelled) return;
+
+        if (hasLocalPmtiles) {
+          applyLocalBasemapStyle();
+          setBasemapStatus({
+            status: "ready",
+            progress: 100,
+            message: "Offline basemap is ready.",
+            file_exists: true,
+          });
+          return;
+        }
+
+        const status = await fetchBasemapStatus();
+        if (cancelled) return;
+        setBasemapStatus(status);
+        if (status.status === "ready" || status.file_exists) {
+          applyLocalBasemapStyle();
+        }
+      } catch {
+        setMapStyle(OFFLINE_MAP_STYLE);
+        setBasemapReady(false);
+        setBasemapStatus({
+          status: "error",
+          progress: 0,
+          message: "Unable to initialize basemap.",
+          error: "Failed to check local basemap status.",
+        });
+      }
+    };
+
+    try {
+      ensurePmtilesProtocolRegistered();
+    } catch {
+      // Keep marker rendering available even if basemap protocol registration fails.
+    }
+
+    void initBasemap();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyLocalBasemapStyle, fetchBasemapStatus]);
+
+  useEffect(() => {
+    if (basemapReady) {
+      return;
+    }
+    if (!basemapStatus || basemapStatus.status !== "running") {
+      return;
+    }
+
+    let cancelled = false;
+    const interval = window.setInterval(async () => {
+      try {
+        const status = await fetchBasemapStatus();
+        if (cancelled) return;
+        setBasemapStatus(status);
+
+        if (status.status === "ready" || status.file_exists) {
+          applyLocalBasemapStyle();
+        }
+      } catch {
+        if (cancelled) return;
+        setBasemapStatus((prev) => ({
+          status: "error",
+          progress: prev?.progress ?? 0,
+          message: "Basemap setup status check failed.",
+          error: "Could not reach backend setup status endpoint.",
+        }));
+      }
+    }, BASEMAP_STATUS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [applyLocalBasemapStyle, basemapReady, basemapStatus, fetchBasemapStatus]);
 
   const normalizedSourceIds = useMemo(() => {
     const seen = new Set<string>();
@@ -424,6 +720,54 @@ export function CorpusMap({
     );
   }
 
+  if (!basemapReady) {
+    const status = basemapStatus;
+    const progress = Math.max(0, Math.min(100, Math.round(status?.progress ?? 0)));
+    const isRunning = status?.status === "running";
+    const isError = status?.status === "error";
+    const canStart = !isRunning;
+
+    return (
+      <div className="relative h-full w-full overflow-hidden bg-[#0e0e0e]">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(90%_70%_at_50%_0%,rgba(96,165,250,0.18),rgba(10,15,26,0)_70%)]" />
+        <div className="absolute inset-0 flex items-center justify-center p-6">
+          <div className="w-full max-w-lg rounded-2xl border border-white/12 bg-black/45 p-6 shadow-[0_20px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl">
+            <p className="text-sm font-semibold tracking-wide text-white/90">Offline Basemap Setup</p>
+            <p className="mt-2 text-sm text-white/70">Set up the local map once, then use it offline.</p>
+
+            <div className="mt-4 rounded-lg border border-white/12 bg-black/35 p-3">
+              <div className="mb-2 flex items-center justify-between text-xs text-white/75">
+                <span>{status?.message ?? "Ready to set up basemap"}</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-sky-400 to-blue-500 transition-all duration-500"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
+
+            {isError && (
+              <p className="mt-3 text-xs text-red-300">{status?.error ?? "Basemap setup failed."}</p>
+            )}
+
+            <div className="mt-5 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => void handleStartSetup()}
+                disabled={!canStart}
+                className="rounded-md border border-blue-300/40 bg-blue-500/20 px-4 py-2 text-sm font-medium text-blue-100 transition-colors hover:bg-blue-500/30 disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                {isRunning ? "Setting Up..." : "Set Up Basemap"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (error) {
     return (
       <div className="flex h-full items-center justify-center px-6 text-center text-sm text-red-300">
@@ -451,11 +795,13 @@ export function CorpusMap({
   }
 
   return (
-    <div className="relative h-full w-full overflow-hidden">
+    <div className="relative h-full w-full overflow-hidden bg-[#0e0e0e]">
       <Map
         ref={mapRef}
         initialViewState={{ longitude: 12, latitude: 25, zoom: 1.7 }}
-        mapStyle={DARK_MAP_STYLE}
+        mapStyle={mapStyle}
+        minZoom={OFFLINE_TILE_MIN_ZOOM}
+        maxZoom={OFFLINE_TILE_MAX_ZOOM}
         interactiveLayerIds={["clusters", "unclustered"]}
         onClick={onMapClick}
         onMouseMove={onMapMouseMove}
@@ -465,7 +811,7 @@ export function CorpusMap({
           type="geojson"
           data={geojson}
           cluster={true}
-          clusterMaxZoom={14}
+          clusterMaxZoom={Math.max(OFFLINE_TILE_MIN_ZOOM, OFFLINE_TILE_MAX_ZOOM - 1)}
           clusterRadius={50}
         >
           <Layer {...CLUSTER_LAYER} />

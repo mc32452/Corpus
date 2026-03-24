@@ -18,8 +18,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import platform
+import tarfile
+import shutil
+import subprocess
 import threading
+import time
 import uuid
+import urllib.request
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional, TYPE_CHECKING
@@ -151,6 +159,271 @@ _FRONTEND_MODE_MAP: dict[str, str] = {
     "regular": "regular",
     "deep-research": "deep-research",
 }
+
+# Basemap setup job state (frontend map bootstrap).
+_BASEMAP_OUTPUT_PATH = Path(__file__).resolve().parent.parent / "frontend" / "public" / "basemap" / "world_cities.pmtiles"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TOOLS_DIR = _REPO_ROOT / "storage" / "tools"
+_BOOTSTRAPPED_PMTILES_BIN = _TOOLS_DIR / "pmtiles"
+_DEFAULT_BASEMAP_SOURCE_URL = "https://demo-bucket.protomaps.com/v4.pmtiles"
+_BASEMAP_SOURCE_FALLBACKS: tuple[str, ...] = (
+    "https://demo-bucket.protomaps.com/v4.pmtiles",
+    "https://build.protomaps.com/v4.pmtiles",
+    "https://build.protomaps.com/20260217.pmtiles",
+)
+_BASEMAP_SETUP_LOCK = threading.Lock()
+_BASEMAP_SETUP_THREAD: threading.Thread | None = None
+_BASEMAP_SETUP_STATE: dict[str, object] = {
+    "status": "idle",          # idle | running | ready | error
+    "progress": 0,              # 0..100
+    "message": "",             # user-readable status
+    "error": None,
+    "started_at": None,
+    "updated_at": None,
+    "max_zoom": None,
+}
+
+
+def _set_basemap_setup_state(**updates: object) -> None:
+    with _BASEMAP_SETUP_LOCK:
+        _BASEMAP_SETUP_STATE.update(updates)
+        _BASEMAP_SETUP_STATE["updated_at"] = time.time()
+
+
+def _get_basemap_setup_status_snapshot() -> dict[str, object]:
+    with _BASEMAP_SETUP_LOCK:
+        snapshot = dict(_BASEMAP_SETUP_STATE)
+    snapshot["file_exists"] = _BASEMAP_OUTPUT_PATH.is_file()
+    snapshot["output_path"] = str(_BASEMAP_OUTPUT_PATH)
+    snapshot["size_bytes"] = _BASEMAP_OUTPUT_PATH.stat().st_size if _BASEMAP_OUTPUT_PATH.is_file() else 0
+    return snapshot
+
+
+def _resolve_go_pmtiles_asset_url() -> str:
+    """Resolve latest go-pmtiles asset URL for current OS/arch."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if machine in ("arm64", "aarch64"):
+        arch = "arm64"
+    elif machine in ("x86_64", "amd64"):
+        arch = "x86_64"
+    else:
+        raise RuntimeError(f"Unsupported CPU architecture for pmtiles bootstrap: {machine}")
+
+    if system == "darwin":
+        needle = f"Darwin_{arch}.zip"
+        extension = ".zip"
+    elif system == "linux":
+        needle = f"Linux_{arch}.tar.gz"
+        extension = ".tar.gz"
+    else:
+        raise RuntimeError(f"Unsupported OS for pmtiles bootstrap: {system}")
+
+    api_url = "https://api.github.com/repos/protomaps/go-pmtiles/releases/latest"
+    with urllib.request.urlopen(api_url, timeout=20) as response:
+        release = json.load(response)
+
+    for asset in release.get("assets", []):
+        url = str(asset.get("browser_download_url", ""))
+        if needle in url and url.endswith(extension):
+            return url
+
+    raise RuntimeError("Could not find matching go-pmtiles release asset for this platform")
+
+
+def _bootstrap_pmtiles_binary() -> Path:
+    """Download and cache a pmtiles binary from go-pmtiles releases."""
+    if _BOOTSTRAPPED_PMTILES_BIN.is_file():
+        return _BOOTSTRAPPED_PMTILES_BIN
+
+    _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = _TOOLS_DIR / "go-pmtiles-archive.tmp"
+    extract_dir = _TOOLS_DIR / "go-pmtiles-extract"
+
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    asset_url = _resolve_go_pmtiles_asset_url()
+    urllib.request.urlretrieve(asset_url, archive_path)
+
+    if str(asset_url).endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(extract_dir)
+    elif str(asset_url).endswith(".tar.gz"):
+        with tarfile.open(archive_path, "r:gz") as tf:
+            tf.extractall(extract_dir)
+    else:
+        raise RuntimeError("Unknown go-pmtiles archive format")
+
+    candidate: Path | None = None
+    for path in extract_dir.rglob("*"):
+        if path.is_file() and path.name in ("pmtiles", "pmtiles.exe"):
+            candidate = path
+            break
+
+    if candidate is None:
+        raise RuntimeError("Failed to locate pmtiles binary in downloaded archive")
+
+    shutil.copy2(candidate, _BOOTSTRAPPED_PMTILES_BIN)
+    os.chmod(_BOOTSTRAPPED_PMTILES_BIN, 0o755)
+
+    try:
+        archive_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    shutil.rmtree(extract_dir, ignore_errors=True)
+
+    return _BOOTSTRAPPED_PMTILES_BIN
+
+
+def _source_url_reachable(url: str) -> bool:
+    """Return True when remote URL responds to a tiny byte-range fetch."""
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return response.status in (200, 206)
+    except Exception:
+        return False
+
+
+def _resolve_basemap_source_url(requested_url: str | None) -> str:
+    """Pick the first reachable PMTiles source URL from requested+fallbacks."""
+    candidates: list[str] = []
+    if requested_url:
+        candidates.append(requested_url)
+    for fallback in _BASEMAP_SOURCE_FALLBACKS:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    for candidate in candidates:
+        if _source_url_reachable(candidate):
+            return candidate
+
+    raise RuntimeError("No reachable PMTiles source URL found for basemap setup")
+
+
+def _run_basemap_setup(max_zoom: int, source_url: str) -> None:
+    tmp_output = _BASEMAP_OUTPUT_PATH.with_suffix(".pmtiles.tmp")
+    try:
+        _set_basemap_setup_state(
+            status="running",
+            progress=5,
+            message="Preparing basemap extract...",
+            error=None,
+            started_at=time.time(),
+            max_zoom=max_zoom,
+        )
+
+        _BASEMAP_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if tmp_output.exists():
+            tmp_output.unlink()
+
+        pmtiles_cmd: list[str] | None = None
+        global_pmtiles = shutil.which("pmtiles")
+        if global_pmtiles:
+            pmtiles_cmd = [global_pmtiles]
+        else:
+            _set_basemap_setup_state(
+                status="running",
+                progress=10,
+                message="Installing PMTiles tool...",
+            )
+            bootstrapped = _bootstrap_pmtiles_binary()
+            pmtiles_cmd = [str(bootstrapped)]
+
+        if pmtiles_cmd is None:
+            raise FileNotFoundError("pmtiles executable not found")
+
+        _set_basemap_setup_state(
+            status="running",
+            progress=12,
+            message="Resolving PMTiles source URL...",
+        )
+        resolved_source_url = _resolve_basemap_source_url(source_url)
+
+        cmd = [
+            *pmtiles_cmd,
+            "extract",
+            resolved_source_url,
+            str(tmp_output),
+            "--maxzoom",
+            str(max_zoom),
+        ]
+
+        _set_basemap_setup_state(
+            status="running",
+            progress=15,
+            message=f"Running PMTiles extract (maxzoom={max_zoom})...",
+        )
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        start_t = time.time()
+        while True:
+            try:
+                code = proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.time() - start_t)
+                progress = min(92, 20 + elapsed)
+                _set_basemap_setup_state(
+                    status="running",
+                    progress=progress,
+                    message="Extracting world city basemap...",
+                )
+
+        output_tail = ""
+        if proc.stdout is not None:
+            try:
+                output_tail = proc.stdout.read()[-2000:]
+            except Exception:
+                output_tail = ""
+
+        if code != 0:
+            raise RuntimeError(
+                f"pmtiles extract failed with exit code {code}. {output_tail.strip()}"
+            )
+
+        if not tmp_output.is_file() or tmp_output.stat().st_size < 1024 * 1024:
+            raise RuntimeError("Basemap output file was not created or is unexpectedly small.")
+
+        _set_basemap_setup_state(status="running", progress=96, message="Finalising basemap file...")
+        os.replace(tmp_output, _BASEMAP_OUTPUT_PATH)
+
+        _set_basemap_setup_state(
+            status="ready",
+            progress=100,
+            message="Offline basemap is ready.",
+            error=None,
+        )
+    except FileNotFoundError:
+        _set_basemap_setup_state(
+            status="error",
+            progress=0,
+            message="Basemap setup failed.",
+            error="pmtiles executable not found and automatic setup failed.",
+        )
+    except Exception as exc:
+        _set_basemap_setup_state(
+            status="error",
+            progress=0,
+            message="Basemap setup failed.",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        if tmp_output.exists():
+            try:
+                tmp_output.unlink()
+            except Exception:
+                pass
+
 
 
 def _get_engine(mode: str | None = None):
@@ -339,6 +612,58 @@ async def health():
         fts_dirty=fts_dirty,
         fts_pending_rows=fts_pending_rows,
     )
+
+
+@app.get("/api/basemap/setup/status")
+async def basemap_setup_status() -> dict[str, object]:
+    """Return current offline basemap setup status/progress."""
+    snapshot = _get_basemap_setup_status_snapshot()
+
+    # If a ready file exists but state was never updated in this process,
+    # report ready so the UI can skip setup.
+    if snapshot.get("file_exists") and snapshot.get("status") in ("idle", "error"):
+        snapshot["status"] = "ready"
+        snapshot["progress"] = 100
+        snapshot["message"] = "Offline basemap is ready."
+        snapshot["error"] = None
+    return snapshot
+
+
+@app.post("/api/basemap/setup")
+async def start_basemap_setup(
+    max_zoom: int = Query(7, ge=6, le=7),
+    source_url: str = Query(_DEFAULT_BASEMAP_SOURCE_URL),
+) -> dict[str, object]:
+    """Start background extraction of a local world city basemap PMTiles file."""
+    global _BASEMAP_SETUP_THREAD
+
+    with _BASEMAP_SETUP_LOCK:
+        status = str(_BASEMAP_SETUP_STATE.get("status") or "idle")
+        if _BASEMAP_SETUP_THREAD is not None and _BASEMAP_SETUP_THREAD.is_alive():
+            return _get_basemap_setup_status_snapshot()
+        if status == "running":
+            return _get_basemap_setup_status_snapshot()
+
+        _BASEMAP_SETUP_STATE.update(
+            {
+                "status": "running",
+                "progress": 1,
+                "message": "Queued basemap setup...",
+                "error": None,
+                "started_at": time.time(),
+                "updated_at": time.time(),
+                "max_zoom": max_zoom,
+            }
+        )
+
+        _BASEMAP_SETUP_THREAD = threading.Thread(
+            target=_run_basemap_setup,
+            args=(max_zoom, source_url),
+            daemon=True,
+        )
+        _BASEMAP_SETUP_THREAD.start()
+
+    return _get_basemap_setup_status_snapshot()
 
 
 @app.get("/api/geo/status")

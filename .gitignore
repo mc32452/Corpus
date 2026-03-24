@@ -43,6 +43,7 @@ __pycache__/
 
 # User workspace data (sqlite, ocr cache, etc.)
 /storage/workspaces/
+/storage/tools/
 
 # Local databases
 *.sqlite
