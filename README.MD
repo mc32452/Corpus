@@ -12,7 +12,7 @@
 [![Next.js 16](https://img.shields.io/badge/Next.js-16-000000?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-Optimised-555555?style=flat-square&logo=apple&logoColor=white)](https://apple.com/silicon)
 [![MLX](https://img.shields.io/badge/Powered_by-MLX-FF6B35?style=flat-square)](https://github.com/ml-explore/mlx)
-[![Offline First](https://img.shields.io/badge/Offline-First-22c55e?style=flat-square)](https://github.com)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/misha-met/Corpus)
 [![No Cloud](https://img.shields.io/badge/No_Cloud-No_Subscription-6366f1?style=flat-square)](https://github.com)
 
 </div>
