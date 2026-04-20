@@ -6,7 +6,7 @@
 
 *Ask questions of your documents. Receive grounded, cited answers. No data leaves your machine.*
 
-![Corpus demo screenshot](docs/images/demo-screenshot.png)
+![Corpus demo screenshot](docs/images/demo-screenshot-main.png)
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Next.js 16](https://img.shields.io/badge/Next.js-16-000000?style=flat-square&logo=nextdotjs&logoColor=white)](https://nextjs.org)

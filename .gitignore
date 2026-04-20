@@ -65,3 +65,7 @@ chroma/
 # e.g. "Untitled-1", "Untitled-7" from DevTools/Editor paste
 Untitled*
 benchmarks/qwen35_m4max_rag_energy_benchmark.py
+.gitnexus
+.serena-cli/project.yml
+.gitignore
+.serena/project.yml
